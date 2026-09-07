@@ -65,16 +65,16 @@ export default function LivePrintPreview({
       </div>
       <div className={`relative overflow-hidden rounded-sm border border-slate-300 bg-white p-[15px] shadow-[0_18px_45px_rgba(15,23,42,0.18)] transition-all duration-300 ${sheetClass}`}>
         <div className="pointer-events-none absolute inset-[15px] rounded-[1px] border border-dashed border-blue-400/70" aria-label="Printable safe margin" />
-        <div className={`relative grid h-full w-full gap-2 ${pageGridClass} ${settings.isColor ? "" : "[filter:grayscale(100%)_contrast(105%)]"}`}>
+        <div className={`relative grid h-full w-full gap-2 p-3 ${pageGridClass} ${settings.isColor ? "" : "[filter:grayscale(100%)_contrast(105%)]"}`}>
           {previewPages.length === 0 && <div className="grid place-items-center text-center text-xs text-slate-400">Upload a document to preview it</div>}
           {previewPages.map((pageNumber) => (
-            <div key={pageNumber} className="flex min-h-0 items-center justify-center overflow-hidden bg-white">
+            <div key={pageNumber} className="flex min-h-0 items-center justify-center overflow-hidden bg-white p-2 text-center">
               {isImage && imagePreviewUrl ? (
                 <img src={imagePreviewUrl} alt="Uploaded print preview" className="max-h-full max-w-full object-contain" />
               ) : previewByPage.get(pageNumber) ? (
                 <img src={previewByPage.get(pageNumber)} alt={`Preview of page ${pageNumber}`} className="max-h-full max-w-full object-contain" />
               ) : (
-                <span className="text-[10px] text-slate-400">Page {pageNumber}</span>
+                <span className="px-2 text-[11px] leading-relaxed text-slate-500">Page {pageNumber} preview unavailable</span>
               )}
             </div>
           ))}

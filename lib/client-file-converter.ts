@@ -65,13 +65,25 @@ async function imageToPdf(file: File) {
 }
 
 async function docxToPdf(file: File) {
-  const [{ default: mammoth }, { jsPDF }] = await Promise.all([
+  const [mammothModule, { jsPDF }] = await Promise.all([
     import("mammoth/mammoth.browser"),
     import("jspdf"),
   ]);
-  const { value } = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+  const mammoth = mammothModule.default ?? mammothModule;
+  const arrayBuffer = await file.arrayBuffer();
+  const { value: html } = await mammoth.convertToHtml({ arrayBuffer });
+  const parsedDocument = new DOMParser().parseFromString(html, "text/html");
+  const value = parsedDocument.body.textContent?.replace(/\u00a0/g, " ").replace(/[ \t]+\n/g, "\n").trim() || "Empty Word document";
+
+  if (/\b(PK\x03\x04|<w:[^>]+>|word\/document\.xml)\b/i.test(value)) {
+    throw new Error("The Word document could not be parsed into readable text.");
+  }
+
   const pdf = new jsPDF({ unit: "pt", format: "a4" });
-  const lines = pdf.splitTextToSize(value.trim() || "Empty Word document", A4_WIDTH - SAFE_MARGIN * 2);
+  const lines = value.split(/\r?\n/).flatMap((paragraph) => {
+    const wrapped = pdf.splitTextToSize(paragraph.trim() || " ", A4_WIDTH - SAFE_MARGIN * 2);
+    return [...wrapped, ""];
+  });
   let y = SAFE_MARGIN + 14;
   for (const line of lines) {
     if (y > A4_HEIGHT - SAFE_MARGIN) {

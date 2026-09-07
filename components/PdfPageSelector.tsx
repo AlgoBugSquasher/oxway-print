@@ -2,7 +2,6 @@
 
 import { type ChangeEvent, type ReactNode, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { load } from "@cashfreepayments/cashfree-js";
 import confetti from "canvas-confetti";
 import {
   Check,
@@ -153,21 +152,71 @@ export default function PdfPageSelector() {
     setError("");
     setIsLoading(true);
     try {
-      const response = await fetch("/api/cashfree", {
+      if (!window.Razorpay) throw new Error("Razorpay Checkout is still loading. Please try again.");
+
+      const response = await fetch("/api/create-order", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amount: totalPrice, fileName: file.name, selectedPages: activePages, settings }),
+        body: JSON.stringify({ amount: totalPrice }),
       });
       const order = await response.json();
       if (!response.ok) throw new Error(order.error || "Could not create payment order");
-      const cashfree = await load({ mode: "sandbox" });
-      if (!cashfree) throw new Error("Cashfree Checkout could not be loaded");
-      const result = await cashfree.checkout({ paymentSessionId: order.paymentSessionId, redirectTarget: "_modal" });
-      if (result?.error) throw new Error(result.error.message || "Payment was not completed");
-      localStorage.setItem("oxway-last-print-order", JSON.stringify({ orderId: order.orderId, fileName: file.name, activePages, settings, totalPrice }));
-      setIsPaid(true);
-      alert("Payment successful. Your print order is ready.");
-      confetti({ particleCount: 80, spread: 70, origin: { y: 0.8 } });
+
+      const razorpay = new window.Razorpay({
+        key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID,
+        amount: order.amount,
+        currency: "INR",
+        name: "OXWAY Smart Kiosk",
+        description: "Document Printing",
+        order_id: order.orderId,
+        theme: { color: "#dc2626" },
+        handler: async (paymentResponse) => {
+          try {
+            const syncResponse = await fetch("/api/print-complete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                pagesPrinted: activePages.length * settings.copies,
+                amount: totalPrice,
+                colorMode: settings.isColor ? "color" : "bw",
+              }),
+            });
+            if (!syncResponse.ok) throw new Error("Payment succeeded, but kiosk sync failed.");
+
+            const printResponse = await fetch("/api/print-job", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                fileName: file.name,
+                selectedPages: activePages,
+                copies: settings.copies,
+                isColor: settings.isColor,
+                totalPrice,
+                layout: settings.layout,
+                paperSize: settings.paperSize,
+                pagesPerSheet: settings.pagesPerSheet,
+                paymentId: paymentResponse.razorpay_payment_id,
+                paymentOrderId: paymentResponse.razorpay_order_id,
+              }),
+            });
+            if (!printResponse.ok) throw new Error("Payment succeeded, but the print job could not be queued.");
+
+            setIsPaid(true);
+            setPrintSuccess(true);
+            alert(`Payment successful. Payment ID: ${paymentResponse.razorpay_payment_id}`);
+            confetti({ particleCount: 80, spread: 70, origin: { y: 0.8 } });
+          } catch (callbackError) {
+            console.error("Post-payment processing failed:", callbackError);
+            setError(callbackError instanceof Error ? callbackError.message : "Payment succeeded, but printing could not be started.");
+          } finally {
+            setIsLoading(false);
+          }
+        },
+        modal: { ondismiss: () => setIsLoading(false) },
+      });
+
+      setIsLoading(false);
+      razorpay.open();
     } catch (paymentError) {
       console.error("Cashfree payment error:", paymentError);
       setError(paymentError instanceof Error ? paymentError.message : "Payment could not be completed.");
