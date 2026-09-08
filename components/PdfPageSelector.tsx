@@ -122,9 +122,13 @@ export default function PdfPageSelector() {
         const viewport = page.getViewport({ scale: 0.38 });
         const canvas = document.createElement("canvas");
         const context = canvas.getContext("2d");
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
+        const devicePixelRatio = window.devicePixelRatio || 2;
+        canvas.width = Math.floor(viewport.width * devicePixelRatio);
+        canvas.height = Math.floor(viewport.height * devicePixelRatio);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
         if (!context) continue;
+        context.scale(devicePixelRatio, devicePixelRatio);
         await page.render({ canvas, canvasContext: context, viewport }).promise;
         renderedPages.push({ pageNumber, dataUrl: canvas.toDataURL("image/jpeg", 0.8) });
       }

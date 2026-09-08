@@ -1,6 +1,7 @@
 "use client";
 
-import { X } from "lucide-react";
+import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { useState } from "react";
 
 interface PageThumbnail {
   pageNumber: number;
@@ -32,9 +33,15 @@ export default function LivePrintPreview({
   isOpen = true,
   onClose,
 }: LivePrintPreviewProps) {
+  const [sheetIndex, setSheetIndex] = useState(0);
   if (!isOpen) return null;
 
-  const previewPages = activePages.slice(0, settings.pagesPerSheet);
+  const sheetCount = Math.max(1, Math.ceil(activePages.length / settings.pagesPerSheet));
+  const safeSheetIndex = Math.min(sheetIndex, sheetCount - 1);
+  const previewPages = activePages.slice(
+    safeSheetIndex * settings.pagesPerSheet,
+    (safeSheetIndex + 1) * settings.pagesPerSheet
+  );
   const isImage = Boolean(imagePreviewUrl && fileType?.startsWith("image/"));
   const previewByPage = new Map(thumbnails.map((thumbnail) => [thumbnail.pageNumber, thumbnail.dataUrl]));
   const sheetClass = settings.layout === "portrait" ? "aspect-[1/1.414]" : "aspect-[1.414/1]";
@@ -61,7 +68,31 @@ export default function LivePrintPreview({
           <p className="text-[11px] font-bold uppercase tracking-[0.2em] text-blue-500">Live preview</p>
           <p className="mt-1 text-sm font-bold">Your printed sheet</p>
         </div>
-        <span className="text-[11px] font-semibold text-slate-500">{settings.pagesPerSheet} per sheet</span>
+        <div className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+          <span>Sheet {safeSheetIndex + 1} / {sheetCount}</span>
+          {sheetCount > 1 && (
+            <span className="flex items-center gap-1">
+              <button
+                type="button"
+                aria-label="Previous preview sheet"
+                disabled={safeSheetIndex === 0}
+                onClick={() => setSheetIndex((index) => Math.max(0, index - 1))}
+                className="rounded-md p-1 hover:bg-slate-100 disabled:opacity-30"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <button
+                type="button"
+                aria-label="Next preview sheet"
+                disabled={safeSheetIndex === sheetCount - 1}
+                onClick={() => setSheetIndex((index) => Math.min(sheetCount - 1, index + 1))}
+                className="rounded-md p-1 hover:bg-slate-100 disabled:opacity-30"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </span>
+          )}
+        </div>
       </div>
       <div className={`relative overflow-hidden rounded-sm border border-slate-300 bg-white p-[15px] shadow-[0_18px_45px_rgba(15,23,42,0.18)] transition-all duration-300 ${sheetClass}`}>
         <div className="pointer-events-none absolute inset-[15px] rounded-[1px] border border-dashed border-blue-400/70" aria-label="Printable safe margin" />
