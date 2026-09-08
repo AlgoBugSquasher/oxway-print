@@ -2,6 +2,8 @@ export const dynamic = 'force-dynamic';
 import Razorpay from "razorpay";
 import { NextResponse } from "next/server";
 
+export const dynamic = "force-dynamic";
+
 export async function POST(request: Request) {
   try {
     const { amount } = (await request.json()) as { amount?: number };
