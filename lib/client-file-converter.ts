@@ -3,6 +3,9 @@ import { PDFDocument } from "pdf-lib";
 const A4_WIDTH = 595.28;
 const A4_HEIGHT = 841.89;
 const SAFE_MARGIN = 15;
+const DOCX_MARGIN = 24;
+const DOCX_FONT_SIZE = 11;
+const DOCX_LINE_HEIGHT = 16;
 
 const isPdf = (file: File) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 const isDocx = (file: File) => file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || file.name.toLowerCase().endsWith(".docx");
@@ -64,34 +67,58 @@ async function imageToPdf(file: File) {
   return pdfDocument.save();
 }
 
+function readFileAsArrayBuffer(file: File) {
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) {
+        resolve(reader.result);
+      } else {
+        reject(new Error("The document could not be read as binary data."));
+      }
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("The document could not be read."));
+    reader.onabort = () => reject(new Error("The document read was cancelled."));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 async function docxToPdf(file: File) {
   const [mammothModule, { jsPDF }] = await Promise.all([
     import("mammoth/mammoth.browser"),
     import("jspdf"),
   ]);
   const mammoth = mammothModule.default ?? mammothModule;
-  const arrayBuffer = await file.arrayBuffer();
-  const { value: html } = await mammoth.convertToHtml({ arrayBuffer });
-  const parsedDocument = new DOMParser().parseFromString(html, "text/html");
-  const value = parsedDocument.body.textContent?.replace(/\u00a0/g, " ").replace(/[ \t]+\n/g, "\n").trim() || "Empty Word document";
+  const arrayBuffer = await readFileAsArrayBuffer(file);
+  const { value: rawText } = await mammoth.extractRawText({ arrayBuffer });
+  const value = rawText
+    .replace(/\u00a0/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
 
-  if (/\b(PK\x03\x04|<w:[^>]+>|word\/document\.xml)\b/i.test(value)) {
+  if (!value || /(?:PK[\x03\x04]|<w:[^>]+>|word\/document\.xml)/i.test(value)) {
     throw new Error("The Word document could not be parsed into readable text.");
   }
 
   const pdf = new jsPDF({ unit: "pt", format: "a4" });
-  const lines = value.split(/\r?\n/).flatMap((paragraph) => {
-    const wrapped = pdf.splitTextToSize(paragraph.trim() || " ", A4_WIDTH - SAFE_MARGIN * 2);
-    return [...wrapped, ""];
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(DOCX_FONT_SIZE);
+  const lines = value.split("\n").flatMap((paragraph) => {
+    const wrapped = pdf.splitTextToSize(paragraph || " ", A4_WIDTH - DOCX_MARGIN * 2);
+    return wrapped.length > 0 ? wrapped : [" "];
   });
-  let y = SAFE_MARGIN + 14;
+  let y = DOCX_MARGIN + DOCX_LINE_HEIGHT;
+  let linesOnPage = 0;
   for (const line of lines) {
-    if (y > A4_HEIGHT - SAFE_MARGIN) {
+    if (y > A4_HEIGHT - DOCX_MARGIN || linesOnPage >= 48) {
       pdf.addPage("a4", "p");
-      y = SAFE_MARGIN + 14;
+      y = DOCX_MARGIN + DOCX_LINE_HEIGHT;
+      linesOnPage = 0;
     }
-    pdf.text(line, SAFE_MARGIN, y);
-    y += 14;
+    pdf.text(line, DOCX_MARGIN, y);
+    y += DOCX_LINE_HEIGHT;
+    linesOnPage += 1;
   }
   return new Uint8Array(pdf.output("arraybuffer"));
 }
