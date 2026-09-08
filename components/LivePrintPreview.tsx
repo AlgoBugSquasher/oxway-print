@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useState } from "react";
 
 interface PageThumbnail {
@@ -53,31 +53,22 @@ export default function LivePrintPreview({
 
   return (
     <div className="relative w-full max-w-sm">
-      {onClose && (
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close print preview"
-          className="absolute right-3 top-3 z-10 grid size-8 place-items-center rounded-full bg-slate-950/70 text-white lg:hidden"
-        >
-          <X size={15} />
-        </button>
-      )}
-      <div className="mb-3 flex items-center justify-between">
-        <div>
-          <p className="text-[11px] font-bold uppercase tracking-[0.2em] text-blue-500">Live preview</p>
-          <p className="mt-1 text-sm font-bold">Your printed sheet</p>
+      <div className="mb-3 flex items-center justify-between gap-3 border-b border-gray-100 p-4">
+        <div className="min-w-0">
+          <p className="block text-[11px] font-bold uppercase tracking-[0.2em] text-blue-600">Live preview</p>
+          <p className="mt-1 truncate text-base font-semibold text-gray-900">Your printed sheet</p>
         </div>
-        <div className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+        <div className="flex shrink-0 items-center gap-3">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-gray-500">
           <span>Sheet {safeSheetIndex + 1} / {sheetCount}</span>
           {sheetCount > 1 && (
-            <span className="flex items-center gap-1">
+            <span className="flex items-center gap-1.5">
               <button
                 type="button"
                 aria-label="Previous preview sheet"
                 disabled={safeSheetIndex === 0}
                 onClick={() => setSheetIndex((index) => Math.max(0, index - 1))}
-                className="rounded-md p-1 hover:bg-slate-100 disabled:opacity-30"
+                className="rounded p-1 hover:bg-gray-100 disabled:opacity-30"
               >
                 <ChevronLeft size={14} />
               </button>
@@ -86,11 +77,22 @@ export default function LivePrintPreview({
                 aria-label="Next preview sheet"
                 disabled={safeSheetIndex === sheetCount - 1}
                 onClick={() => setSheetIndex((index) => Math.min(sheetCount - 1, index + 1))}
-                className="rounded-md p-1 hover:bg-slate-100 disabled:opacity-30"
+                className="rounded p-1 hover:bg-gray-100 disabled:opacity-30"
               >
                 <ChevronRight size={14} />
               </button>
             </span>
+          )}
+          </div>
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close print preview"
+              className="flex size-8 items-center justify-center rounded-full bg-gray-800 text-white transition hover:bg-gray-700 lg:hidden"
+            >
+              <span aria-hidden="true" className="text-sm leading-none">&#10005;</span>
+            </button>
           )}
         </div>
       </div>
