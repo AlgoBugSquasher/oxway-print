@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase';
+import { getSupabaseAdmin } from '@/lib/supabase';
 
 export async function POST(req: Request) {
   console.log('POST /api/print-complete invoked');
@@ -21,6 +21,7 @@ export async function POST(req: Request) {
       created_at: new Date().toISOString(),
     };
 
+    const supabaseAdmin = getSupabaseAdmin();
     const { data, error } = await supabaseAdmin
       .from('print_orders')
       .insert([insertPayload])
