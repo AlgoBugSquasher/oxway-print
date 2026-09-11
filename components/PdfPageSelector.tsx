@@ -180,12 +180,24 @@ export default function PdfPageSelector() {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
+                order_id: paymentResponse.razorpay_order_id,
+                razorpay_payment_id: paymentResponse.razorpay_payment_id,
+                file_url: file ? file.name : null,
+                status: "paid",
+                total_pages: activePages.length * settings.copies,
+                copies: settings.copies,
                 pagesPrinted: activePages.length * settings.copies,
                 amount: totalPrice,
                 colorMode: settings.isColor ? "color" : "bw",
               }),
             });
-            if (!syncResponse.ok) throw new Error("Payment succeeded, but kiosk sync failed.");
+
+            const syncResult = await syncResponse.json().catch(() => ({}));
+            if (!syncResponse.ok) {
+              const message = syncResult?.error || "Payment succeeded, but kiosk sync failed.";
+              alert(message);
+              throw new Error(message);
+            }
 
             const printResponse = await fetch("/api/print-job", {
               method: "POST",

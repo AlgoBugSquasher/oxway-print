@@ -1,62 +1,44 @@
 export const dynamic = 'force-dynamic';
+
 import { NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { supabaseAdmin } from '@/lib/supabase';
+
 export async function POST(req: Request) {
+  console.log('POST /api/print-complete invoked');
+
   try {
-    const { pagesPrinted, amount, colorMode } = await req.json();
+    const body = await req.json();
+    console.log('Received print completion payload:', body);
 
-    // 1. Log Transaction
-    await supabase.from('print_orders').insert({
-      pages_printed: pagesPrinted,
-      amount: amount,
-      color_mode: colorMode,
-      status: 'completed',
-    });
+    const insertPayload = {
+      ...body,
+      order_id: body.order_id ?? body.paymentOrderId ?? body.orderId ?? null,
+      razorpay_payment_id: body.razorpay_payment_id ?? body.paymentId ?? null,
+      file_url: body.file_url ?? body.fileUrl ?? null,
+      status: body.status ?? 'paid',
+      total_pages: body.total_pages ?? body.pagesPrinted ?? null,
+      copies: body.copies ?? 1,
+      created_at: new Date().toISOString(),
+    };
 
-    // 2. Fetch current counts
-    const { data: kiosk, error } = await supabase
-      .from('kiosk_status')
-      .select('*')
-      .eq('id', 'oxway_01')
-      .single();
+    const { data, error } = await supabaseAdmin
+      .from('print_orders')
+      .insert([insertPayload])
+      .select();
 
-    if (error || !kiosk) {
-      return NextResponse.json({ error: 'Kiosk record not found' }, { status: 404 });
+    if (error) {
+      console.error('Supabase insert failed:', error);
+      return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    const updatedTrayPages = (kiosk.tray_pages || 0) + pagesPrinted;
-    const updatedCartridgePages = (kiosk.cartridge_pages || 0) + pagesPrinted;
-    const updatedRevenue = Number(kiosk.total_revenue || 0) + Number(amount);
-    const updatedLifetimePrints = (kiosk.total_lifetime_prints || 0) + pagesPrinted;
+    console.log('Supabase insert success:', data);
 
-    // 3. Update Counters in Supabase
-    await supabase
-      .from('kiosk_status')
-      .update({
-        tray_pages: updatedTrayPages,
-        cartridge_pages: updatedCartridgePages,
-        total_revenue: updatedRevenue,
-        total_lifetime_prints: updatedLifetimePrints,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', 'oxway_01');
-
-    // 4. Threshold Checks (Console trigger / Alert point)
-    if (updatedTrayPages >= 180) {
-      console.warn(`[ALERT] Refill Paper Tray! Current count: ${updatedTrayPages}/200`);
-    }
-
-    if (updatedCartridgePages >= 1100) {
-      console.warn(`[ALERT] Refill Cartridge! Current count: ${updatedCartridgePages}/1100`);
-    }
-
-    return NextResponse.json({ 
-      success: true, 
-      trayPages: updatedTrayPages, 
-      cartridgePages: updatedCartridgePages 
-    });
-
+    return NextResponse.json({ success: true, data });
   } catch (err) {
-    return NextResponse.json({ error: 'Failed to update kiosk status' }, { status: 500 });
+    console.error('Unhandled error in /api/print-complete:', err);
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Failed to record print completion' },
+      { status: 500 }
+    );
   }
 }
