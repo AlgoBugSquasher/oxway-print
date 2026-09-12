@@ -1,28 +1,17 @@
 import { NextResponse } from "next/server";
+import { listJobs } from "@/lib/store";
 
-interface PrintJob {
-  fileName: string;
-  selectedPages: number[];
-  copies: number;
-  isColor: boolean;
-  totalPrice: number;
-  timestamp: string;
-  orderId: string;
-}
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-export const printQueue: PrintJob[] = [];
-
-export async function POST(request: Request) {
-  const body = (await request.json()) as Omit<PrintJob, "timestamp" | "orderId">;
-  const timestamp = new Date().toISOString();
-  const orderId = `PRINT-${Date.now()}`;
-  const job: PrintJob = { ...body, timestamp, orderId };
-
-  printQueue.push(job);
-
-  return NextResponse.json({ success: true, orderId });
-}
-
-export function GET() {
-  return NextResponse.json(printQueue);
+/**
+ * Read-only admin view of the print queue/history. Jobs are created via
+ * /api/create-order and move through their lifecycle automatically:
+ * pending_payment -> paid (see /api/verify-payment) -> printing -> printed,
+ * driven by the Pi's separate print agent (print-agent/index.ts). Nothing
+ * should POST here anymore.
+ */
+export async function GET() {
+  const jobs = await listJobs();
+  return NextResponse.json(jobs);
 }
