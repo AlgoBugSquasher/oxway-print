@@ -1,45 +1,27 @@
-export const dynamic = 'force-dynamic';
+import { NextResponse } from "next/server";
+import { recordCompletedPrint } from "@/lib/kiosk-stats";
 
-import { NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase';
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-export async function POST(req: Request) {
-  console.log('POST /api/print-complete invoked');
-
+/**
+ * Manual/external entry point for logging a completed print to Supabase.
+ * The Pi's print agent (print-agent/index.ts) already calls
+ * recordCompletedPrint() directly once a job finishes printing — this route
+ * stays around for any other caller.
+ */
+export async function POST(request: Request) {
   try {
-    const body = await req.json();
-    console.log('Received print completion payload:', body);
-
-    const insertPayload = {
-      ...body,
-      order_id: body.order_id ?? body.paymentOrderId ?? body.orderId ?? null,
-      razorpay_payment_id: body.razorpay_payment_id ?? body.paymentId ?? null,
-      file_url: body.file_url ?? body.fileUrl ?? null,
-      status: body.status ?? 'paid',
-      total_pages: body.total_pages ?? body.pagesPrinted ?? null,
-      copies: body.copies ?? 1,
-      created_at: new Date().toISOString(),
-    };
-
-    const supabaseAdmin = getSupabaseAdmin();
-    const { data, error } = await supabaseAdmin
-      .from('print_orders')
-      .insert([insertPayload])
-      .select();
-
-    if (error) {
-      console.error('Supabase insert failed:', error);
-      return NextResponse.json({ error: error.message }, { status: 500 });
+    const { pagesPrinted, amount, colorMode } = await request.json();
+    if (!Number.isFinite(pagesPrinted) || !Number.isFinite(amount)) {
+      return NextResponse.json({ error: "pagesPrinted and amount must be numbers" }, { status: 400 });
     }
 
-    console.log('Supabase insert success:', data);
+    const counters = await recordCompletedPrint({ pagesPrinted, amount, colorMode: Boolean(colorMode) });
+    if (!counters) return NextResponse.json({ error: "Kiosk record not found" }, { status: 404 });
 
-    return NextResponse.json({ success: true, data });
-  } catch (err) {
-    console.error('Unhandled error in /api/print-complete:', err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to record print completion' },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: true, trayPages: counters.trayPages, cartridgePages: counters.cartridgePages });
+  } catch {
+    return NextResponse.json({ error: "Failed to update kiosk status" }, { status: 500 });
   }
 }

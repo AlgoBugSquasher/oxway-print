@@ -1,7 +1,8 @@
 "use client";
 
-import { type ChangeEvent, type ReactNode, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { load as loadCashfree } from "@cashfreepayments/cashfree-js";
 import confetti from "canvas-confetti";
 import {
   Check,
@@ -25,6 +26,7 @@ import {
 import * as pdfjsLib from "pdfjs-dist";
 import LivePrintPreview from "@/components/LivePrintPreview";
 import { convertFileInBrowser, isSupportedClientFile } from "@/lib/client-file-converter";
+import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
@@ -36,6 +38,17 @@ interface PageThumbnail {
 type PageMode = "all" | "odd" | "even" | "custom";
 type PaperSize = "A4" | "Letter" | "Legal";
 type Layout = "portrait" | "landscape";
+
+/** Mirrors lib/store.ts JobStatus, plus a local "idle" state before any order exists. */
+type OrderStatus =
+  | "idle"
+  | "pending_payment"
+  | "paid"
+  | "printing"
+  | "printed"
+  | "print_failed"
+  | "payment_failed"
+  | "expired";
 
 type PrintSettings = {
   copies: number;
@@ -84,10 +97,12 @@ export default function PdfPageSelector() {
   const [isLoading, setIsLoading] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
-  const [isPaid, setIsPaid] = useState(false);
-  const [isPrinting, setIsPrinting] = useState(false);
-  const [printSuccess, setPrintSuccess] = useState(false);
+  const [orderStatus, setOrderStatus] = useState<OrderStatus>("idle");
+  const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // Holds the converted PDF's bytes so the final file can be uploaded again at
+  // payment time — pdfjs consumes the response body when rendering thumbnails.
+  const pdfBytesRef = useRef<Uint8Array | null>(null);
 
   const activePages = useMemo(() => {
     if (settings.pageMode === "all") return selectedPages;
@@ -109,11 +124,13 @@ export default function PdfPageSelector() {
     setThumbnails([]);
     const isBrowserPreviewableImage = uploadedFile.type.startsWith("image/") && !/\.(heic|heif)$/i.test(uploadedFile.name) && !["image/heic", "image/heif"].includes(uploadedFile.type);
     setPreviewUrl(isBrowserPreviewableImage ? URL.createObjectURL(uploadedFile) : "");
-    setIsPaid(false);
-    setPrintSuccess(false);
+    setOrderStatus("idle");
+    setJobId(null);
+    pdfBytesRef.current = null;
     try {
       const normalizedPdfBytes = await convertFileInBrowser(uploadedFile);
-      const pdf = await pdfjsLib.getDocument({ data: normalizedPdfBytes }).promise;
+      pdfBytesRef.current = normalizedPdfBytes;
+      const pdf = await pdfjsLib.getDocument({ data: normalizedPdfBytes.slice() }).promise;
       setTotalPages(pdf.numPages);
       setSelectedPages(Array.from({ length: pdf.numPages }, (_, index) => index + 1));
       const renderedPages: PageThumbnail[] = [];
@@ -151,116 +168,101 @@ export default function PdfPageSelector() {
 
   const togglePage = (pageNumber: number) => setSelectedPages((pages) => pages.includes(pageNumber) ? pages.filter((page) => page !== pageNumber) : [...pages, pageNumber].sort((a, b) => a - b));
 
-  const handlePayment = async () => {
-    if (!file || activePages.length === 0) return setError("Select at least one page before paying.");
+  // Creates the order with whichever gateway is live (PAYMENT_PROVIDER env var
+  // on the server) and opens that gateway's own checkout modal — Card /
+  // Netbanking / UPI (with its own QR), for both Cashfree and Razorpay.
+  // Actual payment confirmation and printing happen server-side: this
+  // component never trusts the modal's own success callback by itself, it
+  // just kicks off polling (see the effect below) which asks the server,
+  // which asks the gateway directly.
+  const handleStartPayment = async () => {
+    if (!file || !pdfBytesRef.current || activePages.length === 0) return setError("Select at least one page before paying.");
     setError("");
     setIsLoading(true);
     try {
-      if (!window.Razorpay) throw new Error("Razorpay Checkout is still loading. Please try again.");
+      const formData = new FormData();
+      formData.append("file", new Blob([pdfBytesRef.current.slice().buffer], { type: "application/pdf" }), file.name);
+      formData.append("fileName", file.name);
+      formData.append("selectedPages", JSON.stringify(activePages));
+      formData.append("settings", JSON.stringify(settings));
+      formData.append("totalPrice", String(totalPrice));
 
-      const response = await fetch("/api/create-order", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amount: totalPrice }),
-      });
+      const response = await fetch("/api/create-order", { method: "POST", body: formData });
       const order = await response.json();
       if (!response.ok) throw new Error(order.error || "Could not create payment order");
 
-      const razorpay = new window.Razorpay({
-        key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID,
-        amount: order.amount,
-        currency: "INR",
-        name: "OXWAY Smart Kiosk",
-        description: "Document Printing",
-        order_id: order.orderId,
-        theme: { color: "#dc2626" },
-        handler: async (paymentResponse) => {
-          try {
-            const syncResponse = await fetch("/api/print-complete", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                order_id: paymentResponse.razorpay_order_id,
-                razorpay_payment_id: paymentResponse.razorpay_payment_id,
-                file_url: file ? file.name : null,
-                status: "paid",
-                total_pages: activePages.length * settings.copies,
-                copies: settings.copies,
-                pagesPrinted: activePages.length * settings.copies,
-                amount: totalPrice,
-                colorMode: settings.isColor ? "color" : "bw",
-              }),
-            });
+      setJobId(order.jobId);
+      setOrderStatus("pending_payment");
 
-            const syncResult = await syncResponse.json().catch(() => ({}));
-            if (!syncResponse.ok) {
-              const message = syncResult?.error || "Payment succeeded, but kiosk sync failed.";
-              alert(message);
-              throw new Error(message);
-            }
-
-            const printResponse = await fetch("/api/print-job", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                fileName: file.name,
-                selectedPages: activePages,
-                copies: settings.copies,
-                isColor: settings.isColor,
-                totalPrice,
-                layout: settings.layout,
-                paperSize: settings.paperSize,
-                pagesPerSheet: settings.pagesPerSheet,
-                paymentId: paymentResponse.razorpay_payment_id,
-                paymentOrderId: paymentResponse.razorpay_order_id,
-              }),
-            });
-            if (!printResponse.ok) throw new Error("Payment succeeded, but the print job could not be queued.");
-
-            setIsPaid(true);
-            setPrintSuccess(true);
-            alert(`Payment successful. Payment ID: ${paymentResponse.razorpay_payment_id}`);
-            confetti({ particleCount: 80, spread: 70, origin: { y: 0.8 } });
-          } catch (callbackError) {
-            console.error("Post-payment processing failed:", callbackError);
-            setError(callbackError instanceof Error ? callbackError.message : "Payment succeeded, but printing could not be started.");
-          } finally {
-            setIsLoading(false);
-          }
-        },
-        modal: { ondismiss: () => setIsLoading(false) },
-      });
-
-      setIsLoading(false);
-      razorpay.open();
+      if (order.provider === "cashfree") {
+        const cashfree = await loadCashfree({ mode: "sandbox" });
+        if (!cashfree) throw new Error("Cashfree Checkout could not be loaded");
+        void cashfree.checkout({ paymentSessionId: order.paymentSessionId, redirectTarget: "_modal" });
+      } else {
+        await loadRazorpayCheckout();
+        if (!window.Razorpay) throw new Error("Razorpay Checkout could not be loaded");
+        const razorpay = new window.Razorpay({
+          key: order.keyId,
+          amount: order.amount,
+          currency: "INR",
+          name: "OXWAY Print Kiosk",
+          description: file.name,
+          order_id: order.providerOrderId,
+          theme: { color: "#2563eb" },
+          // Intentionally a no-op — polling below confirms with Razorpay directly.
+          handler: () => {},
+          modal: {},
+        });
+        razorpay.open();
+      }
     } catch (paymentError) {
-      console.error("Cashfree payment error:", paymentError);
-      setError(paymentError instanceof Error ? paymentError.message : "Payment could not be completed.");
+      console.error("Payment order error:", paymentError);
+      setError(paymentError instanceof Error ? paymentError.message : "Payment could not be started.");
+      setOrderStatus("idle");
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handlePrint = async () => {
-    if (!file) return;
-    setIsPrinting(true);
-    try {
-      const response = await fetch("/api/print-job", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileName: file.name, selectedPages: activePages, copies: settings.copies, isColor: settings.isColor, totalPrice, layout: settings.layout, paperSize: settings.paperSize, pagesPerSheet: settings.pagesPerSheet }),
-      });
-      if (!response.ok) throw new Error("Print queue request failed");
-      setPrintSuccess(true);
-      window.print();
-      alert("Your document has been sent to the printer.");
-      confetti({ particleCount: 100, spread: 80, origin: { y: 0.6 } });
-    } catch (printError) {
-      console.error(printError);
-      setError("Unable to send the document to the printer. Please try again.");
-    } finally {
-      setIsPrinting(false);
-    }
+  // Polls the server for real payment/print status. The server verifies
+  // payment directly with the gateway (outbound call, works from anywhere)
+  // and the kiosk's separate print agent picks up "paid" jobs and prints
+  // them — this just reflects that status back to the customer.
+  useEffect(() => {
+    if (!jobId) return;
+    if (["printed", "print_failed", "payment_failed", "expired"].includes(orderStatus)) return;
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/verify-payment?jobId=${jobId}`);
+        const data = await response.json();
+        if (!response.ok || cancelled) return;
+        setOrderStatus((current) => {
+          if (data.status === current) return current;
+          if (data.status === "paid" || data.status === "printed") {
+            confetti({ particleCount: data.status === "printed" ? 100 : 80, spread: 75, origin: { y: 0.7 } });
+          }
+          if (data.status === "print_failed" || data.status === "payment_failed") {
+            setError(data.error || "Something went wrong. Please see kiosk staff.");
+          }
+          return data.status;
+        });
+      } catch (pollError) {
+        console.error("Status poll error:", pollError);
+      }
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [jobId, orderStatus]);
+
+  const resetOrder = () => {
+    setOrderStatus("idle");
+    setJobId(null);
+    setError("");
   };
 
   const theme = isDark ? "bg-[#101419] text-slate-100" : "bg-[#f4f6f8] text-slate-950";
@@ -276,7 +278,14 @@ export default function PdfPageSelector() {
       {file && !isLoading && <><div className={`mb-5 flex items-center gap-4 rounded-2xl border p-4 ${panel}`}><div className="grid size-11 shrink-0 place-items-center rounded-xl bg-red-500/10 text-red-500"><FileText size={21} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{file.name}</p><p className={`mt-1 text-xs ${muted}`}>{(file.size / (1024 * 1024)).toFixed(2)} MB · {totalPages} pages</p></div><button onClick={() => fileInputRef.current?.click()} className="rounded-xl p-2 text-blue-500 sm:hidden"><RefreshCw size={17} /></button></div><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">02 / Select pages</p><p className={`mt-1 text-sm ${muted}`}>{activePages.length} active pages · tap a page to include or exclude</p></div><div className="flex gap-2"><button onClick={() => setSelectedPages(Array.from({ length: totalPages }, (_, index) => index + 1))} className="text-xs font-bold text-blue-500">All</button><button onClick={() => setSelectedPages([])} className={`text-xs font-bold ${muted}`}>Clear</button></div></div><div className={`grid max-h-[560px] grid-cols-2 gap-3 overflow-y-auto rounded-3xl border p-3 sm:grid-cols-3 xl:grid-cols-4 ${isDark ? "border-white/10 bg-white/[0.03]" : "border-slate-200 bg-slate-100/70"}`}>{thumbnails.map((thumbnail) => { const selected = selectedPages.includes(thumbnail.pageNumber); return <button key={thumbnail.pageNumber} onClick={() => togglePage(thumbnail.pageNumber)} className={`relative overflow-hidden rounded-2xl border-2 bg-white p-1 text-left transition hover:-translate-y-0.5 ${selected ? "border-blue-500 shadow-lg shadow-blue-500/10" : "border-transparent opacity-45 grayscale"}`}><img src={thumbnail.dataUrl} alt={`Page ${thumbnail.pageNumber}`} className="aspect-[1/1.35] w-full object-contain" /><span className="absolute left-3 top-3 rounded-md bg-white/90 px-1.5 py-1 text-[10px] font-black text-slate-600">{thumbnail.pageNumber}</span><span className="absolute right-3 top-3 text-blue-600">{selected ? <CheckCircle2 size={19} fill="white" /> : <Circle size={19} />}</span></button>; })}</div></>}
       {error && <div className="mt-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
     </section><aside className="lg:pt-[86px]"><div className={`rounded-[2rem] border p-5 shadow-xl shadow-slate-900/5 ${panel}`}><div className="mb-5 flex items-center justify-between"><div><p className={`text-xs font-bold uppercase tracking-[0.2em] ${muted}`}>Print order</p><p className="mt-1 text-lg font-black">Configure output</p></div><Settings2 className="text-blue-500" size={19} /></div><div className={`mb-4 rounded-2xl p-4 ${isDark ? "bg-blue-500/10" : "bg-blue-50"}`}><div className="flex items-center justify-between"><span className={`text-xs font-semibold ${muted}`}>Estimated total</span><span className="text-2xl font-black text-blue-600">₹{totalPrice}</span></div><div className={`mt-2 text-xs ${muted}`}>{billableSheets} billable sheets · {activePages.length} pages · {settings.copies} {settings.copies === 1 ? "copy" : "copies"}</div></div><button onClick={() => setIsSettingsOpen(true)} className={`flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${isDark ? "border-white/10" : "border-slate-200"}`}><span className="flex items-center gap-2"><LayoutGrid size={16} className="text-blue-500" /> Print settings</span><ChevronDown size={16} className={muted} /></button><div className={`mt-4 space-y-3 text-xs ${muted}`}><div className="flex justify-between"><span>Color mode</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.isColor ? "Color" : "B&W"}</b></div><div className="flex justify-between"><span>Paper</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.paperSize} · {settings.layout}</b></div><div className="flex justify-between"><span>Pages per sheet</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.pagesPerSheet}</b></div></div></div></aside></main>
-    {file && <div className={`fixed bottom-0 left-0 right-0 z-30 border-t backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/90" : "border-slate-200 bg-white/90"}`}><div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-4 lg:px-8"><div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>{!isPaid ? <button onClick={handlePayment} disabled={isLoading || activePages.length === 0} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button> : !printSuccess ? <button onClick={handlePrint} disabled={isPrinting} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-emerald-500/20">{isPrinting ? <RefreshCw className="animate-spin" size={17} /> : <Printer size={17} />}{isPrinting ? "Sending..." : "Print document"}</button> : <div className="flex items-center gap-2 text-sm font-bold text-emerald-500"><Check size={17} /> Queued successfully</div>}</div></div>}
+    {file && <div className={`fixed bottom-0 left-0 right-0 z-30 border-t backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/90" : "border-slate-200 bg-white/90"}`}><div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-4 lg:px-8"><div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>{orderStatus === "idle" && <button onClick={handleStartPayment} disabled={isLoading || activePages.length === 0} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>}
+      {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
+      {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print...</div>}
+      {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document...</div>}
+      {orderStatus === "printed" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500/10 px-5 py-3.5 text-sm font-black text-emerald-500"><Check size={17} /> Printed — please collect it</div>}
+      {orderStatus === "expired" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Payment expired — try again</button>}
+      {(orderStatus === "print_failed" || orderStatus === "payment_failed") && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — try again</button>}
+    </div></div>}
     {isSettingsOpen && <div className="fixed inset-0 z-40 flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsSettingsOpen(false); }}><div className={`w-full max-w-lg rounded-t-[2rem] p-6 shadow-2xl sm:rounded-[2rem] ${isDark ? "bg-[#171d24]" : "bg-white"}`}><div className="mb-6 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Print settings</p><h2 className="mt-1 text-xl font-black">Tune your document</h2></div><button onClick={() => setIsSettingsOpen(false)} className={`grid size-9 place-items-center rounded-xl ${isDark ? "bg-white/10" : "bg-slate-100"}`}><X size={17} /></button></div><div className="space-y-5"><SettingRow label="Copies" icon={<Copy size={16} />}><div className={`flex items-center gap-1 rounded-xl border p-1 ${isDark ? "border-white/10" : "border-slate-200"}`}><button onClick={() => updateSettings("copies", Math.max(1, settings.copies - 1))} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Minus size={15} /></button><span className="w-8 text-center text-sm font-black">{settings.copies}</span><button onClick={() => updateSettings("copies", settings.copies + 1)} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Plus size={15} /></button></div></SettingRow><SettingRow label="Layout" icon={<LayoutGrid size={16} />}><Segmented value={settings.layout} options={["portrait", "landscape"]} onChange={(value) => updateSettings("layout", value as Layout)} /></SettingRow><SettingRow label="Color mode" icon={<Palette size={16} />}><Segmented value={settings.isColor ? "color" : "bw"} options={["bw", "color"]} labels={["B&W · ₹2", "Color · ₹10"]} onChange={(value) => updateSettings("isColor", value === "color")} /></SettingRow><div><p className={`mb-2 text-sm font-bold ${muted}`}>Pages</p><div className="grid grid-cols-4 gap-2">{(["all", "odd", "even", "custom"] as PageMode[]).map((mode) => <button key={mode} onClick={() => updateSettings("pageMode", mode)} className={`rounded-xl border px-2 py-2.5 text-xs font-bold capitalize ${settings.pageMode === mode ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}>{mode}</button>)}</div>{settings.pageMode === "custom" && <input value={settings.customRange} onChange={(event) => updateSettings("customRange", event.target.value)} placeholder="Example: 1-5, 8" className={`mt-2 w-full rounded-xl border px-3 py-2.5 text-sm outline-none focus:border-blue-500 ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`} />}</div><SettingRow label="Paper size" icon={<FileText size={16} />}><select value={settings.paperSize} onChange={(event) => updateSettings("paperSize", event.target.value as PaperSize)} className={`rounded-xl border px-3 py-2 text-xs font-bold outline-none ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`}>{(["A4", "Letter", "Legal"] as PaperSize[]).map((size) => <option key={size}>{size}</option>)}</select></SettingRow><SettingRow label="Pages per sheet" icon={<LayoutGrid size={16} />}><Segmented value={String(settings.pagesPerSheet)} options={["1", "2", "4"]} labels={["1", "2 in 1", "4 in 1"]} onChange={(value) => updateSettings("pagesPerSheet", Number(value) as 1 | 2 | 4)} /></SettingRow></div><button onClick={() => setIsSettingsOpen(false)} className="mt-7 w-full rounded-xl bg-blue-600 py-3.5 text-sm font-black text-white">Apply settings</button></div></div>}
     <div className="pointer-events-none fixed inset-x-0 bottom-24 z-20 hidden justify-center px-5 lg:flex">
       <div className="pointer-events-auto rounded-[2rem] border border-slate-200 bg-white p-5 shadow-2xl">
