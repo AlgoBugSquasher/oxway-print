@@ -25,7 +25,7 @@ loadEnv({ path: path.resolve(process.cwd(), ".env.local"), override: true });
 
 import { writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
+import { KIOSK_ID, PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
 import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
 import { submitPrintJob, isJobStillQueued } from "../lib/print/cups";
 import { recordCompletedPrint } from "../lib/kiosk-stats";
@@ -89,10 +89,10 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function pollLoop(): Promise<void> {
-  console.log(`[print-agent] Watching for paid jobs every ${PRINT_AGENT_POLL_INTERVAL_MS}ms...`);
+  console.log(`[print-agent] Kiosk "${KIOSK_ID}" watching for paid jobs every ${PRINT_AGENT_POLL_INTERVAL_MS}ms...`);
   for (;;) {
     try {
-      const paidJobs = await listPaidJobs();
+      const paidJobs = await listPaidJobs(KIOSK_ID);
       for (const job of paidJobs) {
         await processJob(job);
       }

@@ -23,6 +23,15 @@ export const PAYMENT_TIMEOUT_SECONDS = Number(process.env.PAYMENT_TIMEOUT_SECOND
 /** CUPS printer name on the kiosk Pi. Leave unset to use the system default printer. */
 export const PRINTER_NAME = process.env.PRINTER_NAME || "";
 
+/**
+ * Which physical kiosk this Pi's print agent is. Only relevant on the Pi
+ * side — the website is shared across all kiosks and reads the kiosk id
+ * from each job instead. Defaults to "oxway_01" (today's single kiosk).
+ * Give each new kiosk its own value here, matching what its QR code encodes
+ * — see MULTI_KIOSK.md.
+ */
+export const KIOSK_ID = process.env.KIOSK_ID || "oxway_01";
+
 /** Supabase Storage bucket final print-ready PDFs are uploaded to. */
 export const SUPABASE_PRINT_BUCKET = process.env.SUPABASE_PRINT_BUCKET || "print-jobs";
 

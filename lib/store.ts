@@ -31,6 +31,12 @@ export interface PrintJobRecord {
   providerMeta?: Record<string, string>;
   /** Path inside SUPABASE_PRINT_BUCKET where the final, print-ready PDF lives. */
   pdfStoragePath: string;
+  /**
+   * Which physical kiosk this job should print at. Defaults to "oxway_01"
+   * (today's single kiosk) so nothing changes until a second kiosk exists —
+   * see MULTI_KIOSK.md for how to add one.
+   */
+  kioskId: string;
   createdAt: string;
   updatedAt: string;
   error?: string;
@@ -50,6 +56,7 @@ interface PrintJobRow {
   provider_order_id: string;
   provider_meta: Record<string, string> | null;
   pdf_storage_path: string;
+  kiosk_id: string;
   created_at: string;
   updated_at: string;
   error: string | null;
@@ -68,6 +75,7 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     providerOrderId: row.provider_order_id,
     providerMeta: row.provider_meta ?? undefined,
     pdfStoragePath: row.pdf_storage_path,
+    kioskId: row.kiosk_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     error: row.error ?? undefined,
@@ -87,6 +95,7 @@ function toInsertRow(job: PrintJobRecord): Partial<PrintJobRow> {
     provider_order_id: job.providerOrderId,
     provider_meta: job.providerMeta ?? null,
     pdf_storage_path: job.pdfStoragePath,
+    kiosk_id: job.kioskId,
     created_at: job.createdAt,
     updated_at: job.updatedAt,
   };
@@ -151,8 +160,13 @@ export async function claimJobForPrinting(jobId: string): Promise<PrintJobRecord
   return data ? fromRow(data as PrintJobRow) : null;
 }
 
-export async function listPaidJobs(): Promise<PrintJobRecord[]> {
-  const { data, error } = await supabaseAdmin().from("print_jobs").select("*").eq("status", "paid");
+/** Scoped to a single kiosk — each Pi's print agent only ever sees its own jobs. */
+export async function listPaidJobs(kioskId: string): Promise<PrintJobRecord[]> {
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .select("*")
+    .eq("status", "paid")
+    .eq("kiosk_id", kioskId);
   if (error) throw new Error(`Could not list paid jobs: ${error.message}`);
   return (data as PrintJobRow[]).map(fromRow);
 }

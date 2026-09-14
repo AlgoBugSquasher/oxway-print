@@ -1,0 +1,420 @@
+diff --git a/.env.example b/.env.example
+index db12689..9c976ae 100644
+--- a/.env.example
++++ b/.env.example
+@@ -22,6 +22,9 @@ RAZORPAY_WEBHOOK_SECRET=
+ # --- Printer (set on the Pi's .env.local, not the website's) -----------------
+ # CUPS printer name, e.g. from `lpstat -p`. Leave blank to use the system default.
+ PRINTER_NAME=
++# Which physical kiosk this Pi is (Pi-side only). Defaults to "oxway_01" —
++# only set this when adding a second+ kiosk, see MULTI_KIOSK.md.
++KIOSK_ID=
+ 
+ # --- Supabase (shared by the website and the Pi's print agent) ---------------
+ # See SUPABASE_SETUP.md.
+diff --git a/MULTI_KIOSK.md b/MULTI_KIOSK.md
+new file mode 100644
+index 0000000..47e02a1
+--- /dev/null
++++ b/MULTI_KIOSK.md
+@@ -0,0 +1,61 @@
++# Adding a second (or third...) kiosk
++
++The system is built to support multiple physical kiosks from day one, even
++though only one exists right now. Every job is tagged with a `kiosk_id`, and
++everything defaults to `"oxway_01"` — today's single kiosk — so nothing
++about your current setup needs to change until you actually add a second
++machine.
++
++## 1. Run this once, in Supabase's SQL Editor
++
++```sql
++alter table print_jobs add column if not exists kiosk_id text not null default 'oxway_01';
++create index if not exists print_jobs_kiosk_id_idx on print_jobs (kiosk_id);
++```
++
++Safe to run even with existing rows/jobs already in the table — they all get
++`kiosk_id = 'oxway_01'` automatically, matching your current single kiosk.
++
++## 2. When you add kiosk #2 (or #3, #4...)
++
++Pick a short id for it — `oxway_02`, `oxway_03`, etc.
++
++**On that kiosk's Pi**, in `.env.local`, add:
++```env
++KIOSK_ID=oxway_02
++```
++Its print agent will now only ever pick up jobs tagged for `oxway_02` —
++never jobs meant for a different kiosk, even though every Pi is reading from
++the same shared Supabase project.
++
++**Generate that kiosk's QR code** pointing at:
++```
++https://your-site.com/?k=oxway_02
++```
++(the `?k=` query param — not a different domain/page, the same website).
++When a customer scans it, the site tags their order with that kiosk id
++automatically, so it only ever gets printed at kiosk #2's printer.
++
++**Point that kiosk's on-screen display** (the `chromium --kiosk` autostart
++command, see SETUP_PI.md) at:
++```
++https://your-site.com/kiosk-display?k=oxway_02
++```
++so it only shows that kiosk's own job status, not every kiosk's activity
++mixed together.
++
++**Optional**: give it its own `kiosk_status` row too (for separate
++paper-tray/cartridge/revenue tracking per machine, instead of one shared
++total across all kiosks):
++```sql
++insert into kiosk_status (id) values ('oxway_02');
++```
++This is only worth doing once you actually want per-kiosk admin stats —
++until then, all kiosks quietly share the one `oxway_01` counters row, which
++is harmless but not very meaningful once there's more than one machine.
++
++## That's the whole migration
++
++No code changes needed for any of this — it's all configuration (one env
++var per Pi, one query param per QR code/display URL). The code was written
++once to support it from the start.
+diff --git a/SUPABASE_SETUP.md b/SUPABASE_SETUP.md
+index 516d515..41e7406 100644
+--- a/SUPABASE_SETUP.md
++++ b/SUPABASE_SETUP.md
+@@ -26,6 +26,7 @@ create table print_jobs (
+   total_price numeric not null,
+   provider text not null,
+   provider_order_id text not null default '',
++  kiosk_id text not null default 'oxway_01',
+   provider_meta jsonb,
+   pdf_storage_path text not null,
+   cups_job_id text,
+@@ -36,6 +37,7 @@ create table print_jobs (
+ 
+ create index print_jobs_provider_order_id_idx on print_jobs (provider_order_id);
+ create index print_jobs_status_idx on print_jobs (status);
++create index print_jobs_kiosk_id_idx on print_jobs (kiosk_id);
+ 
+ -- The website and print agent both use the service_role key, which bypasses
+ -- RLS entirely, so no policies are strictly required. If you'd rather turn
+@@ -81,7 +83,26 @@ insert into kiosk_status (id) values ('oxway_01');
+ (`oxway_01` is the id `lib/kiosk-stats.ts` and `app/admin/page.tsx` both look
+ for — if you rename it, update both.)
+ 
+-## 5. Env vars
++## 5. Row Level Security policies
++
++The website's API routes and the Pi's print agent both use the service-role
++key, which bypasses RLS entirely — so these policies are purely about what
++the public anon key (used client-side, e.g. by `/kiosk-display`) can read:
++
++```sql
++alter table kiosk_status enable row level security;
++create policy "Public read access to kiosk status"
++on kiosk_status for select using (true);
++
++alter table print_jobs enable row level security;
++create policy "Public read status for kiosk display"
++on print_jobs for select using (true);
++
++-- print_orders is never read client-side — lock it fully closed.
++alter table print_orders enable row level security;
++```
++
++## 6. Env vars
+ 
+ Both the website and the Pi's print agent need the same three values:
+ 
+@@ -90,3 +111,8 @@ NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+ NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...
+ SUPABASE_SERVICE_ROLE_KEY=eyJ...
+ ```
++
++## 7. Multiple kiosks
++
++See [MULTI_KIOSK.md](./MULTI_KIOSK.md) — the schema above already includes
++`kiosk_id`, so adding kiosks later is just configuration, no code changes.
+diff --git a/app/api/create-order/route.ts b/app/api/create-order/route.ts
+index 35b7886..a728c56 100644
+--- a/app/api/create-order/route.ts
++++ b/app/api/create-order/route.ts
+@@ -26,6 +26,11 @@ export async function POST(request: Request) {
+     const selectedPages = JSON.parse(String(formData.get("selectedPages") || "[]")) as number[];
+     const settings = JSON.parse(String(formData.get("settings") || "{}")) as PrintSettingsSnapshot;
+     const totalPrice = Number(formData.get("totalPrice") || 0);
++    // Which physical kiosk this order is for — the customer's QR encodes it
++    // as a URL query param, the frontend forwards it here. Defaults to the
++    // single kiosk this project started with, so today's QR (no param)
++    // keeps working unchanged.
++    const kioskId = String(formData.get("kioskId") || "oxway_01");
+ 
+     if (!(file instanceof File)) return jsonError("Missing print-ready PDF.");
+     if (!fileName) return jsonError("Missing file name.");
+@@ -52,6 +57,7 @@ export async function POST(request: Request) {
+       provider,
+       providerOrderId: "",
+       pdfStoragePath,
++      kioskId,
+       createdAt: now,
+       updatedAt: now,
+     };
+diff --git a/app/kiosk-display/kiosk-display-view.tsx b/app/kiosk-display/kiosk-display-view.tsx
+new file mode 100644
+index 0000000..f4a02f1
+--- /dev/null
++++ b/app/kiosk-display/kiosk-display-view.tsx
+@@ -0,0 +1,117 @@
++"use client";
++// Renamed internal component — wrapped by page.tsx below in a Suspense boundary.
++
++import { useEffect, useState } from "react";
++import { useSearchParams } from "next/navigation";
++import Image from "next/image";
++import { supabase } from "@/lib/supabase";
++
++type LiveStatus =
++  | "idle"
++  | "pending_payment"
++  | "paid"
++  | "printing"
++  | "printed"
++  | "print_failed"
++  | "payment_failed"
++  | "expired";
++
++const STATUS_COPY: Record<LiveStatus, { headline: string; tone: "idle" | "progress" | "success" | "error" }> = {
++  idle: { headline: "Scan the QR code to get started", tone: "idle" },
++  pending_payment: { headline: "Waiting for payment...", tone: "progress" },
++  paid: { headline: "Payment verified — starting print...", tone: "progress" },
++  printing: { headline: "Printing your document...", tone: "progress" },
++  printed: { headline: "Printed! Please collect your document.", tone: "success" },
++  print_failed: { headline: "Print failed — please see staff.", tone: "error" },
++  payment_failed: { headline: "Payment failed — please try again.", tone: "error" },
++  expired: { headline: "Payment window expired.", tone: "error" },
++};
++
++// How long a finished/failed job keeps showing before the screen resets to idle.
++const SETTLE_DISPLAY_MS = 20_000;
++const POLL_INTERVAL_MS = 3000;
++
++function KioskDisplayView() {
++  const [status, setStatus] = useState<LiveStatus>("idle");
++  // This same page is shared across every kiosk — ?k=<kiosk-id> in the URL
++  // (matching this kiosk's own Chromium autostart command) scopes it to
++  // just this machine's jobs. Defaults to the original single kiosk.
++  const kioskId = useSearchParams().get("k") || "oxway_01";
++
++  useEffect(() => {
++    let cancelled = false;
++    let settledAt: number | null = null;
++
++    const poll = async () => {
++      const { data, error } = await supabase
++        .from("print_jobs")
++        .select("status, updated_at")
++        .eq("kiosk_id", kioskId)
++        .order("updated_at", { ascending: false })
++        .limit(1)
++        .maybeSingle();
++
++      if (cancelled) return;
++      if (error || !data) {
++        setStatus("idle");
++        return;
++      }
++
++      const isSettled = ["printed", "print_failed", "payment_failed", "expired"].includes(data.status);
++      if (isSettled) {
++        if (settledAt === null) settledAt = Date.now();
++        if (Date.now() - settledAt > SETTLE_DISPLAY_MS) {
++          setStatus("idle");
++          return;
++        }
++      } else {
++        settledAt = null;
++      }
++
++      setStatus(data.status as LiveStatus);
++    };
++
++    poll();
++    const interval = setInterval(poll, POLL_INTERVAL_MS);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, [kioskId]);
++
++  const copy = STATUS_COPY[status];
++  const toneClass =
++    copy.tone === "success"
++      ? "text-emerald-400"
++      : copy.tone === "error"
++        ? "text-red-400"
++        : copy.tone === "progress"
++          ? "text-blue-400"
++          : "text-slate-200";
++
++  return (
++    <div className="flex h-screen w-screen select-none items-center justify-center gap-16 bg-[#0b0f14] px-16 text-white">
++      <div className="flex flex-col items-center gap-6">
++        <div className="rounded-[2rem] bg-white p-8 shadow-2xl">
++          {/* Place the QR PNG at public/kiosk-qr.png — generated for this site's live URL. */}
++          <Image src="/kiosk-qr.png" alt="Scan to open the print kiosk" width={420} height={420} priority />
++        </div>
++        <p className="text-xl font-bold uppercase tracking-[0.3em] text-slate-400">Scan to upload &amp; print</p>
++      </div>
++
++      <div className="flex w-[420px] flex-col gap-4">
++        <p className="text-sm font-bold uppercase tracking-[0.3em] text-blue-500">OXWAY Print Kiosk</p>
++        <h1 className={`text-4xl font-black leading-tight transition-colors duration-500 ${toneClass}`}>
++          {copy.headline}
++        </h1>
++        {status === "idle" && (
++          <p className="text-lg text-slate-400">
++            Open your camera, scan the code, upload your file, and pay — your document prints here automatically.
++          </p>
++        )}
++      </div>
++    </div>
++  );
++}
++
++export default KioskDisplayView;
+diff --git a/app/kiosk-display/page.tsx b/app/kiosk-display/page.tsx
+new file mode 100644
+index 0000000..106facb
+--- /dev/null
++++ b/app/kiosk-display/page.tsx
+@@ -0,0 +1,10 @@
++import { Suspense } from "react";
++import KioskDisplayView from "./kiosk-display-view";
++
++export default function KioskDisplayPage() {
++  return (
++    <Suspense fallback={<div className="flex h-screen w-screen items-center justify-center bg-[#0b0f14]" />}>
++      <KioskDisplayView />
++    </Suspense>
++  );
++}
+diff --git a/components/PdfPageSelector.tsx b/components/PdfPageSelector.tsx
+index f608f0d..32ad75a 100644
+--- a/components/PdfPageSelector.tsx
++++ b/components/PdfPageSelector.tsx
+@@ -186,6 +186,11 @@ export default function PdfPageSelector() {
+       formData.append("selectedPages", JSON.stringify(activePages));
+       formData.append("settings", JSON.stringify(settings));
+       formData.append("totalPrice", String(totalPrice));
++      // Which kiosk this customer scanned — encoded in the QR as ?k=<kiosk-id>.
++      // Missing param means today's single-kiosk QR, which the server
++      // already defaults to the right thing.
++      const kioskId = new URLSearchParams(window.location.search).get("k");
++      if (kioskId) formData.append("kioskId", kioskId);
+ 
+       const response = await fetch("/api/create-order", { method: "POST", body: formData });
+       const order = await response.json();
+diff --git a/lib/config.ts b/lib/config.ts
+index 05a7a47..ad02362 100644
+--- a/lib/config.ts
++++ b/lib/config.ts
+@@ -23,6 +23,15 @@ export const PAYMENT_TIMEOUT_SECONDS = Number(process.env.PAYMENT_TIMEOUT_SECOND
+ /** CUPS printer name on the kiosk Pi. Leave unset to use the system default printer. */
+ export const PRINTER_NAME = process.env.PRINTER_NAME || "";
+ 
++/**
++ * Which physical kiosk this Pi's print agent is. Only relevant on the Pi
++ * side — the website is shared across all kiosks and reads the kiosk id
++ * from each job instead. Defaults to "oxway_01" (today's single kiosk).
++ * Give each new kiosk its own value here, matching what its QR code encodes
++ * — see MULTI_KIOSK.md.
++ */
++export const KIOSK_ID = process.env.KIOSK_ID || "oxway_01";
++
+ /** Supabase Storage bucket final print-ready PDFs are uploaded to. */
+ export const SUPABASE_PRINT_BUCKET = process.env.SUPABASE_PRINT_BUCKET || "print-jobs";
+ 
+diff --git a/lib/store.ts b/lib/store.ts
+index 763f690..76071fc 100644
+--- a/lib/store.ts
++++ b/lib/store.ts
+@@ -31,6 +31,12 @@ export interface PrintJobRecord {
+   providerMeta?: Record<string, string>;
+   /** Path inside SUPABASE_PRINT_BUCKET where the final, print-ready PDF lives. */
+   pdfStoragePath: string;
++  /**
++   * Which physical kiosk this job should print at. Defaults to "oxway_01"
++   * (today's single kiosk) so nothing changes until a second kiosk exists —
++   * see MULTI_KIOSK.md for how to add one.
++   */
++  kioskId: string;
+   createdAt: string;
+   updatedAt: string;
+   error?: string;
+@@ -50,6 +56,7 @@ interface PrintJobRow {
+   provider_order_id: string;
+   provider_meta: Record<string, string> | null;
+   pdf_storage_path: string;
++  kiosk_id: string;
+   created_at: string;
+   updated_at: string;
+   error: string | null;
+@@ -68,6 +75,7 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
+     providerOrderId: row.provider_order_id,
+     providerMeta: row.provider_meta ?? undefined,
+     pdfStoragePath: row.pdf_storage_path,
++    kioskId: row.kiosk_id,
+     createdAt: row.created_at,
+     updatedAt: row.updated_at,
+     error: row.error ?? undefined,
+@@ -87,6 +95,7 @@ function toInsertRow(job: PrintJobRecord): Partial<PrintJobRow> {
+     provider_order_id: job.providerOrderId,
+     provider_meta: job.providerMeta ?? null,
+     pdf_storage_path: job.pdfStoragePath,
++    kiosk_id: job.kioskId,
+     created_at: job.createdAt,
+     updated_at: job.updatedAt,
+   };
+@@ -151,8 +160,13 @@ export async function claimJobForPrinting(jobId: string): Promise<PrintJobRecord
+   return data ? fromRow(data as PrintJobRow) : null;
+ }
+ 
+-export async function listPaidJobs(): Promise<PrintJobRecord[]> {
+-  const { data, error } = await supabaseAdmin().from("print_jobs").select("*").eq("status", "paid");
++/** Scoped to a single kiosk — each Pi's print agent only ever sees its own jobs. */
++export async function listPaidJobs(kioskId: string): Promise<PrintJobRecord[]> {
++  const { data, error } = await supabaseAdmin()
++    .from("print_jobs")
++    .select("*")
++    .eq("status", "paid")
++    .eq("kiosk_id", kioskId);
+   if (error) throw new Error(`Could not list paid jobs: ${error.message}`);
+   return (data as PrintJobRow[]).map(fromRow);
+ }
+diff --git a/print-agent/index.ts b/print-agent/index.ts
+index e3b62c9..e2d69bb 100644
+--- a/print-agent/index.ts
++++ b/print-agent/index.ts
+@@ -25,7 +25,7 @@ loadEnv({ path: path.resolve(process.cwd(), ".env.local"), override: true });
+ 
+ import { writeFile, mkdtemp, rm } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+-import { PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
++import { KIOSK_ID, PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
+ import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
+ import { submitPrintJob, isJobStillQueued } from "../lib/print/cups";
+ import { recordCompletedPrint } from "../lib/kiosk-stats";
+@@ -89,10 +89,10 @@ function sleep(ms: number): Promise<void> {
+ }
+ 
+ async function pollLoop(): Promise<void> {
+-  console.log(`[print-agent] Watching for paid jobs every ${PRINT_AGENT_POLL_INTERVAL_MS}ms...`);
++  console.log(`[print-agent] Kiosk "${KIOSK_ID}" watching for paid jobs every ${PRINT_AGENT_POLL_INTERVAL_MS}ms...`);
+   for (;;) {
+     try {
+-      const paidJobs = await listPaidJobs();
++      const paidJobs = await listPaidJobs(KIOSK_ID);
+       for (const job of paidJobs) {
+         await processJob(job);
+       }

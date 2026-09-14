@@ -186,6 +186,11 @@ export default function PdfPageSelector() {
       formData.append("selectedPages", JSON.stringify(activePages));
       formData.append("settings", JSON.stringify(settings));
       formData.append("totalPrice", String(totalPrice));
+      // Which kiosk this customer scanned — encoded in the QR as ?k=<kiosk-id>.
+      // Missing param means today's single-kiosk QR, which the server
+      // already defaults to the right thing.
+      const kioskId = new URLSearchParams(window.location.search).get("k");
+      if (kioskId) formData.append("kioskId", kioskId);
 
       const response = await fetch("/api/create-order", { method: "POST", body: formData });
       const order = await response.json();

@@ -26,6 +26,11 @@ export async function POST(request: Request) {
     const selectedPages = JSON.parse(String(formData.get("selectedPages") || "[]")) as number[];
     const settings = JSON.parse(String(formData.get("settings") || "{}")) as PrintSettingsSnapshot;
     const totalPrice = Number(formData.get("totalPrice") || 0);
+    // Which physical kiosk this order is for — the customer's QR encodes it
+    // as a URL query param, the frontend forwards it here. Defaults to the
+    // single kiosk this project started with, so today's QR (no param)
+    // keeps working unchanged.
+    const kioskId = String(formData.get("kioskId") || "oxway_01");
 
     if (!(file instanceof File)) return jsonError("Missing print-ready PDF.");
     if (!fileName) return jsonError("Missing file name.");
@@ -52,6 +57,7 @@ export async function POST(request: Request) {
       provider,
       providerOrderId: "",
       pdfStoragePath,
+      kioskId,
       createdAt: now,
       updatedAt: now,
     };

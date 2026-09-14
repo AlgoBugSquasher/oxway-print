@@ -26,6 +26,7 @@ create table print_jobs (
   total_price numeric not null,
   provider text not null,
   provider_order_id text not null default '',
+  kiosk_id text not null default 'oxway_01',
   provider_meta jsonb,
   pdf_storage_path text not null,
   cups_job_id text,
@@ -36,6 +37,7 @@ create table print_jobs (
 
 create index print_jobs_provider_order_id_idx on print_jobs (provider_order_id);
 create index print_jobs_status_idx on print_jobs (status);
+create index print_jobs_kiosk_id_idx on print_jobs (kiosk_id);
 
 -- The website and print agent both use the service_role key, which bypasses
 -- RLS entirely, so no policies are strictly required. If you'd rather turn
@@ -81,7 +83,26 @@ insert into kiosk_status (id) values ('oxway_01');
 (`oxway_01` is the id `lib/kiosk-stats.ts` and `app/admin/page.tsx` both look
 for — if you rename it, update both.)
 
-## 5. Env vars
+## 5. Row Level Security policies
+
+The website's API routes and the Pi's print agent both use the service-role
+key, which bypasses RLS entirely — so these policies are purely about what
+the public anon key (used client-side, e.g. by `/kiosk-display`) can read:
+
+```sql
+alter table kiosk_status enable row level security;
+create policy "Public read access to kiosk status"
+on kiosk_status for select using (true);
+
+alter table print_jobs enable row level security;
+create policy "Public read status for kiosk display"
+on print_jobs for select using (true);
+
+-- print_orders is never read client-side — lock it fully closed.
+alter table print_orders enable row level security;
+```
+
+## 6. Env vars
 
 Both the website and the Pi's print agent need the same three values:
 
@@ -90,3 +111,8 @@ NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...
 SUPABASE_SERVICE_ROLE_KEY=eyJ...
 ```
+
+## 7. Multiple kiosks
+
+See [MULTI_KIOSK.md](./MULTI_KIOSK.md) — the schema above already includes
+`kiosk_id`, so adding kiosks later is just configuration, no code changes.
