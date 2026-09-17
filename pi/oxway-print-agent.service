@@ -1,0 +1,23 @@
+[Unit]
+# ROADMAP.md — the print agent must survive reboots and auto-restart if it
+# ever crashes (a Supabase blip, an unhandled exception, etc.) without
+# anyone needing to notice and manually restart it. See pi/launch-kiosk.sh
+# for the matching autostart piece (the kiosk-display browser).
+Description=OXWAY print agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these three lines for your actual Pi setup before installing:
+User=pi
+WorkingDirectory=/home/pi/oxway-print-v2.5
+# Run `which npm` on the Pi and use its real path here if this one's wrong.
+ExecStart=/usr/bin/npm run print-agent
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
