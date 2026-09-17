@@ -44,20 +44,22 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   // automatically, with no change needed here, if §1 is ever re-enabled.
   const last4 = job.phoneNumber.slice(-4);
 
-  // Pinned near the top of the page rather than centered on it, so the
-  // pickup code is visible with barely a glance at the stack — no need to
-  // lift/flip the page to find it further down.
+  // Pinned near the BOTTOM of the page (not the top) — this printer outputs
+  // pages such that the bottom edge is what's immediately visible/reachable
+  // on the stack, the reverse of a typical top-first assumption. If a
+  // different printer/output tray needs the opposite again later, these are
+  // the only y-coordinates that need flipping back.
   const label = "PICKUP ID";
   banner.drawText(label, {
     x: centeredX(bold, label, 24, A4_WIDTH),
-    y: A4_HEIGHT - 70,
+    y: 245,
     size: 24,
     font: bold,
     color: rgb(0.29, 0.33, 0.41),
   });
   banner.drawText(pickupCode, {
     x: centeredX(bold, pickupCode, 90, A4_WIDTH),
-    y: A4_HEIGHT - 190,
+    y: 125,
     size: 90,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),
@@ -65,18 +67,18 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const detailLine = last4 ? `Phone ***${last4}  ·  ${timestamp}` : timestamp;
   banner.drawText(detailLine, {
     x: centeredX(regular, detailLine, 13, A4_WIDTH),
-    y: A4_HEIGHT - 230,
+    y: 85,
     size: 13,
     font: regular,
     color: rgb(0.45, 0.5, 0.57),
   });
-  // Kept small, below the fold — useful for staff tracing a specific
-  // printout back to its exact job (e.g. in Supabase or a support
-  // conversation) without being confused for the pickup code itself.
+  // Kept small — useful for staff tracing a specific printout back to its
+  // exact job (e.g. in Supabase or a support conversation) without being
+  // confused for the pickup code itself.
   const requestIdLine = `Request ID: ${requestId}`;
   banner.drawText(requestIdLine, {
     x: centeredX(regular, requestIdLine, 11, A4_WIDTH),
-    y: A4_HEIGHT - 250,
+    y: 65,
     size: 11,
     font: regular,
     color: rgb(0.65, 0.68, 0.72),
@@ -84,7 +86,7 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const brand = "OXWAY";
   banner.drawText(brand, {
     x: centeredX(bold, brand, 16, A4_WIDTH),
-    y: 60,
+    y: 30,
     size: 16,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),

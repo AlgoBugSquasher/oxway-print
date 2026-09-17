@@ -11,18 +11,23 @@ const MEDIA_BY_PAPER_SIZE: Record<PrintSettingsSnapshot["paperSize"], string> = 
   Legal: "legal",
 };
 
-// IPP orientation-requested values: 3 = portrait, 4 = landscape.
-const ORIENTATION_BY_LAYOUT: Record<PrintSettingsSnapshot["layout"], string> = {
-  portrait: "3",
-  landscape: "4",
-};
-
 function buildLpArgs(filePath: string, settings: PrintSettingsSnapshot): string[] {
   const args: string[] = [];
   if (PRINTER_NAME) args.push("-d", PRINTER_NAME);
   args.push("-n", String(Math.max(1, settings.copies)));
   args.push("-o", `media=${MEDIA_BY_PAPER_SIZE[settings.paperSize]}`);
-  args.push("-o", `orientation-requested=${ORIENTATION_BY_LAYOUT[settings.layout]}`);
+  // Deliberately NOT setting orientation-requested here (ROADMAP.md #15).
+  // The generated PDF's own /Rotate is already the source of truth for
+  // orientation — verified directly against pdf-lib's actual behavior, not
+  // assumed. Also setting orientation-requested told the printer to
+  // physically rotate the paper feed AND told it the content was already
+  // pre-rotated, at the same time — two independent rotation instructions
+  // for the same job, which a driver honoring both nets out to a double
+  // rotation (upside-down or sideways-wrong), not "no rotation." If content
+  // still doesn't come out oriented correctly after this change, the next
+  // thing to check is which physical direction /Rotate 90 vs 270 actually
+  // needs to be for this printer/driver — see extractSelectedPages's own
+  // "UNVERIFIED" note in lib/print/pdf.ts.
   args.push("-o", `number-up=${settings.pagesPerSheet}`);
   // The generated PDF's own page dimensions don't always exactly match the
   // customer's chosen paper size (an uploaded file's native page size, or a
