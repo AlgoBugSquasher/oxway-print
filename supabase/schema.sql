@@ -225,6 +225,16 @@ $$;
 -- Dropped first because Postgres refuses CREATE OR REPLACE when the return
 -- type changes — safe to re-run this file from scratch even if an earlier
 -- version of this function (a plain `returns integer`) already exists.
+--
+-- ON CONFLICT targets the primary key BY NAME (kiosk_ticket_counters_pkey,
+-- Postgres's default name for an unnamed inline `primary key (...)`) rather
+-- than by column list `(kiosk_id, ticket_date)` — that column-list form is
+-- parsed as an expression list (it has to be, since Postgres also allows
+-- expression-based unique indexes there), and `RETURNS TABLE(..., ticket_date
+-- date)` makes `ticket_date` an implicit PL/pgSQL variable for this whole
+-- function body. The two together made every bare `ticket_date` in an
+-- expression position ambiguous — which column list isn't, so it never
+-- showed up until Postgres actually tried to resolve the ON CONFLICT target.
 drop function if exists public.next_ticket_number(text);
 create or replace function public.next_ticket_number(p_kiosk_id text)
 returns table(ticket_number integer, ticket_date date)
@@ -236,7 +246,7 @@ declare
 begin
   insert into kiosk_ticket_counters (kiosk_id, ticket_date, last_number)
   values (p_kiosk_id, v_ticket_date, 1)
-  on conflict (kiosk_id, ticket_date) do update
+  on conflict on constraint kiosk_ticket_counters_pkey do update
     set last_number = kiosk_ticket_counters.last_number + 1
   returning last_number into v_number;
   return query select v_number, v_ticket_date;

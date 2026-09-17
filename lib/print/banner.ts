@@ -28,6 +28,14 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const regular = await output.embedFont(StandardFonts.Helvetica);
 
   const banner = output.addPage([A4_WIDTH, A4_HEIGHT]);
+  // ROADMAP.md §21's ticket code is the number shown to the customer on
+  // their phone and on the kiosk screen — the banner has to print the SAME
+  // code, big, or the whole point of a pickup-ID page (matching what's on
+  // paper to what the customer is looking at) breaks. Falls back to the
+  // Request ID only in the defensive case a job somehow reached printing
+  // without one assigned, which shouldn't happen since §21 assigns it at
+  // creation — never expected in practice, just not a hard crash if it did.
+  const pickupCode = job.ticketNumber != null ? `#${String(job.ticketNumber).padStart(3, "0")}` : shortRequestId(job.id);
   const requestId = shortRequestId(job.id);
   const timestamp = new Date(job.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
   // Phone number collection (ROADMAP.md §1) is disabled in this build, so
@@ -36,17 +44,20 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   // automatically, with no change needed here, if §1 is ever re-enabled.
   const last4 = job.phoneNumber.slice(-4);
 
+  // Pinned near the top of the page rather than centered on it, so the
+  // pickup code is visible with barely a glance at the stack — no need to
+  // lift/flip the page to find it further down.
   const label = "PICKUP ID";
   banner.drawText(label, {
     x: centeredX(bold, label, 24, A4_WIDTH),
-    y: A4_HEIGHT - 220,
+    y: A4_HEIGHT - 70,
     size: 24,
     font: bold,
     color: rgb(0.29, 0.33, 0.41),
   });
-  banner.drawText(requestId, {
-    x: centeredX(bold, requestId, 90, A4_WIDTH),
-    y: A4_HEIGHT - 340,
+  banner.drawText(pickupCode, {
+    x: centeredX(bold, pickupCode, 90, A4_WIDTH),
+    y: A4_HEIGHT - 190,
     size: 90,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),
@@ -54,10 +65,21 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const detailLine = last4 ? `Phone ***${last4}  ·  ${timestamp}` : timestamp;
   banner.drawText(detailLine, {
     x: centeredX(regular, detailLine, 13, A4_WIDTH),
-    y: A4_HEIGHT - 400,
+    y: A4_HEIGHT - 230,
     size: 13,
     font: regular,
     color: rgb(0.45, 0.5, 0.57),
+  });
+  // Kept small, below the fold — useful for staff tracing a specific
+  // printout back to its exact job (e.g. in Supabase or a support
+  // conversation) without being confused for the pickup code itself.
+  const requestIdLine = `Request ID: ${requestId}`;
+  banner.drawText(requestIdLine, {
+    x: centeredX(regular, requestIdLine, 11, A4_WIDTH),
+    y: A4_HEIGHT - 250,
+    size: 11,
+    font: regular,
+    color: rgb(0.65, 0.68, 0.72),
   });
   const brand = "OXWAY";
   banner.drawText(brand, {
