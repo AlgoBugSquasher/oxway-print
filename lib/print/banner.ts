@@ -44,22 +44,22 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   // automatically, with no change needed here, if §1 is ever re-enabled.
   const last4 = job.phoneNumber.slice(-4);
 
-  // Pinned near the BOTTOM of the page (not the top) — this printer outputs
-  // pages such that the bottom edge is what's immediately visible/reachable
-  // on the stack, the reverse of a typical top-first assumption. If a
-  // different printer/output tray needs the opposite again later, these are
-  // the only y-coordinates that need flipping back.
+  // Centered vertically on the page — moving this text up or down can't
+  // actually change which physical edge faces the printer's mechanism
+  // (that's fixed by the paper path, not by where content sits on the
+  // page), so there's no positioning that fixes accessibility on a given
+  // printer; middle is the neutral default that isn't wrong for any of them.
   const label = "PICKUP ID";
   banner.drawText(label, {
     x: centeredX(bold, label, 24, A4_WIDTH),
-    y: 245,
+    y: A4_HEIGHT - 220,
     size: 24,
     font: bold,
     color: rgb(0.29, 0.33, 0.41),
   });
   banner.drawText(pickupCode, {
     x: centeredX(bold, pickupCode, 90, A4_WIDTH),
-    y: 125,
+    y: A4_HEIGHT - 340,
     size: 90,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),
@@ -67,7 +67,7 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const detailLine = last4 ? `Phone ***${last4}  ·  ${timestamp}` : timestamp;
   banner.drawText(detailLine, {
     x: centeredX(regular, detailLine, 13, A4_WIDTH),
-    y: 85,
+    y: A4_HEIGHT - 400,
     size: 13,
     font: regular,
     color: rgb(0.45, 0.5, 0.57),
@@ -78,7 +78,7 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const requestIdLine = `Request ID: ${requestId}`;
   banner.drawText(requestIdLine, {
     x: centeredX(regular, requestIdLine, 11, A4_WIDTH),
-    y: 65,
+    y: A4_HEIGHT - 420,
     size: 11,
     font: regular,
     color: rgb(0.65, 0.68, 0.72),
@@ -86,7 +86,7 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const brand = "OXWAY";
   banner.drawText(brand, {
     x: centeredX(bold, brand, 16, A4_WIDTH),
-    y: 30,
+    y: 60,
     size: 16,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),

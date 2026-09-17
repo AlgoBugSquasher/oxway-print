@@ -6,23 +6,30 @@ import type { PrintSettingsSnapshot } from "../store";
  * uploaded PDF, and rotates portrait-dimensioned pages when the customer
  * requested landscape output (ROADMAP.md #15).
  *
- * Rotation is done here, on the PDF page content itself, rather than relying
- * on CUPS's `orientation-requested` option (still set in lib/print/cups.ts)
- * — that flag mostly instructs the printer how paper feeds and doesn't
- * reliably rotate content with a community driver like splix. Setting the
- * PDF page's own /Rotate value is driver-independent: CUPS's own PDF-to-
- * raster filter chain honors it when rasterizing, regardless of what the
- * driver does with the separate IPP attribute.
+ * ROADMAP.md #15 v1 set the page's /Rotate attribute (`page.setRotation()`)
+ * and left `orientation-requested` out of the CUPS args, expecting the
+ * printer's PDF-to-raster filter chain to honor /Rotate regardless of the
+ * driver. In practice, on this printer's actual CUPS/splix setup, the
+ * printed output came out IDENTICAL regardless of the layout setting —
+ * meaning /Rotate itself was being silently ignored somewhere in that
+ * filter chain, not just misapplied. This version bakes the rotation
+ * directly into the page's own content geometry instead (an actual
+ * coordinate transform, with the page's own width/height swapped), so
+ * there's no separate rotation instruction left for anything to ignore —
+ * the content's coordinates already describe the rotated layout.
+ *
+ * The transform used — draw the embedded source page at
+ * `{ x: height, y: 0, rotate: degrees(90) }` onto a new page sized
+ * `[height, width]` — is pdf-lib's own rotate-then-translate composition
+ * (verified directly against its operator-generation source, not assumed)
+ * for exactly the matrix PDF viewers use to bake in a /Rotate=90
+ * (clockwise) page: `[0, 1, -1, 0, height, 0]`. The two were checked to
+ * produce identical numbers before shipping this.
  *
  * NOT handled here (out of scope for the documented bug): a source page
  * that's already landscape-dimensioned with `layout: "portrait"` selected.
  * ROADMAP.md #15 only describes the portrait-source + landscape-setting
  * failure; the symmetric case isn't reported as broken and isn't touched.
- *
- * UNVERIFIED: which rotation direction (clockwise vs counterclockwise)
- * actually reads right on the real ML-1866W + splix combination hasn't been
- * confirmed on physical hardware — 90° clockwise is the common convention
- * and is what's used below, but this needs a real test print to confirm.
  */
 export interface ExtractedPdf {
   bytes: Uint8Array;
@@ -54,14 +61,18 @@ export async function extractSelectedPages(
     throw new Error("No valid pages selected to print.");
   }
 
-  const copiedPages = await output.copyPages(source, zeroIndexed);
-  copiedPages.forEach((page) => {
-    if (layout === "landscape") {
-      const { width, height } = page.getSize();
-      const isPortraitDimensioned = height >= width;
-      if (isPortraitDimensioned) page.setRotation(degrees(90));
+  const embeddedPages = await output.embedPdf(source, zeroIndexed);
+  embeddedPages.forEach((embeddedPage) => {
+    const { width, height } = embeddedPage;
+    const isPortraitDimensioned = height >= width;
+
+    if (layout === "landscape" && isPortraitDimensioned) {
+      const page = output.addPage([height, width]);
+      page.drawPage(embeddedPage, { x: height, y: 0, rotate: degrees(90) });
+    } else {
+      const page = output.addPage([width, height]);
+      page.drawPage(embeddedPage, { x: 0, y: 0 });
     }
-    output.addPage(page);
   });
 
   return { bytes: await output.save(), pageCount: output.getPageCount() };
