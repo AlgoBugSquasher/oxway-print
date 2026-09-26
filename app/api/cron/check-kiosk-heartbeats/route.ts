@@ -13,8 +13,8 @@ export const dynamic = "force-dynamic";
  * ROADMAP.md #8 — a kiosk's own print agent can't alert on its own silence
  * (if it's down, nothing runs to send the alert), so this has to be an
  * independent, server-side check, same reasoning as #9's payment recheck.
- * Reads kiosk_status.updated_at, which the print agent now touches on its
- * own heartbeat timer (see print-agent/index.ts) — not just after printing.
+ * Reads kiosk_status.last_seen_at, which the print agent touches on its own
+ * heartbeat timer (see print-agent/index.ts), independent of print activity.
  *
  * KNOWN LIMITATION, not an oversight: unlike the low-supply alert in
  * lib/kiosk-stats.ts, there's no "alert once, not every cycle" debounce here
@@ -38,7 +38,13 @@ export async function GET(request: Request) {
     const kiosks = await listKioskHeartbeats();
     const now = Date.now();
     const silentKiosks = kiosks
-      .map((kiosk) => ({ ...kiosk, minutesSinceLastSeen: Math.round((now - new Date(kiosk.updatedAt).getTime()) / 60_000) }))
+      // A kiosk that has never sent a heartbeat (null last_seen_at — e.g. right
+      // after last_seen_at was added, before its print agent restarted) counts
+      // as silent rather than being skipped.
+      .map((kiosk) => ({
+        ...kiosk,
+        minutesSinceLastSeen: kiosk.lastSeenAt ? Math.round((now - new Date(kiosk.lastSeenAt).getTime()) / 60_000) : Number.POSITIVE_INFINITY,
+      }))
       .filter((kiosk) => kiosk.minutesSinceLastSeen >= KIOSK_SILENT_THRESHOLD_MINUTES);
 
     // Disabled for v2.5 — see the §2 note in this file's imports above.

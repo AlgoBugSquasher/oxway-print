@@ -4,6 +4,7 @@ import { type FormEvent, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, KeyRound, LogIn, RefreshCw } from "lucide-react";
+import BrandWordmark from "@/components/BrandWordmark";
 import { fetchJson } from "@/lib/fetch-json";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 
@@ -72,12 +73,12 @@ export default function AdminLoginPage() {
           <ArrowLeft size={14} /> Back to printing
         </Link>
         <div className="mb-6 flex items-center gap-3">
-          <div className="grid size-10 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20">
+          <div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20">
             <LogIn size={19} />
           </div>
           <div>
-            <p className="text-sm font-black tracking-[0.16em] text-blue-600">OXWAY</p>
-            <p className="text-xs text-slate-500">Admin sign in</p>
+            <BrandWordmark className="h-10" />
+            <p className="mt-1.5 text-xs text-slate-500">Admin sign in</p>
           </div>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">

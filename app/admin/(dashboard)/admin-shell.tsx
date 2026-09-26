@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
+import BrandWordmark from "@/components/BrandWordmark";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import type { AdminRole } from "@/lib/admin/types";
 
@@ -31,8 +32,11 @@ export default function AdminShell({ children, email, role }: { children: ReactN
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-5 py-4 lg:px-8">
           <div className="flex flex-wrap items-center gap-6">
             <Link href="/" className="block">
-              <p className="text-sm font-black tracking-[0.16em] text-blue-600">OXWAY ADMIN</p>
-              <p className="text-xs text-slate-500">{email} &middot; {role}</p>
+              <div className="flex items-center gap-2">
+                <BrandWordmark className="h-6" />
+                <span className="text-xs font-black uppercase tracking-[0.2em] text-slate-400">Admin</span>
+              </div>
+              <p className="mt-1 text-xs text-slate-500">{email} &middot; {role}</p>
             </Link>
             <nav className="flex items-center gap-1">
               {navItems.map(({ href, label, icon: Icon }) => (

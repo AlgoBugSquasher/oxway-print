@@ -54,17 +54,23 @@ export const CREATE_ORDER_RATE_LIMIT_WINDOW_SECONDS = 60;
 export const DUPLICATE_ORDER_WINDOW_SECONDS = 60;
 
 /**
- * Heartbeat monitoring (ROADMAP.md #8). Reuses kiosk_status.updated_at as
- * the heartbeat signal instead of a dedicated column — the print agent
- * touches it on its own timer, independent of the job-polling loop, so a
- * kiosk with zero jobs for hours still reads as alive. Touched every minute
- * rather than every poll cycle (default 4s) to keep the write volume against
- * Supabase's free-tier request quota reasonable — heartbeat doesn't need
- * job-polling precision.
+ * Heartbeat monitoring (ROADMAP.md #8). Writes to kiosk_status.last_seen_at,
+ * a dedicated column separate from updated_at (which also moves on every
+ * print-counter update) — the print agent touches it on its own timer,
+ * independent of the job-polling loop, so a kiosk with zero jobs for hours
+ * still reads as alive. Every 20s so the website's own-online indicator
+ * (ONLINE_THRESHOLD_SECONDS below) can react within well under a minute.
  */
-export const KIOSK_HEARTBEAT_INTERVAL_MS = 60_000;
-/** A kiosk silent longer than this is flagged stale — generous enough (10x the heartbeat interval) to absorb a transient blip without a false alarm. */
+export const KIOSK_HEARTBEAT_INTERVAL_MS = 20_000;
+/** A kiosk silent longer than this is flagged stale for the owner-alert cron — generous enough to absorb a transient blip without a false alarm. */
 export const KIOSK_SILENT_THRESHOLD_MINUTES = 10;
+/**
+ * How stale kiosk_status.last_seen_at can be before the customer-facing
+ * website treats the kiosk as offline. 3x the heartbeat interval above —
+ * enough to absorb one or two missed beats without flapping the banner on a
+ * momentary network blip.
+ */
+export const ONLINE_THRESHOLD_SECONDS = 60;
 
 /** Where low-supply / kiosk-silent alerts (ROADMAP.md #8) go — the owner, not a customer. No real SMS/WhatsApp provider is wired yet (see lib/notify/console.ts), so this only matters once one is. */
 export const OWNER_ALERT_PHONE = process.env.OWNER_ALERT_PHONE || "";

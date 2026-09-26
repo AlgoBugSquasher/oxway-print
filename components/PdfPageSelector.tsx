@@ -21,14 +21,20 @@ import {
   RefreshCw,
   Settings2,
   Sun,
+  WifiOff,
   X,
 } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+import BrandWatermark from "@/components/BrandWatermark";
+import BrandWordmark from "@/components/BrandWordmark";
 import LivePrintPreview from "@/components/LivePrintPreview";
 import { convertFileInBrowser, isSupportedClientFile } from "@/lib/client-file-converter";
+import { reportClientError } from "@/lib/client-log";
 import { fetchJson } from "@/lib/fetch-json";
 import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
 import type { CreateOrderOutput } from "@/lib/payment";
+import { createSupabaseBrowserClient } from "@/lib/supabase";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
@@ -68,6 +74,46 @@ const PRICE_BW = 2;
 const PRICE_COLOR = 10;
 // Physical-sheet threshold above which the pickup-ID banner defaults to checked. See ROADMAP.md #5.
 const BANNER_AUTO_THRESHOLD_SHEETS = 10;
+// Once a job reaches one of these, nothing about it changes again — no point
+// still polling or staying subscribed to Realtime for it.
+const TERMINAL_ORDER_STATUSES: OrderStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled"];
+// Not latency-sensitive (see the kiosk online/offline signal's own doc) — a
+// device outage or recovery showing up within ~15s is plenty responsive for
+// a banner, so this stays a plain poll rather than Realtime.
+const KIOSK_STATUS_POLL_INTERVAL_MS = 12_000;
+
+/**
+ * Short beep via the Web Audio API rather than shipping/loading an audio
+ * file — one self-contained function, nothing to fetch or fail to load.
+ */
+function playPrintReadySound() {
+  try {
+    const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const context = new AudioContextClass();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.35);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.35);
+    oscillator.onended = () => void context.close();
+  } catch {
+    // Web Audio unavailable/blocked — the desktop notification below still gets through.
+  }
+}
+
+/** Fires the "your print is ready" browser notification + sound. Permission is requested once on mount (see the effect below); if it was never granted, this just skips the Notification and the sound still plays. */
+function notifyPrintReady() {
+  playPrintReadySound();
+  if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+    new Notification("Your print is ready", { body: "Please collect it from the kiosk." });
+  }
+}
 // Phone number collection (ROADMAP.md §1) is disabled for v2.5 — the input
 // below and everything that used it (isPhoneValid, the payment-button
 // gate, Razorpay's prefill) are commented out, not deleted.
@@ -127,6 +173,52 @@ export default function PdfPageSelector() {
   // payment time — pdfjs consumes the response body when rendering thumbnails.
   const pdfBytesRef = useRef<Uint8Array | null>(null);
 
+  // Which kiosk this customer scanned (?k=<kiosk-id> in the QR URL) — a lazy
+  // initializer rather than an effect+setState, since it never needs to
+  // change after mount (matches how handleStartPayment already reads the
+  // same param below, both avoiding next/navigation's useSearchParams so
+  // this component doesn't need a Suspense boundary just for this).
+  const [kioskId] = useState(() => (typeof window === "undefined" ? "oxway_01" : new URLSearchParams(window.location.search).get("k") || "oxway_01"));
+
+  // Device online/offline heartbeat signal — polled independently of order
+  // status, since it's relevant both before and after payment.
+  const [isKioskOnline, setIsKioskOnline] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await fetchJson<{ isOnline: boolean }>(`/api/kiosk-status/${kioskId}`);
+        if (!cancelled) setIsKioskOnline(data.isOnline);
+      } catch {
+        // Best-effort — a failed check just skips this tick rather than flipping the banner on.
+      }
+    };
+    void poll();
+    const interval = setInterval(poll, KIOSK_STATUS_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [kioskId]);
+
+  // Whether the Realtime subscription below is actually connected — the
+  // fallback poll effect uses this to back off once Realtime is doing the
+  // job, and to keep running if it isn't (not yet enabled for print_jobs in
+  // the Supabase dashboard, or a dropped socket).
+  const [isRealtimeConnected, setIsRealtimeConnected] = useState(false);
+  // Guards the "printed" notification/sound so it fires exactly once per job,
+  // not on every subsequent update while status stays "printed".
+  const notifiedPrintedForJobRef = useRef<string | null>(null);
+
+  // Notification permission is requested once, non-blockingly, on load — the
+  // customer never has to do anything for the payment/print flow to keep
+  // working even if they dismiss or ignore the browser's prompt.
+  useEffect(() => {
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      void Notification.requestPermission();
+    }
+  }, []);
+
   // const isPhoneValid = PHONE_PATTERN.test(phone);
 
   const activePages = useMemo(() => {
@@ -159,14 +251,33 @@ export default function PdfPageSelector() {
     setJobId(null);
     setBannerOverride(null);
     pdfBytesRef.current = null;
+
+    // Diagnostic context for reportClientError below — added specifically to
+    // debug iPhone 15/15 Plus Safari PDF-upload failures that can't be
+    // reproduced on desktop. `stage` records how far processing got before
+    // it broke, `stallTimer` catches the other failure shape a thrown error
+    // can't: pdf.js's worker (loaded from a CDN — see the workerSrc setup at
+    // the top of this file) hanging instead of rejecting, which would
+    // otherwise leave the "Preparing your document..." spinner running
+    // forever with nothing in any log at all.
+    const fileMeta = { name: uploadedFile.name, type: uploadedFile.type, size: uploadedFile.size };
+    let stage = "convert";
+    let settled = false;
+    const stallTimer = setTimeout(() => {
+      if (!settled) reportClientError("upload-stalled", new Error(`Still stuck at "${stage}" after 15s`), fileMeta);
+    }, 15000);
+
     try {
+      stage = "convert";
       const normalizedPdfBytes = await convertFileInBrowser(uploadedFile);
       pdfBytesRef.current = normalizedPdfBytes;
+      stage = "pdfjs-load";
       const pdf = await pdfjsLib.getDocument({ data: normalizedPdfBytes.slice() }).promise;
       setTotalPages(pdf.numPages);
       setSelectedPages(Array.from({ length: pdf.numPages }, (_, index) => index + 1));
       const renderedPages: PageThumbnail[] = [];
       for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+        stage = `render-page-${pageNumber}`;
         const page = await pdf.getPage(pageNumber);
         const viewport = page.getViewport({ scale: 0.38 });
         const canvas = document.createElement("canvas");
@@ -183,11 +294,13 @@ export default function PdfPageSelector() {
       }
       setThumbnails(renderedPages);
     } catch (loadError) {
-      console.error(loadError);
+      reportClientError(`upload-failed:${stage}`, loadError, fileMeta);
       setFile(null);
       setPreviewUrl("");
       setError(loadError instanceof Error ? loadError.message : "We could not read this file. Please try another one.");
     } finally {
+      settled = true;
+      clearTimeout(stallTimer);
       setIsLoading(false);
     }
   };
@@ -232,11 +345,11 @@ export default function PdfPageSelector() {
       // ignores this field entirely regardless, but not sent for clarity.
       // formData.append("phone", phone);
       formData.append("includeBannerPage", String(includeBannerPage));
-      // Which kiosk this customer scanned — encoded in the QR as ?k=<kiosk-id>.
-      // Missing param means today's single-kiosk QR, which the server
-      // already defaults to the right thing.
-      const kioskId = new URLSearchParams(window.location.search).get("k");
-      if (kioskId) formData.append("kioskId", kioskId);
+      // kioskId (state, above) is read from the QR's ?k=<kiosk-id> param on
+      // mount; only sent when explicitly present so the server's own
+      // single-kiosk default still applies otherwise.
+      const paramKioskId = new URLSearchParams(window.location.search).get("k");
+      if (paramKioskId) formData.append("kioskId", paramKioskId);
 
       const order = await fetchJson<{ jobId: string } & CreateOrderOutput>("/api/create-order", { method: "POST", body: formData });
 
@@ -276,39 +389,92 @@ export default function PdfPageSelector() {
     }
   };
 
-  // Polls the server for real payment/print status. The server verifies
-  // payment directly with the gateway (outbound call, works from anywhere)
-  // and the kiosk's separate print agent picks up "paid" jobs and prints
-  // them — this just reflects that status back to the customer.
+  // Shared by both the poll effect and the Realtime subscription below, so
+  // "what a status change means for the UI" (confetti, error text, the
+  // print-ready notification) lives in exactly one place regardless of which
+  // path delivered it.
+  const applyStatusUpdate = (forJobId: string, next: { status: OrderStatus; error?: string | null; ticketNumber?: number | null }) => {
+    if (next.ticketNumber !== undefined) setTicketNumber(next.ticketNumber ?? null);
+    setOrderStatus((current) => {
+      if (next.status === current) return current;
+      if (next.status === "paid" || next.status === "printed") {
+        confetti({ particleCount: next.status === "printed" ? 100 : 80, spread: 75, origin: { y: 0.7 } });
+      }
+      if (next.status === "print_failed" || next.status === "payment_failed") {
+        setError(next.error || "Something went wrong. Please see kiosk staff.");
+      }
+      if (next.status === "printed" && notifiedPrintedForJobRef.current !== forJobId) {
+        notifiedPrintedForJobRef.current = forJobId;
+        notifyPrintReady();
+      }
+      return next.status;
+    });
+  };
+
+  // Polls the server for real payment/print status. While pending_payment,
+  // this is what actually triggers the server-side gateway reconciliation
+  // (not just a status read) so it has to keep running regardless of
+  // Realtime. Once paid, the Realtime subscription below is the instant
+  // path; this keeps running as a slow fallback only if that subscription
+  // isn't connected (Realtime not yet enabled for print_jobs, or a dropped
+  // socket) so the customer is never stuck without updates.
   useEffect(() => {
     if (!jobId) return;
-    if (["printed", "print_failed", "payment_failed", "expired", "cancelled"].includes(orderStatus)) return;
+    if (TERMINAL_ORDER_STATUSES.includes(orderStatus)) return;
+    if (orderStatus !== "pending_payment" && isRealtimeConnected) return;
 
     let cancelled = false;
-    const interval = setInterval(async () => {
+    const poll = async () => {
       try {
         const data = await fetchJson<{ jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number }>(`/api/verify-payment?jobId=${jobId}`);
         if (cancelled) return;
         setEtaMinutes(data.etaMinutes ?? null);
-        setTicketNumber(data.ticketNumber ?? null);
-        setOrderStatus((current) => {
-          if (data.status === current) return current;
-          if (data.status === "paid" || data.status === "printed") {
-            confetti({ particleCount: data.status === "printed" ? 100 : 80, spread: 75, origin: { y: 0.7 } });
-          }
-          if (data.status === "print_failed" || data.status === "payment_failed") {
-            setError(data.error || "Something went wrong. Please see kiosk staff.");
-          }
-          return data.status;
-        });
+        applyStatusUpdate(jobId, { status: data.status, error: data.error, ticketNumber: data.ticketNumber });
       } catch (pollError) {
         console.error("Status poll error:", pollError);
       }
-    }, 3000);
+    };
+    const interval = setInterval(poll, orderStatus === "pending_payment" ? 3000 : 10000);
 
     return () => {
       cancelled = true;
       clearInterval(interval);
+    };
+  }, [jobId, orderStatus, isRealtimeConnected]);
+
+  // Instant print-ready signal (ROADMAP.md-style CUPS-spool -> Realtime
+  // wiring): the print agent updates the job's row the moment CUPS confirms
+  // completion, and this subscription pushes that straight into the UI
+  // instead of waiting on the next poll tick. Requires print_jobs to be
+  // added to the Realtime publication in the Supabase dashboard — see this
+  // repo's setup notes; until then, isRealtimeConnected just stays false and
+  // the poll effect above keeps covering status updates on its own.
+  useEffect(() => {
+    if (!jobId) return;
+    if (TERMINAL_ORDER_STATUSES.includes(orderStatus)) return;
+
+    let channel: RealtimeChannel | null = null;
+    try {
+      const supabase = createSupabaseBrowserClient();
+      channel = supabase
+        .channel(`print-job-${jobId}`)
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "print_jobs", filter: `id=eq.${jobId}` },
+          (payload) => {
+            const row = payload.new as { status: OrderStatus; error: string | null; ticket_number: number | null };
+            applyStatusUpdate(jobId, { status: row.status, error: row.error, ticketNumber: row.ticket_number });
+          }
+        )
+        .subscribe((status) => setIsRealtimeConnected(status === "SUBSCRIBED"));
+    } catch (realtimeError) {
+      // Missing Supabase env vars, etc. — non-fatal, the poll fallback above covers it.
+      console.error("Realtime subscription error:", realtimeError);
+    }
+
+    return () => {
+      setIsRealtimeConnected(false);
+      if (channel) void channel.unsubscribe();
     };
   }, [jobId, orderStatus]);
 
@@ -325,7 +491,10 @@ export default function PdfPageSelector() {
   const muted = isDark ? "text-slate-400" : "text-slate-500";
 
   return <div className={`min-h-screen pb-36 transition-colors duration-300 ${theme}`}>
-    <header className={`sticky top-0 z-20 border-b backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/85" : "border-slate-200/80 bg-[#f4f6f8]/85"}`}><div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-4 lg:px-8"><div className="flex items-center gap-3"><div className="grid size-10 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20"><Printer size={19} /></div><div><p className="text-sm font-black tracking-[0.16em] text-blue-600">OXWAY</p><p className={`text-xs ${muted}`}>Smart print kiosk</p></div></div><div className="flex items-center gap-2"><span className="hidden items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-500 sm:flex"><span className="size-1.5 rounded-full bg-emerald-500" />Online</span><Link href="/admin" className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${isDark ? "border-white/10 text-slate-300 hover:border-white/20 hover:bg-white/10" : "border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"}`}>Admin</Link><button aria-label="Toggle color theme" onClick={() => setIsDark((value) => !value)} className={`grid size-10 place-items-center rounded-xl border ${panel}`}>{isDark ? <Sun size={17} /> : <Moon size={17} />}</button></div></div></header>
+    <header className={`sticky top-0 z-20 border-b backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/85" : "border-slate-200/80 bg-[#f4f6f8]/85"}`}><div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-4 lg:px-8"><div className="flex items-center gap-3"><div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20"><Printer size={19} /></div><div><BrandWordmark className="h-10" /><p className={`mt-1.5 text-xs ${muted}`}>Smart print kiosk</p></div></div><div className="flex items-center gap-2">{isKioskOnline
+      ? <span className="hidden items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-500 sm:flex"><span className="size-1.5 rounded-full bg-emerald-500" />Online</span>
+      : <span className="hidden items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-500 sm:flex"><span className="size-1.5 rounded-full bg-amber-500" />Offline</span>}<Link href="/admin" className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${isDark ? "border-white/10 text-slate-300 hover:border-white/20 hover:bg-white/10" : "border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"}`}>Admin</Link><button aria-label="Toggle color theme" onClick={() => setIsDark((value) => !value)} className={`grid size-10 place-items-center rounded-xl border ${panel}`}>{isDark ? <Sun size={17} /> : <Moon size={17} />}</button></div></div></header>
+    {!isKioskOnline && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600"><WifiOff size={18} className="mt-0.5 shrink-0" /><p>This kiosk isn&apos;t reachable right now — it may be powered off or have no network connection. Printing will resume once it&apos;s back online.</p></div></div>}
     <main className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[1fr_330px] lg:px-8"><section className="min-w-0"><div className="mb-7 flex items-end justify-between gap-4"><div><p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-blue-500">01 / Upload</p><h1 className="text-3xl font-black tracking-tight sm:text-4xl">Print without the queue.</h1><p className={`mt-2 text-sm ${muted}`}>Upload a PDF, tune your print settings, and send it straight to the kiosk.</p></div>{file && <button onClick={() => fileInputRef.current?.click()} className="hidden rounded-xl border border-blue-500/30 px-3 py-2 text-xs font-bold text-blue-500 sm:block">Change file</button>}</div><button type="button" onClick={() => setIsPreviewOpen(true)} className={`mb-4 flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${panel}`}><span>Preview print</span><span className="text-blue-500">View sheet</span></button>
       <input ref={fileInputRef} type="file" accept="application/pdf,image/png,image/jpeg,image/webp,image/heic,image/heif,.pdf,.png,.jpg,.jpeg,.webp,.heic,.heif,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" className="hidden" onChange={handleFileInput} />
       {!file && !isLoading && <button type="button" onClick={() => fileInputRef.current?.click()} onDragEnter={(event) => { event.preventDefault(); setIsDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); const droppedFile = event.dataTransfer.files[0]; if (droppedFile) void processFile(droppedFile); }} className={`group flex min-h-[320px] w-full flex-col items-center justify-center rounded-[2rem] border-2 border-dashed p-8 text-center transition ${isDragging ? "border-blue-500 bg-blue-500/10" : `${isDark ? "border-white/15 bg-white/[0.04]" : "border-slate-300 bg-white/70 hover:border-blue-300 hover:bg-white"}`}`}><span className="mb-5 grid size-16 place-items-center rounded-3xl bg-blue-600 text-white shadow-xl shadow-blue-600/20 transition group-hover:-translate-y-1"><FileUp size={27} /></span><span className="text-lg font-bold">Drop your file here</span><span className={`mt-2 text-sm ${muted}`}>PDF, image, or Word document</span><span className={`mt-6 rounded-full px-3 py-1 text-[11px] ${isDark ? "bg-white/10 text-slate-300" : "bg-slate-100 text-slate-500"}`}>PDF · PNG · JPG · HEIC · DOCX · max 25 MB</span></button>}
@@ -372,6 +541,7 @@ export default function PdfPageSelector() {
         {showBannerCaution && <p className="mt-1.5 ml-6 text-xs font-medium text-amber-500">Only uncheck this if you&apos;ll be right there when it&apos;s printed — otherwise it may be hard to find later.</p>}
       </div>
       <button onClick={() => setIsSettingsOpen(true)} className={`flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${isDark ? "border-white/10" : "border-slate-200"}`}><span className="flex items-center gap-2"><LayoutGrid size={16} className="text-blue-500" /> Print settings</span><ChevronDown size={16} className={muted} /></button><div className={`mt-4 space-y-3 text-xs ${muted}`}><div className="flex justify-between"><span>Color mode</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.isColor ? "Color" : "B&W"}</b></div><div className="flex justify-between"><span>Paper</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.paperSize} · {settings.layout}</b></div><div className="flex justify-between"><span>Pages per sheet</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.pagesPerSheet}</b></div></div></div></aside></main>
+    <BrandWatermark isDark={isDark} />
     {file && <div className={`fixed bottom-0 left-0 right-0 z-30 border-t backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/90" : "border-slate-200 bg-white/90"}`}><div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-4 lg:px-8">
       {/* ROADMAP.md §22 — once payment's confirmed, this swaps from the
          pre-payment price to the customer's pickup code: the entire
@@ -384,7 +554,7 @@ export default function PdfPageSelector() {
       {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
       {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
       {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
-      {orderStatus === "printed" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500/10 px-5 py-3.5 text-sm font-black text-emerald-500"><Check size={17} /> Printed — please collect it</div>}
+      {orderStatus === "printed" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500/10 px-5 py-3.5 text-sm font-black text-emerald-500"><Check size={17} /> Your print is ready — please collect it</div>}
       {orderStatus === "expired" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Payment expired — try again</button>}
       {(orderStatus === "print_failed" || orderStatus === "payment_failed") && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — try again</button>}
       {orderStatus === "cancelled" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-slate-500 px-5 py-3.5 text-sm font-black text-white">Cancelled — see kiosk staff</button>}

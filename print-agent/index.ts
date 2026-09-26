@@ -31,13 +31,18 @@ import { recordCompletedPrint, touchKioskHeartbeat } from "../lib/kiosk-stats";
 // below for why, and lib/payment-reconciliation.ts for the other trigger.
 // import { notifyPrintCompleted } from "../lib/notify";
 import { prependBannerPage } from "../lib/print/banner";
-import { isJobStillQueued, submitPrintJob } from "../lib/print/cups";
+import { getCupsJobQueueState, submitPrintJob } from "../lib/print/cups";
 import { physicalSheetsForJob } from "../lib/print/sheets";
 import { attemptRefund } from "../lib/refund";
 import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
 
-const QUEUE_POLL_INTERVAL_MS = 3000;
-const QUEUE_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+// Polls CUPS aggressively (every second) so the moment a job leaves the
+// queue, the customer's Realtime-subscribed status page updates near-
+// instantly instead of on the next multi-second poll tick.
+const QUEUE_POLL_INTERVAL_MS = 1000;
+// A job stuck in the CUPS queue this long is treated as failed rather than
+// leaving the customer waiting forever — see failJob below.
+const QUEUE_POLL_TIMEOUT_MS = 2 * 60 * 1000;
 
 async function processJob(job: PrintJobRecord): Promise<void> {
   const claimed = await claimJobForPrinting(job.id);
@@ -60,32 +65,40 @@ async function processJob(job: PrintJobRecord): Promise<void> {
 
     await watchUntilPrinted(job, cupsJobId);
   } catch (error) {
-    console.error(`[print-agent] Job ${job.id} failed:`, error);
-    await updateJob(job.id, {
-      status: "print_failed",
-      error: error instanceof Error ? error.message : "Unknown printing error.",
-    });
-
-    // ROADMAP.md §10 — automatic, not waiting on staff to notice and click
-    // the admin panel's refund button. Safe to call unconditionally: `job`
-    // here is the pre-claim record (never refunded yet), and attemptRefund's
-    // own already-refunded guard makes this a no-op rather than a double
-    // refund if it's ever somehow called twice for the same failure.
-    try {
-      const result = await attemptRefund(job);
-      if (result.ok) {
-        console.log(`[print-agent] Auto-refunded job ${job.id}: ${result.refundId}`);
-      } else if (result.reason === "no_captured_payment") {
-        console.warn(`[print-agent] Could not auto-refund job ${job.id}: no captured payment reference.`);
-      }
-    } catch (refundError) {
-      // A failed refund attempt must never crash the poll loop or mask the
-      // print_failed status update above — staff can still refund manually
-      // from the admin panel if this keeps failing.
-      console.error(`[print-agent] Auto-refund failed for job ${job.id}:`, refundError);
-    }
+    await failJob(job, error instanceof Error ? error.message : "Unknown printing error.");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Shared terminal-failure path for both a thrown exception (processJob's
+ * catch block) and a stuck/errored CUPS queue (watchUntilPrinted below) —
+ * one place that marks the job print_failed and attempts the ROADMAP.md §10
+ * auto-refund, so the two failure sources can never drift out of sync with
+ * each other.
+ */
+async function failJob(job: PrintJobRecord, reason: string): Promise<void> {
+  console.error(`[print-agent] Job ${job.id} failed: ${reason}`);
+  await updateJob(job.id, { status: "print_failed", error: reason });
+
+  // Automatic, not waiting on staff to notice and click the admin panel's
+  // refund button. Safe to call unconditionally: `job` here is the pre-claim
+  // record (never refunded yet), and attemptRefund's own already-refunded
+  // guard makes this a no-op rather than a double refund if it's ever
+  // somehow called twice for the same failure.
+  try {
+    const result = await attemptRefund(job);
+    if (result.ok) {
+      console.log(`[print-agent] Auto-refunded job ${job.id}: ${result.refundId}`);
+    } else if (result.reason === "no_captured_payment") {
+      console.warn(`[print-agent] Could not auto-refund job ${job.id}: no captured payment reference.`);
+    }
+  } catch (refundError) {
+    // A failed refund attempt must never crash the poll loop or mask the
+    // print_failed status update above — staff can still refund manually
+    // from the admin panel if this keeps failing.
+    console.error(`[print-agent] Auto-refund failed for job ${job.id}:`, refundError);
   }
 }
 
@@ -93,8 +106,9 @@ async function watchUntilPrinted(job: PrintJobRecord, cupsJobId: string): Promis
   const deadline = Date.now() + QUEUE_POLL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await sleep(QUEUE_POLL_INTERVAL_MS);
-    const stillQueued = await isJobStillQueued(cupsJobId);
-    if (!stillQueued) {
+    const state = await getCupsJobQueueState(cupsJobId);
+
+    if (state === "completed") {
       await updateJob(job.id, { status: "printed" });
       console.log(`[print-agent] Job ${job.id} printed.`);
 
@@ -113,10 +127,15 @@ async function watchUntilPrinted(job: PrintJobRecord, cupsJobId: string): Promis
       });
       return;
     }
+
+    if (state === "error") {
+      await failJob(job, `CUPS reported job ${cupsJobId} as stopped/held/errored.`);
+      return;
+    }
   }
-  // Left claimed/"printing" — the job is still in the CUPS queue after the
-  // timeout. Check `lpstat -o` on the kiosk directly.
-  console.warn(`[print-agent] Job ${job.id} (CUPS ${cupsJobId}) still queued after timeout.`);
+  // Still "active" after the full timeout — stuck rather than genuinely
+  // erroring, but the customer can't be left waiting forever either way.
+  await failJob(job, `Job ${cupsJobId} was still queued after ${QUEUE_POLL_TIMEOUT_MS / 1000}s — treating as stuck.`);
 }
 
 function sleep(ms: number): Promise<void> {

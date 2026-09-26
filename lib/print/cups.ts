@@ -52,21 +52,39 @@ export async function submitPrintJob(filePath: string, settings: PrintSettingsSn
   return match[1];
 }
 
+export type CupsJobQueueState = "active" | "completed" | "error";
+
 /**
- * Polls `lpstat` to see whether a submitted job has left the queue.
- * CUPS doesn't push completion events over the CLI, so this is the practical
- * way to know whether the printer actually finished (or the job vanished
- * because it errored out — check `lpstat -W not-completed` output/logs on the
- * kiosk if a job disappears without printing).
+ * Polls `lpstat -o <destination>` to see whether a submitted job has left the
+ * queue, and whether it looks stuck/erroring before it does. CUPS doesn't
+ * push completion events over the CLI, so this is the practical way to know
+ * whether the printer actually finished.
+ *
+ * The destination is parsed off the job id itself (CUPS job ids are always
+ * "<destination>-<sequence-number>") rather than threaded through as a
+ * separate argument — that's the only destination the job could possibly be
+ * sitting on, so there's nothing a caller-supplied value would add.
  */
-export async function isJobStillQueued(cupsJobId: string): Promise<boolean> {
+export async function getCupsJobQueueState(cupsJobId: string): Promise<CupsJobQueueState> {
+  const destination = cupsJobId.slice(0, cupsJobId.lastIndexOf("-"));
+
+  let stdout: string;
   try {
-    const { stdout } = await execFileAsync("lpstat", ["-W", "not-completed", "-o"]);
-    return stdout.includes(cupsJobId);
+    ({ stdout } = await execFileAsync("lpstat", ["-o", destination]));
   } catch {
-    // lpstat exits non-zero when the queue is empty — treat that as "not queued".
-    return false;
+    // lpstat exits non-zero when the destination's queue is empty.
+    return "completed";
   }
+
+  const jobLine = stdout.split("\n").find((line) => line.startsWith(cupsJobId));
+  if (!jobLine) return "completed";
+
+  // CUPS annotates a held/stopped/aborted job's queue line with its reason in
+  // parentheses (e.g. "... (stopped)"). This is a best-effort fast path for
+  // an obviously-broken job — the caller's own timeout (print-agent/index.ts)
+  // is the reliable fallback either way, so an exact-wording miss here just
+  // means the timeout catches it a bit later instead of immediately.
+  return /\((?:stopped|held|aborted|error)/i.test(jobLine) ? "error" : "active";
 }
 
 export async function listPrinters(): Promise<string[]> {

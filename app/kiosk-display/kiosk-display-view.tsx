@@ -10,6 +10,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Image from "next/image";
+import BrandWordmark from "@/components/BrandWordmark";
 import { fetchJson } from "@/lib/fetch-json";
 
 const POLL_INTERVAL_MS = 3000;
@@ -80,7 +81,10 @@ function KioskDisplayView() {
       </div>
 
       <div className="flex w-[420px] flex-col gap-4">
-        <p className="text-sm font-bold uppercase tracking-[0.3em] text-blue-500">OXWAY Print Kiosk</p>
+        <div className="flex items-center gap-3">
+          <BrandWordmark className="h-10" />
+          <span className="text-sm font-bold uppercase tracking-[0.3em] text-blue-500">Print Kiosk</span>
+        </div>
         <h1 className={`text-4xl font-black leading-tight transition-colors duration-500 ${toneClass}`}>{headline}</h1>
         {!current && isOnline && (
           <p className="text-lg text-slate-400">

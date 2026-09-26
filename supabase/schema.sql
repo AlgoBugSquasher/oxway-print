@@ -112,7 +112,13 @@ create table kiosk_status (
   cartridge_max_pages integer not null default 1500,  -- standard MLT-D104S yield
   total_revenue numeric not null default 0,
   total_lifetime_prints integer not null default 0,
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+
+  -- Online/offline heartbeat (§10 below) — nullable, written by the print
+  -- agent's own 20s timer, deliberately separate from updated_at (which also
+  -- moves on every print-counter update) so "last alive" and "last printed"
+  -- can never be confused with each other.
+  last_seen_at timestamptz
 );
 
 insert into kiosk_status (id) values ('oxway_01');
@@ -377,6 +383,31 @@ from public.kiosk_status;
 
 grant select on public.print_jobs_admin_view to authenticated;
 grant select on public.kiosk_status_admin_view to authenticated;
+
+-- ============================================================================
+-- 10. Anonymous read access for the customer status page's Realtime signal
+-- ============================================================================
+--
+-- print_jobs otherwise has zero policies (service-role only, see §1) — the
+-- customer's own browser needs to subscribe directly via Supabase Realtime
+-- (postgres_changes) to get an instant "printed" update, and Realtime
+-- authorizes each subscription the same way PostgREST does: a real SELECT
+-- grant plus a passing RLS policy for the connecting role (`anon` here,
+-- since kiosk customers never sign in).
+--
+-- Scoped tightly on both axes:
+--   - column grant: only the columns the status page actually needs, never
+--     total_price/phone_number/file_name/settings/pdf_storage_path.
+--   - policy: `using (true)` reads broad, but combined with the column grant
+--     above the only way to ever address a matching row is to already know
+--     its `id` (an unguessable uuid, never enumerated anywhere) — the exact
+--     same trust model /api/verify-payment already uses (whoever holds the
+--     id can read that job's status), just enforced by the database instead
+--     of the API route so Realtime can check it independently.
+grant select (id, status, error, ticket_number, updated_at) on public.print_jobs to anon;
+
+create policy "Anyone holding a job id can read its own status" on public.print_jobs
+for select using (true);
 
 -- ============================================================================
 -- Not part of this file: the Storage bucket.

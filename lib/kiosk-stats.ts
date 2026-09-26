@@ -18,14 +18,28 @@ export interface KioskCounters {
 
 export interface KioskHeartbeatRow {
   id: string;
-  updatedAt: string;
+  /** Null for a kiosk whose print agent has never sent a heartbeat since last_seen_at was added. */
+  lastSeenAt: string | null;
 }
 
 /** Used by app/api/cron/check-kiosk-heartbeats to find silent kiosks (ROADMAP.md #8). */
 export async function listKioskHeartbeats(): Promise<KioskHeartbeatRow[]> {
-  const { data, error } = await supabaseAdmin().from("kiosk_status").select("id, updated_at");
+  const { data, error } = await supabaseAdmin().from("kiosk_status").select("id, last_seen_at");
   if (error) throw new Error(`Could not list kiosk heartbeats: ${error.message}`);
-  return (data as { id: string; updated_at: string }[]).map((row) => ({ id: row.id, updatedAt: row.updated_at }));
+  return (data as { id: string; last_seen_at: string | null }[]).map((row) => ({ id: row.id, lastSeenAt: row.last_seen_at }));
+}
+
+/**
+ * Used by the website's kiosk-status API route (app/api/kiosk-status) to
+ * drive the "kiosk isn't reachable" banner on the upload/configure and
+ * post-payment pages. Server-side only (service-role client) — kiosk_status
+ * also carries revenue/counter columns that must never reach the browser
+ * directly, so this returns just the one field that route needs.
+ */
+export async function getKioskLastSeenAt(kioskId: string): Promise<string | null> {
+  const { data, error } = await supabaseAdmin().from("kiosk_status").select("last_seen_at").eq("id", kioskId).maybeSingle();
+  if (error) throw new Error(`Could not read kiosk last_seen_at: ${error.message}`);
+  return (data as { last_seen_at: string | null } | null)?.last_seen_at ?? null;
 }
 
 // Proactive threshold for both tray and cartridge — ROADMAP.md #8 previously
@@ -117,18 +131,22 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
 }
 
 /**
- * Heartbeat (ROADMAP.md #8) — reuses kiosk_status.updated_at rather than a
- * dedicated column. Called on its own timer from print-agent/index.ts,
- * independent of the job-polling loop, so a kiosk with no jobs for hours
- * still reads as alive. Best-effort like recordCompletedPrint — a failed
- * heartbeat write shouldn't crash the agent, it just means this beat is
- * missed and the next one (a minute later) catches up.
+ * Heartbeat (ROADMAP.md #8) — writes kiosk_status.last_seen_at. Called on its
+ * own timer from print-agent/index.ts, independent of the job-polling loop,
+ * so a kiosk with no jobs for hours still reads as alive. Deliberately does
+ * NOT touch updated_at — that column also moves on every print-counter
+ * update (recordCompletedPrint above), so conflating the two would make
+ * "last printed" and "last alive" indistinguishable.
+ *
+ * Best-effort like recordCompletedPrint — a failed heartbeat write shouldn't
+ * crash the agent, it just means this beat is missed and the next one
+ * (20s later) catches up.
  */
 export async function touchKioskHeartbeat(kioskId: string): Promise<void> {
   try {
     const { error } = await supabaseAdmin()
       .from("kiosk_status")
-      .update({ updated_at: new Date().toISOString() })
+      .update({ last_seen_at: new Date().toISOString() })
       .eq("id", kioskId);
     if (error) console.error("Failed to update kiosk heartbeat:", error.message);
   } catch (error) {
