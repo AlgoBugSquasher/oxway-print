@@ -201,11 +201,6 @@ export default function PdfPageSelector() {
     };
   }, [kioskId]);
 
-  // Whether the Realtime subscription below is actually connected — the
-  // fallback poll effect uses this to back off once Realtime is doing the
-  // job, and to keep running if it isn't (not yet enabled for print_jobs in
-  // the Supabase dashboard, or a dropped socket).
-  const [isRealtimeConnected, setIsRealtimeConnected] = useState(false);
   // Guards the "printed" notification/sound so it fires exactly once per job,
   // not on every subsequent update while status stays "printed".
   const notifiedPrintedForJobRef = useRef<string | null>(null);
@@ -439,14 +434,22 @@ export default function PdfPageSelector() {
   // Polls the server for real payment/print status. While pending_payment,
   // this is what actually triggers the server-side gateway reconciliation
   // (not just a status read) so it has to keep running regardless of
-  // Realtime. Once paid, the Realtime subscription below is the instant
-  // path; this keeps running as a slow fallback only if that subscription
-  // isn't connected (Realtime not yet enabled for print_jobs, or a dropped
-  // socket) so the customer is never stuck without updates.
+  // Realtime. Once paid, the Realtime subscription below is the *instant*
+  // path, but this keeps running too — always, not just when Realtime
+  // looks disconnected. A Realtime channel reporting "SUBSCRIBED" only
+  // means the websocket handshake succeeded; it does NOT mean print_jobs
+  // is actually in the Supabase Realtime publication, which is a separate,
+  // easy-to-forget dashboard setting. Gating this poll on "Realtime looks
+  // connected" meant a channel that subscribes fine but is silently
+  // misconfigured (never added to the publication) left the customer stuck
+  // on a stale "starting print" status forever, with nothing visibly
+  // wrong — exactly the bug this was rewritten to stop being able to
+  // happen. Realtime is still what makes updates feel instant when it's
+  // actually working; this is just the guarantee that they arrive at all
+  // either way.
   useEffect(() => {
     if (!jobId) return;
     if (TERMINAL_ORDER_STATUSES.includes(orderStatus)) return;
-    if (orderStatus !== "pending_payment" && isRealtimeConnected) return;
 
     let cancelled = false;
     const poll = async () => {
@@ -465,15 +468,18 @@ export default function PdfPageSelector() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [jobId, orderStatus, isRealtimeConnected]);
+  }, [jobId, orderStatus]);
 
   // Instant print-ready signal (ROADMAP.md-style CUPS-spool -> Realtime
   // wiring): the print agent updates the job's row the moment CUPS confirms
   // completion, and this subscription pushes that straight into the UI
   // instead of waiting on the next poll tick. Requires print_jobs to be
   // added to the Realtime publication in the Supabase dashboard — see this
-  // repo's setup notes; until then, isRealtimeConnected just stays false and
-  // the poll effect above keeps covering status updates on its own.
+  // repo's setup notes. If that's never been done (or the socket drops),
+  // this channel can still silently report itself "subscribed" without ever
+  // receiving a row change — the poll effect above no longer trusts that
+  // status for anything, it just keeps running regardless, so this is purely
+  // an accelerator, never a single point of failure for status updates.
   useEffect(() => {
     if (!jobId) return;
     if (TERMINAL_ORDER_STATUSES.includes(orderStatus)) return;
@@ -491,14 +497,13 @@ export default function PdfPageSelector() {
             applyStatusUpdate(jobId, { status: row.status, error: row.error, ticketNumber: row.ticket_number });
           }
         )
-        .subscribe((status) => setIsRealtimeConnected(status === "SUBSCRIBED"));
+        .subscribe();
     } catch (realtimeError) {
       // Missing Supabase env vars, etc. — non-fatal, the poll fallback above covers it.
       console.error("Realtime subscription error:", realtimeError);
     }
 
     return () => {
-      setIsRealtimeConnected(false);
       if (channel) void channel.unsubscribe();
     };
   }, [jobId, orderStatus]);
