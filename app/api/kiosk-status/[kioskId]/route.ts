@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { jsonNoStore } from "@/lib/api-response";
 import { ONLINE_THRESHOLD_SECONDS } from "@/lib/config";
 import { getKioskLastSeenAt } from "@/lib/kiosk-stats";
 
@@ -19,10 +19,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
     const lastSeenAt = await getKioskLastSeenAt(kioskId);
     const isOnline = lastSeenAt !== null && Date.now() - new Date(lastSeenAt).getTime() < ONLINE_THRESHOLD_SECONDS * 1000;
 
-    return NextResponse.json({ isOnline, lastSeenAt });
+    return jsonNoStore({ isOnline, lastSeenAt });
   } catch (error) {
     console.error("kiosk-status error:", error);
-    return NextResponse.json(
+    return jsonNoStore(
       { error: error instanceof Error ? error.message : "Could not check kiosk status." },
       { status: 500 }
     );

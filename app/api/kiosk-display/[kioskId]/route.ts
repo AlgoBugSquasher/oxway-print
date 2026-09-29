@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { jsonNoStore } from "@/lib/api-response";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
 export const runtime = "nodejs";
@@ -75,10 +75,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
       .filter((row) => row.ticket_number != null)
       .map((row) => ({ ticketNumber: row.ticket_number as number }));
 
-    return NextResponse.json({ current, upcoming });
+    return jsonNoStore({ current, upcoming });
   } catch (error) {
     console.error("kiosk-display error:", error);
-    return NextResponse.json(
+    return jsonNoStore(
       { error: error instanceof Error ? error.message : "Could not load kiosk display data." },
       { status: 500 }
     );

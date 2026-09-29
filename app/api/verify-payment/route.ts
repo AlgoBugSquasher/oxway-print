@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { jsonNoStore } from "@/lib/api-response";
 import { estimateMinutesUntilReady } from "@/lib/eta";
 import { reconcilePendingPayment } from "@/lib/payment-reconciliation";
 import { getJob } from "@/lib/store";
@@ -20,10 +20,10 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   try {
     const jobId = new URL(request.url).searchParams.get("jobId");
-    if (!jobId) return NextResponse.json({ error: "Missing jobId" }, { status: 400 });
+    if (!jobId) return jsonNoStore({ error: "Missing jobId" }, { status: 400 });
 
     const job = await getJob(jobId);
-    if (!job) return NextResponse.json({ error: "Job not found" }, { status: 404 });
+    if (!job) return jsonNoStore({ error: "Job not found" }, { status: 404 });
 
     const reconciled = await reconcilePendingPayment(job);
 
@@ -39,7 +39,7 @@ export async function GET(request: Request) {
       }
     }
 
-    return NextResponse.json({
+    return jsonNoStore({
       jobId: reconciled.id,
       status: reconciled.status,
       error: reconciled.error,
@@ -53,7 +53,7 @@ export async function GET(request: Request) {
     });
   } catch (error) {
     console.error("verify-payment error:", error);
-    return NextResponse.json(
+    return jsonNoStore(
       { error: error instanceof Error ? error.message : "Could not check payment status." },
       { status: 500 }
     );
