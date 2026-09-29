@@ -29,7 +29,7 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import BrandWatermark from "@/components/BrandWatermark";
 import BrandWordmark from "@/components/BrandWordmark";
 import LivePrintPreview from "@/components/LivePrintPreview";
-import { convertFileInBrowser, isSupportedClientFile } from "@/lib/client-file-converter";
+import { convertFileInBrowser, isImageFile, isSupportedClientFile } from "@/lib/client-file-converter";
 import { reportClientError } from "@/lib/client-log";
 import { fetchJson } from "@/lib/fetch-json";
 import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
@@ -269,7 +269,7 @@ export default function PdfPageSelector() {
 
     try {
       stage = "convert";
-      const normalizedPdfBytes = await convertFileInBrowser(uploadedFile);
+      const normalizedPdfBytes = await convertFileInBrowser(uploadedFile, settings.layout);
       pdfBytesRef.current = normalizedPdfBytes;
       stage = "pdfjs-load";
       const pdf = await pdfjsLib.getDocument({ data: normalizedPdfBytes.slice() }).promise;
@@ -304,6 +304,31 @@ export default function PdfPageSelector() {
       setIsLoading(false);
     }
   };
+
+  // Images bake their canvas shape (portrait vs landscape) in at conversion
+  // time (see imageToPdf in lib/client-file-converter.ts) rather than
+  // relying on the server's later whole-page rotation — necessary so a wide
+  // photo actually fills a landscape page instead of being pre-shrunk into
+  // a narrow portrait frame first. That means an image upload has to be
+  // re-converted if the customer changes Layout after uploading, unlike a
+  // PDF/DOCX upload, where the server-side rotation step still has the
+  // real page shape to work with and never needs this. Skipped once an
+  // order exists (orderStatus !== "idle") so a stray Layout change can
+  // never reset jobId/orderStatus out from under an order already in
+  // flight — reaching the settings panel at that point isn't a real UI
+  // path today, but this guard costs nothing and removes the question.
+  useEffect(() => {
+    if (!file || !isImageFile(file) || orderStatus !== "idle") return;
+    // queueMicrotask defers past processFile's own synchronous setState
+    // calls (setError/setFile/setIsLoading, before its first await) — those
+    // are the whole point of calling it here, just not synchronously within
+    // this effect's own body.
+    queueMicrotask(() => void processFile(file));
+    // Intentionally narrow — only a Layout change should trigger a
+    // reconversion; processFile/file/orderStatus in this list would turn
+    // every processFile call (including this one) into another effect run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.layout]);
 
   const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
     const uploadedFile = event.target.files?.[0];
@@ -491,9 +516,9 @@ export default function PdfPageSelector() {
   const muted = isDark ? "text-slate-400" : "text-slate-500";
 
   return <div className={`min-h-screen pb-36 transition-colors duration-300 ${theme}`}>
-    <header className={`sticky top-0 z-20 border-b backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/85" : "border-slate-200/80 bg-[#f4f6f8]/85"}`}><div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-4 lg:px-8"><div className="flex items-center gap-3"><div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20"><Printer size={19} /></div><div><BrandWordmark className="h-10" /><p className={`mt-1.5 text-xs ${muted}`}>Smart print kiosk</p></div></div><div className="flex items-center gap-2">{isKioskOnline
-      ? <span className="hidden items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-500 sm:flex"><span className="size-1.5 rounded-full bg-emerald-500" />Online</span>
-      : <span className="hidden items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-500 sm:flex"><span className="size-1.5 rounded-full bg-amber-500" />Offline</span>}<Link href="/admin" className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${isDark ? "border-white/10 text-slate-300 hover:border-white/20 hover:bg-white/10" : "border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"}`}>Admin</Link><button aria-label="Toggle color theme" onClick={() => setIsDark((value) => !value)} className={`grid size-10 place-items-center rounded-xl border ${panel}`}>{isDark ? <Sun size={17} /> : <Moon size={17} />}</button></div></div></header>
+    <header className={`sticky top-0 z-20 border-b backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/85" : "border-slate-200/80 bg-[#f4f6f8]/85"}`}><div className="mx-auto flex max-w-6xl flex-wrap items-center gap-y-2 px-5 py-4 lg:px-8"><div className="flex items-center gap-3"><div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20"><Printer size={19} /></div><div><BrandWordmark className="h-10" /><p className={`mt-1.5 text-xs ${muted}`}>Smart print kiosk</p></div></div><div className="ml-auto flex items-center gap-2">{isKioskOnline
+      ? <span className="flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-500"><span className="size-1.5 rounded-full bg-emerald-500" />Online</span>
+      : <span className="flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-500"><span className="size-1.5 rounded-full bg-amber-500" />Offline</span>}<Link href="/admin" className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${isDark ? "border-white/10 text-slate-300 hover:border-white/20 hover:bg-white/10" : "border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"}`}>Admin</Link><button aria-label="Toggle color theme" onClick={() => setIsDark((value) => !value)} className={`grid size-10 place-items-center rounded-xl border ${panel}`}>{isDark ? <Sun size={17} /> : <Moon size={17} />}</button></div></div></header>
     {!isKioskOnline && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600"><WifiOff size={18} className="mt-0.5 shrink-0" /><p>This kiosk isn&apos;t reachable right now — it may be powered off or have no network connection. Printing will resume once it&apos;s back online.</p></div></div>}
     <main className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[1fr_330px] lg:px-8"><section className="min-w-0"><div className="mb-7 flex items-end justify-between gap-4"><div><p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-blue-500">01 / Upload</p><h1 className="text-3xl font-black tracking-tight sm:text-4xl">Print without the queue.</h1><p className={`mt-2 text-sm ${muted}`}>Upload a PDF, tune your print settings, and send it straight to the kiosk.</p></div>{file && <button onClick={() => fileInputRef.current?.click()} className="hidden rounded-xl border border-blue-500/30 px-3 py-2 text-xs font-bold text-blue-500 sm:block">Change file</button>}</div><button type="button" onClick={() => setIsPreviewOpen(true)} className={`mb-4 flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${panel}`}><span>Preview print</span><span className="text-blue-500">View sheet</span></button>
       <input ref={fileInputRef} type="file" accept="application/pdf,image/png,image/jpeg,image/webp,image/heic,image/heif,.pdf,.png,.jpg,.jpeg,.webp,.heic,.heif,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" className="hidden" onChange={handleFileInput} />

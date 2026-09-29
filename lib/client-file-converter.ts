@@ -1,5 +1,12 @@
 import { PDFDocument } from "pdf-lib";
 
+// Not imported from lib/store.ts's PrintSettingsSnapshot on purpose — this
+// file is bundled into the browser (see PdfPageSelector.tsx's import of it),
+// and store.ts pulls in the service-role Supabase client. PdfPageSelector.tsx
+// already keeps its own local `Layout` type for the same client/server
+// boundary reason; this mirrors that.
+type Layout = "portrait" | "landscape";
+
 const A4_WIDTH = 595.28;
 const A4_HEIGHT = 841.89;
 const SAFE_MARGIN = 15;
@@ -10,6 +17,7 @@ const DOCX_LINE_HEIGHT = 16;
 const isPdf = (file: File) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 const isDocx = (file: File) => file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || file.name.toLowerCase().endsWith(".docx");
 const isHeic = (file: File) => ["image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"].includes(file.type) || /\.(heic|heif)$/i.test(file.name);
+export const isImageFile = (file: File) => file.type.startsWith("image/") || isHeic(file) || /\.(png|jpe?g|webp)$/i.test(file.name);
 
 async function decodeImage(blob: Blob) {
   if (typeof createImageBitmap === "function") {
@@ -31,7 +39,7 @@ async function decodeImage(blob: Blob) {
   }
 }
 
-async function imageToPdf(file: File) {
+async function imageToPdf(file: File, layout: Layout) {
   let imageBlob: Blob = file;
   if (isHeic(file)) {
     const { default: heic2any } = await import("heic2any");
@@ -44,7 +52,19 @@ async function imageToPdf(file: File) {
   const imageHeight = image.height;
   if (!imageWidth || !imageHeight) throw new Error("The camera image has no readable dimensions.");
 
-  const scale = Math.min((A4_WIDTH - SAFE_MARGIN * 2) / imageWidth, (A4_HEIGHT - SAFE_MARGIN * 2) / imageHeight);
+  // The requested layout picks the canvas shape up front, rather than
+  // always using a fixed portrait A4 canvas and leaving the server's later
+  // whole-page rotation (extractSelectedPages) to fix it up. That older
+  // two-step path scaled a wide photo down to fit the *narrower* portrait
+  // dimension first — a correct later rotation could then only rotate an
+  // already-shrunk, letterboxed image sideways, never actually fill a
+  // proper landscape page with it. Deciding the shape here, before the
+  // image gets scaled at all, is the only point in the pipeline that still
+  // has the source image's real dimensions to make that call with.
+  const pageWidth = layout === "landscape" ? A4_HEIGHT : A4_WIDTH;
+  const pageHeight = layout === "landscape" ? A4_WIDTH : A4_HEIGHT;
+
+  const scale = Math.min((pageWidth - SAFE_MARGIN * 2) / imageWidth, (pageHeight - SAFE_MARGIN * 2) / imageHeight);
   const width = imageWidth * scale;
   const height = imageHeight * scale;
   const canvas = document.createElement("canvas");
@@ -61,8 +81,8 @@ async function imageToPdf(file: File) {
   });
   const pdfDocument = await PDFDocument.create();
   const embeddedImage = await pdfDocument.embedJpg(jpegBytes);
-  const page = pdfDocument.addPage([A4_WIDTH, A4_HEIGHT]);
-  page.drawImage(embeddedImage, { x: (A4_WIDTH - width) / 2, y: (A4_HEIGHT - height) / 2, width, height });
+  const page = pdfDocument.addPage([pageWidth, pageHeight]);
+  page.drawImage(embeddedImage, { x: (pageWidth - width) / 2, y: (pageHeight - height) / 2, width, height });
   if ("close" in image && typeof image.close === "function") image.close();
   return pdfDocument.save();
 }
@@ -123,13 +143,13 @@ async function docxToPdf(file: File) {
   return new Uint8Array(pdf.output("arraybuffer"));
 }
 
-export async function convertFileInBrowser(file: File) {
+export async function convertFileInBrowser(file: File, layout: Layout) {
   if (isPdf(file)) return new Uint8Array(await file.arrayBuffer());
   if (isDocx(file)) return docxToPdf(file);
-  if (file.type.startsWith("image/") || isHeic(file) || /\.(png|jpe?g|webp)$/i.test(file.name)) return imageToPdf(file);
+  if (isImageFile(file)) return imageToPdf(file, layout);
   throw new Error("Unsupported file. Upload a PDF, PNG, JPG, JPEG, WEBP, HEIC, HEIF, or DOCX file.");
 }
 
 export function isSupportedClientFile(file: File) {
-  return isPdf(file) || isDocx(file) || file.type.startsWith("image/") || isHeic(file) || /\.(png|jpe?g|webp)$/i.test(file.name);
+  return isPdf(file) || isDocx(file) || isImageFile(file);
 }

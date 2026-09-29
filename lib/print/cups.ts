@@ -15,19 +15,25 @@ function buildLpArgs(filePath: string, settings: PrintSettingsSnapshot): string[
   const args: string[] = [];
   if (PRINTER_NAME) args.push("-d", PRINTER_NAME);
   args.push("-n", String(Math.max(1, settings.copies)));
+  // Explicit, not left to CUPS's own default — a >1-copy job otherwise
+  // prints uncollated (every copy of page 1, then every copy of page 2,
+  // etc.) rather than each full copy in sequence. Confirmed via
+  // `lpoptions -p <printer> -l` that this printer's PPD exposes no
+  // Collate option of its own — it isn't a driver/hardware feature here,
+  // it's CUPS's own generic job-level page ordering, so this is safe to
+  // set unconditionally regardless of which printer/PPD is in use.
+  args.push("-o", "collate=true");
   args.push("-o", `media=${MEDIA_BY_PAPER_SIZE[settings.paperSize]}`);
   // Deliberately NOT setting orientation-requested here (ROADMAP.md #15).
-  // The generated PDF's own /Rotate is already the source of truth for
-  // orientation — verified directly against pdf-lib's actual behavior, not
-  // assumed. Also setting orientation-requested told the printer to
-  // physically rotate the paper feed AND told it the content was already
-  // pre-rotated, at the same time — two independent rotation instructions
-  // for the same job, which a driver honoring both nets out to a double
-  // rotation (upside-down or sideways-wrong), not "no rotation." If content
-  // still doesn't come out oriented correctly after this change, the next
-  // thing to check is which physical direction /Rotate 90 vs 270 actually
-  // needs to be for this printer/driver — see extractSelectedPages's own
-  // "UNVERIFIED" note in lib/print/pdf.ts.
+  // The generated PDF's own content geometry is already the source of
+  // truth for orientation (see extractSelectedPages in lib/print/pdf.ts,
+  // which also now accounts for a source page's own pre-existing rotation,
+  // not just this app's Layout setting). Also setting orientation-requested
+  // told the printer to physically rotate the paper feed AND told it the
+  // content was already pre-rotated, at the same time — two independent
+  // rotation instructions for the same job, which a driver honoring both
+  // nets out to a double rotation (upside-down or sideways-wrong), not "no
+  // rotation."
   args.push("-o", `number-up=${settings.pagesPerSheet}`);
   // The generated PDF's own page dimensions don't always exactly match the
   // customer's chosen paper size (an uploaded file's native page size, or a
@@ -54,37 +60,78 @@ export async function submitPrintJob(filePath: string, settings: PrintSettingsSn
 
 export type CupsJobQueueState = "active" | "completed" | "error";
 
+// Matched (case-insensitively) against a job's lpstat -l block — both while
+// still queued (paper-out/offline/jammed usually shows here first) and in
+// CUPS's completed-job history (a canceled or aborted job also leaves the
+// active queue, and previously that alone was enough to be misread as a
+// successful "completed" — see the bug this rewrite fixes below). Biased
+// deliberately broad: a false "error" just costs an unnecessary refund +
+// reprint (recoverable), while a false "completed" means a customer paid
+// for nothing and printing silently never happens — those two mistakes are
+// not equally bad, so every ambiguous case here resolves toward "error" or
+// "active" (keep waiting), never toward an unearned "completed".
+const FAILURE_KEYWORDS = /stopped|held|abort|cancel|error|fail|jam|offline|empty|media|no\s*paper|out\s*of\s*paper/i;
+
+/** lpstat -l exits 0 with nothing to print, or non-zero when a destination/job has no matching entries — both mean "no lines", not a real failure. */
+async function lpstatLongLines(args: string[]): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync("lpstat", ["-l", ...args]);
+    return stdout.split("\n");
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Polls `lpstat -o <destination>` to see whether a submitted job has left the
- * queue, and whether it looks stuck/erroring before it does. CUPS doesn't
- * push completion events over the CLI, so this is the practical way to know
- * whether the printer actually finished.
+ * `lpstat -l` prints one job as a header line starting with the job id,
+ * followed by indented detail lines (status-message, etc.) up to the next
+ * job's own header line (or the end of output). Returns that whole block
+ * for `cupsJobId`, or null if the id isn't in `lines` at all.
+ */
+function extractJobBlock(lines: string[], cupsJobId: string): string | null {
+  const startIndex = lines.findIndex((line) => line.startsWith(cupsJobId));
+  if (startIndex === -1) return null;
+  const block = [lines[startIndex]];
+  for (let i = startIndex + 1; i < lines.length && !/^\S/.test(lines[i]); i += 1) {
+    block.push(lines[i]);
+  }
+  return block.join("\n");
+}
+
+/**
+ * Polls CUPS to see whether a submitted job has left the active queue, and
+ * — the part the original version of this function got wrong — whether it
+ * left because it genuinely finished versus because it errored, was
+ * canceled, or was aborted (a printer going offline, jamming, or running out
+ * of paper mid-job all end a job's time in the active queue without ever
+ * printing it). CUPS doesn't push completion events over the CLI, so
+ * polling `lpstat` is still the practical way to know what happened; the
+ * fix is to keep looking once the job disappears from the active list
+ * instead of treating "gone from active" as a synonym for "printed":
  *
- * The destination is parsed off the job id itself (CUPS job ids are always
- * "<destination>-<sequence-number>") rather than threaded through as a
- * separate argument — that's the only destination the job could possibly be
- * sitting on, so there's nothing a caller-supplied value would add.
+ *   1. Still in the active/pending queue (`lpstat -l -o <destination>`,
+ *      CUPS's default "not completed" view)? Check its detail lines for a
+ *      failure keyword (paper-out etc. usually shows here first, well
+ *      before the job would ever fall out of this list) — "error" if so,
+ *      "active" (keep polling) otherwise.
+ *   2. Not there anymore — check CUPS's completed-job history
+ *      (`lpstat -l -W completed -o <destination>`), which includes
+ *      canceled/aborted jobs, not just genuinely successful ones. Found
+ *      with a failure keyword -> "error". Found clean -> "completed".
+ *   3. Not in *either* list (a brief gap while CUPS moves it between the
+ *      two) -> "active", never a guessed "completed" — the caller's own
+ *      timeout (print-agent/index.ts) is the backstop if it never shows up
+ *      again, exactly like an unrecognized failure keyword would be.
  */
 export async function getCupsJobQueueState(cupsJobId: string): Promise<CupsJobQueueState> {
   const destination = cupsJobId.slice(0, cupsJobId.lastIndexOf("-"));
 
-  let stdout: string;
-  try {
-    ({ stdout } = await execFileAsync("lpstat", ["-o", destination]));
-  } catch {
-    // lpstat exits non-zero when the destination's queue is empty.
-    return "completed";
-  }
+  const activeBlock = extractJobBlock(await lpstatLongLines(["-o", destination]), cupsJobId);
+  if (activeBlock) return FAILURE_KEYWORDS.test(activeBlock) ? "error" : "active";
 
-  const jobLine = stdout.split("\n").find((line) => line.startsWith(cupsJobId));
-  if (!jobLine) return "completed";
-
-  // CUPS annotates a held/stopped/aborted job's queue line with its reason in
-  // parentheses (e.g. "... (stopped)"). This is a best-effort fast path for
-  // an obviously-broken job — the caller's own timeout (print-agent/index.ts)
-  // is the reliable fallback either way, so an exact-wording miss here just
-  // means the timeout catches it a bit later instead of immediately.
-  return /\((?:stopped|held|aborted|error)/i.test(jobLine) ? "error" : "active";
+  const completedBlock = extractJobBlock(await lpstatLongLines(["-W", "completed", "-o", destination]), cupsJobId);
+  if (!completedBlock) return "active";
+  return FAILURE_KEYWORDS.test(completedBlock) ? "error" : "completed";
 }
 
 export async function listPrinters(): Promise<string[]> {

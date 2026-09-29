@@ -27,7 +27,27 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   const bold = await output.embedFont(StandardFonts.HelveticaBold);
   const regular = await output.embedFont(StandardFonts.Helvetica);
 
-  const banner = output.addPage([A4_WIDTH, A4_HEIGHT]);
+  // Loaded (and copied) before the banner page itself so the banner can
+  // match the content's actual orientation — copyPages doesn't insert
+  // these into output's page tree yet, that only happens at the
+  // output.addPage() calls below, so doing this first doesn't change the
+  // final page order (banner still ends up as page 1).
+  const content = await PDFDocument.load(contentPdfBytes);
+  const contentPages = await output.copyPages(content, content.getPageIndices());
+
+  // A landscape print job with the banner enabled would otherwise mix a
+  // portrait cover sheet in with landscape content pages inside the same
+  // CUPS job — a mixed-page-size job that can confuse a printer's
+  // fit-to-page handling, and at best just looks wrong: a portrait sheet
+  // sitting sideways-relative-to-everything-else in an otherwise-landscape
+  // stack. Match extractSelectedPages' own notion of orientation (width vs
+  // height of the already-processed content) rather than re-deriving it.
+  const [firstContentPage] = contentPages;
+  const isContentLandscape = firstContentPage.getWidth() > firstContentPage.getHeight();
+  const bannerWidth = isContentLandscape ? A4_HEIGHT : A4_WIDTH;
+  const bannerHeight = isContentLandscape ? A4_WIDTH : A4_HEIGHT;
+
+  const banner = output.addPage([bannerWidth, bannerHeight]);
   // ROADMAP.md §21's ticket code is the number shown to the customer on
   // their phone and on the kiosk screen — the banner has to print the SAME
   // code, big, or the whole point of a pickup-ID page (matching what's on
@@ -51,23 +71,23 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   // printer; middle is the neutral default that isn't wrong for any of them.
   const label = "PICKUP ID";
   banner.drawText(label, {
-    x: centeredX(bold, label, 24, A4_WIDTH),
-    y: A4_HEIGHT - 220,
+    x: centeredX(bold, label, 24, bannerWidth),
+    y: bannerHeight - 220,
     size: 24,
     font: bold,
     color: rgb(0.29, 0.33, 0.41),
   });
   banner.drawText(pickupCode, {
-    x: centeredX(bold, pickupCode, 90, A4_WIDTH),
-    y: A4_HEIGHT - 340,
+    x: centeredX(bold, pickupCode, 90, bannerWidth),
+    y: bannerHeight - 340,
     size: 90,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),
   });
   const detailLine = last4 ? `Phone ***${last4}  ·  ${timestamp}` : timestamp;
   banner.drawText(detailLine, {
-    x: centeredX(regular, detailLine, 13, A4_WIDTH),
-    y: A4_HEIGHT - 400,
+    x: centeredX(regular, detailLine, 13, bannerWidth),
+    y: bannerHeight - 400,
     size: 13,
     font: regular,
     color: rgb(0.45, 0.5, 0.57),
@@ -77,23 +97,21 @@ export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJ
   // confused for the pickup code itself.
   const requestIdLine = `Request ID: ${requestId}`;
   banner.drawText(requestIdLine, {
-    x: centeredX(regular, requestIdLine, 11, A4_WIDTH),
-    y: A4_HEIGHT - 420,
+    x: centeredX(regular, requestIdLine, 11, bannerWidth),
+    y: bannerHeight - 420,
     size: 11,
     font: regular,
     color: rgb(0.65, 0.68, 0.72),
   });
   const brand = "OXWAY";
   banner.drawText(brand, {
-    x: centeredX(bold, brand, 16, A4_WIDTH),
+    x: centeredX(bold, brand, 16, bannerWidth),
     y: 60,
     size: 16,
     font: bold,
     color: rgb(0.15, 0.39, 0.92),
   });
 
-  const content = await PDFDocument.load(contentPdfBytes);
-  const contentPages = await output.copyPages(content, content.getPageIndices());
   contentPages.forEach((page) => output.addPage(page));
 
   return output.save();
