@@ -99,6 +99,35 @@ function extractJobBlock(lines: string[], cupsJobId: string): string | null {
 }
 
 /**
+ * Confirmed by tracing real `lpstat` output during a live multi-copy job
+ * (Pi, 1 page × 3 copies): CUPS considers its own part of a job "done" as
+ * soon as it finishes handing the fully-rendered data off to the printer's
+ * own internal buffer — for a multi-copy job small enough to fit there
+ * entirely, that can happen while the print head is still physically
+ * working through the earlier copies. So `lpstat -o`/the job's own queue
+ * state going empty is necessary but not sufficient for "printed"; this is
+ * the second signal getCupsJobQueueState below cross-checks it against —
+ * the PRINTER's own hardware state, not the job's. `lpstat -p <dest>`
+ * reports exactly two things that matter here: "is idle" once it's
+ * genuinely done with everything queued to it, or "now printing <job-id>" /
+ * some other non-idle state while it's still physically busy — checked
+ * with a plain substring match rather than trying to enumerate every
+ * possible non-idle phrasing, since "idle" is the one CUPS-generated string
+ * this doesn't need to guess at.
+ */
+async function isPrinterIdle(destination: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("lpstat", ["-p", destination]);
+    return /\bis idle\b/i.test(stdout);
+  } catch {
+    // Can't tell what state the printer's in — never treat that as "idle"
+    // and risk an early "printed"; same conservative default as everywhere
+    // else in this function.
+    return false;
+  }
+}
+
+/**
  * Polls CUPS to see whether a submitted job has left the active queue, and
  * — the part the original version of this function got wrong — whether it
  * left because it genuinely finished versus because it errored, was
@@ -117,8 +146,15 @@ function extractJobBlock(lines: string[], cupsJobId: string): string | null {
  *   2. Not there anymore — check CUPS's completed-job history
  *      (`lpstat -l -W completed -o <destination>`), which includes
  *      canceled/aborted jobs, not just genuinely successful ones. Found
- *      with a failure keyword -> "error". Found clean -> "completed".
- *   3. Not in *either* list (a brief gap while CUPS moves it between the
+ *      with a failure keyword -> "error".
+ *   3. Found clean in the completed history -> one more check before this
+ *      can be called "completed": is the PRINTER itself actually idle right
+ *      now (see isPrinterIdle above)? CUPS's job-level bookkeeping can lag
+ *      behind physical reality for a multi-copy job buffered on the
+ *      printer's own hardware — if the printer's still busy, this stays
+ *      "active" and gets polled again, even though the job itself has
+ *      already left CUPS's own queue.
+ *   4. Not in *either* list (a brief gap while CUPS moves it between the
  *      two) -> "active", never a guessed "completed" — the caller's own
  *      timeout (print-agent/index.ts) is the backstop if it never shows up
  *      again, exactly like an unrecognized failure keyword would be.
@@ -131,7 +167,9 @@ export async function getCupsJobQueueState(cupsJobId: string): Promise<CupsJobQu
 
   const completedBlock = extractJobBlock(await lpstatLongLines(["-W", "completed", "-o", destination]), cupsJobId);
   if (!completedBlock) return "active";
-  return FAILURE_KEYWORDS.test(completedBlock) ? "error" : "completed";
+  if (FAILURE_KEYWORDS.test(completedBlock)) return "error";
+
+  return (await isPrinterIdle(destination)) ? "completed" : "active";
 }
 
 export async function listPrinters(): Promise<string[]> {
