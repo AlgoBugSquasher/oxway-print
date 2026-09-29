@@ -1,0 +1,19 @@
+-- OXWAY v2.5 — additive migration: expose refund status to the customer's
+-- own status page.
+--
+-- Run this ONCE, in the Supabase SQL editor, against the EXISTING project
+-- (supabase/schema.sql already has this folded into its §10 grant for
+-- anyone setting up a brand-new project after this point).
+--
+-- Purely additive: widens an existing column-level grant by one column,
+-- nothing existing is narrowed, dropped, or changed. Safe to run against a
+-- live project.
+--
+-- Why: print_failed now always triggers an auto-refund attempt
+-- (lib/refund.ts), but the customer's status page had no way to tell a
+-- successful refund apart from a failed one — both just showed a generic
+-- "Failed — try again". refunded_at (already a column on print_jobs, set
+-- only once a refund genuinely succeeds at the gateway) is what
+-- distinguishes them; it just wasn't in the customer-readable column set
+-- the Realtime subscription and /api/verify-payment rely on.
+grant select (refunded_at) on public.print_jobs to anon;

@@ -398,13 +398,17 @@ grant select on public.kiosk_status_admin_view to authenticated;
 -- Scoped tightly on both axes:
 --   - column grant: only the columns the status page actually needs, never
 --     total_price/phone_number/file_name/settings/pdf_storage_path.
+--     refunded_at included so a print_failed job can tell the customer
+--     whether their auto-refund (lib/refund.ts) actually succeeded, rather
+--     than showing a generic "failed" message that silently hides a
+--     refund that also failed.
 --   - policy: `using (true)` reads broad, but combined with the column grant
 --     above the only way to ever address a matching row is to already know
 --     its `id` (an unguessable uuid, never enumerated anywhere) — the exact
 --     same trust model /api/verify-payment already uses (whoever holds the
 --     id can read that job's status), just enforced by the database instead
 --     of the API route so Realtime can check it independently.
-grant select (id, status, error, ticket_number, updated_at) on public.print_jobs to anon;
+grant select (id, status, error, ticket_number, updated_at, refunded_at) on public.print_jobs to anon;
 
 create policy "Anyone holding a job id can read its own status" on public.print_jobs
 for select using (true);

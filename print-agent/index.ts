@@ -31,7 +31,7 @@ import { recordCompletedPrint, touchKioskHeartbeat } from "../lib/kiosk-stats";
 // below for why, and lib/payment-reconciliation.ts for the other trigger.
 // import { notifyPrintCompleted } from "../lib/notify";
 import { prependBannerPage } from "../lib/print/banner";
-import { getCupsJobQueueState, submitPrintJob } from "../lib/print/cups";
+import { cancelPrintJob, getCupsJobQueueState, submitPrintJob } from "../lib/print/cups";
 import { physicalSheetsForJob } from "../lib/print/sheets";
 import { attemptRefund } from "../lib/refund";
 import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
@@ -50,6 +50,11 @@ async function processJob(job: PrintJobRecord): Promise<void> {
 
   const tempDir = await mkdtemp(path.join(tmpdir(), "oxway-print-"));
   const tempPdfPath = path.join(tempDir, `${job.id}.pdf`);
+  // Declared outside the try block (not `const` inside it) so the catch
+  // block below can still see whatever value it had at the point of
+  // failure — undefined if the job never even reached CUPS, or the real id
+  // if it did, in which case failJob needs it to actually cancel the job.
+  let cupsJobId: string | undefined;
 
   try {
     console.log(`[print-agent] Printing job ${job.id} (${job.fileName})...`);
@@ -59,13 +64,13 @@ async function processJob(job: PrintJobRecord): Promise<void> {
     }
     await writeFile(tempPdfPath, pdfBytes);
 
-    const cupsJobId = await submitPrintJob(tempPdfPath, job.settings);
+    cupsJobId = await submitPrintJob(tempPdfPath, job.settings);
     await updateJob(job.id, { cupsJobId });
     console.log(`[print-agent] Submitted to CUPS as ${cupsJobId}, watching queue...`);
 
     await watchUntilPrinted(job, cupsJobId);
   } catch (error) {
-    await failJob(job, error instanceof Error ? error.message : "Unknown printing error.");
+    await failJob(job, error instanceof Error ? error.message : "Unknown printing error.", cupsJobId);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -77,9 +82,18 @@ async function processJob(job: PrintJobRecord): Promise<void> {
  * one place that marks the job print_failed and attempts the ROADMAP.md §10
  * auto-refund, so the two failure sources can never drift out of sync with
  * each other.
+ *
+ * Cancels the actual CUPS job first, when one was ever submitted — a real,
+ * confirmed bug: without this, a stuck/errored job left sitting in CUPS's
+ * queue could still get physically printed later (e.g. a disabled queue
+ * getting re-enabled after its timeout), well after the customer had
+ * already been refunded for it. `cupsJobId` is undefined only when the
+ * failure happened before `lp` ever ran (e.g. the PDF download itself
+ * failed) — nothing to cancel in that case.
  */
-async function failJob(job: PrintJobRecord, reason: string): Promise<void> {
+async function failJob(job: PrintJobRecord, reason: string, cupsJobId?: string): Promise<void> {
   console.error(`[print-agent] Job ${job.id} failed: ${reason}`);
+  if (cupsJobId) await cancelPrintJob(cupsJobId);
   await updateJob(job.id, { status: "print_failed", error: reason });
 
   // Automatic, not waiting on staff to notice and click the admin panel's
@@ -129,13 +143,13 @@ async function watchUntilPrinted(job: PrintJobRecord, cupsJobId: string): Promis
     }
 
     if (state === "error") {
-      await failJob(job, `CUPS reported job ${cupsJobId} as stopped/held/errored.`);
+      await failJob(job, `CUPS reported job ${cupsJobId} as stopped/held/errored.`, cupsJobId);
       return;
     }
   }
   // Still "active" after the full timeout — stuck rather than genuinely
   // erroring, but the customer can't be left waiting forever either way.
-  await failJob(job, `Job ${cupsJobId} was still queued after ${QUEUE_POLL_TIMEOUT_MS / 1000}s — treating as stuck.`);
+  await failJob(job, `Job ${cupsJobId} was still queued after ${QUEUE_POLL_TIMEOUT_MS / 1000}s — treating as stuck.`, cupsJobId);
 }
 
 function sleep(ms: number): Promise<void> {

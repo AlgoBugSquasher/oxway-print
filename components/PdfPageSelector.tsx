@@ -168,6 +168,11 @@ export default function PdfPageSelector() {
   // status poll below once payment's confirmed (never shown before that —
   // see the ticketNumber comment in app/api/verify-payment/route.ts).
   const [ticketNumber, setTicketNumber] = useState<number | null>(null);
+  // Set only once an auto-refund for this job genuinely succeeded (see
+  // lib/refund.ts) — distinguishes "print_failed, refunded" from the much
+  // worse "print_failed, and the refund itself failed too" for the
+  // print_failed messaging further down.
+  const [refundedAt, setRefundedAt] = useState<string | null>(null);
   const [error, setError] = useState("");
   // Holds the converted PDF's bytes so the final file can be uploaded again at
   // payment time — pdfjs consumes the response body when rendering thumbnails.
@@ -413,8 +418,9 @@ export default function PdfPageSelector() {
   // "what a status change means for the UI" (confetti, error text, the
   // print-ready notification) lives in exactly one place regardless of which
   // path delivered it.
-  const applyStatusUpdate = (forJobId: string, next: { status: OrderStatus; error?: string | null; ticketNumber?: number | null }) => {
+  const applyStatusUpdate = (forJobId: string, next: { status: OrderStatus; error?: string | null; ticketNumber?: number | null; refundedAt?: string | null }) => {
     if (next.ticketNumber !== undefined) setTicketNumber(next.ticketNumber ?? null);
+    if (next.refundedAt !== undefined) setRefundedAt(next.refundedAt ?? null);
     setOrderStatus((current) => {
       if (next.status === current) return current;
       if (next.status === "paid" || next.status === "printed") {
@@ -454,10 +460,10 @@ export default function PdfPageSelector() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await fetchJson<{ jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number }>(`/api/verify-payment?jobId=${jobId}`);
+        const data = await fetchJson<{ jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number; refundedAt?: string | null }>(`/api/verify-payment?jobId=${jobId}`);
         if (cancelled) return;
         setEtaMinutes(data.etaMinutes ?? null);
-        applyStatusUpdate(jobId, { status: data.status, error: data.error, ticketNumber: data.ticketNumber });
+        applyStatusUpdate(jobId, { status: data.status, error: data.error, ticketNumber: data.ticketNumber, refundedAt: data.refundedAt });
       } catch (pollError) {
         console.error("Status poll error:", pollError);
       }
@@ -493,8 +499,8 @@ export default function PdfPageSelector() {
           "postgres_changes",
           { event: "UPDATE", schema: "public", table: "print_jobs", filter: `id=eq.${jobId}` },
           (payload) => {
-            const row = payload.new as { status: OrderStatus; error: string | null; ticket_number: number | null };
-            applyStatusUpdate(jobId, { status: row.status, error: row.error, ticketNumber: row.ticket_number });
+            const row = payload.new as { status: OrderStatus; error: string | null; ticket_number: number | null; refunded_at: string | null };
+            applyStatusUpdate(jobId, { status: row.status, error: row.error, ticketNumber: row.ticket_number, refundedAt: row.refunded_at });
           }
         )
         .subscribe();
@@ -513,6 +519,7 @@ export default function PdfPageSelector() {
     setJobId(null);
     setEtaMinutes(null);
     setTicketNumber(null);
+    setRefundedAt(null);
     setError("");
   };
 
@@ -586,7 +593,16 @@ export default function PdfPageSelector() {
       {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
       {orderStatus === "printed" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500/10 px-5 py-3.5 text-sm font-black text-emerald-500"><Check size={17} /> Your print is ready — please collect it</div>}
       {orderStatus === "expired" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Payment expired — try again</button>}
-      {(orderStatus === "print_failed" || orderStatus === "payment_failed") && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — try again</button>}
+      {orderStatus === "payment_failed" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — try again</button>}
+      {/* print_failed always triggers an auto-refund attempt (lib/refund.ts)
+         — "try again" is misleading here regardless (the failure was
+         physical, not something resubmitting fixes), and a bare "Failed"
+         silently hides whether the customer actually got their money back.
+         refundedAt (only set once the refund genuinely succeeded at the
+         gateway) is what tells these two apart. */}
+      {orderStatus === "print_failed" && (refundedAt
+        ? <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-3.5 text-sm font-black text-white"><Check size={17} /> Refunded — see kiosk staff to try again</button>
+        : <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — see kiosk staff for a refund</button>)}
       {orderStatus === "cancelled" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-slate-500 px-5 py-3.5 text-sm font-black text-white">Cancelled — see kiosk staff</button>}
     </div></div>}
     {isSettingsOpen && <div className="fixed inset-0 z-40 flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsSettingsOpen(false); }}><div className={`w-full max-w-lg rounded-t-[2rem] p-6 shadow-2xl sm:rounded-[2rem] ${isDark ? "bg-[#171d24]" : "bg-white"}`}><div className="mb-6 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Print settings</p><h2 className="mt-1 text-xl font-black">Tune your document</h2></div><button onClick={() => setIsSettingsOpen(false)} className={`grid size-9 place-items-center rounded-xl ${isDark ? "bg-white/10" : "bg-slate-100"}`}><X size={17} /></button></div><div className="space-y-5"><SettingRow label="Copies" icon={<Copy size={16} />}><div className={`flex items-center gap-1 rounded-xl border p-1 ${isDark ? "border-white/10" : "border-slate-200"}`}><button onClick={() => updateSettings("copies", Math.max(1, settings.copies - 1))} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Minus size={15} /></button><span className="w-8 text-center text-sm font-black">{settings.copies}</span><button onClick={() => updateSettings("copies", settings.copies + 1)} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Plus size={15} /></button></div></SettingRow><SettingRow label="Layout" icon={<LayoutGrid size={16} />}><Segmented value={settings.layout} options={["portrait", "landscape"]} onChange={(value) => updateSettings("layout", value as Layout)} /></SettingRow><SettingRow label="Color mode" icon={<Palette size={16} />}><Segmented value={settings.isColor ? "color" : "bw"} options={["bw", "color"]} labels={["B&W · ₹2", "Color · ₹10"]} onChange={(value) => updateSettings("isColor", value === "color")} /></SettingRow><div><p className={`mb-2 text-sm font-bold ${muted}`}>Pages</p><div className="grid grid-cols-4 gap-2">{(["all", "odd", "even", "custom"] as PageMode[]).map((mode) => <button key={mode} onClick={() => updateSettings("pageMode", mode)} className={`rounded-xl border px-2 py-2.5 text-xs font-bold capitalize ${settings.pageMode === mode ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}>{mode}</button>)}</div>{settings.pageMode === "custom" && <input value={settings.customRange} onChange={(event) => updateSettings("customRange", event.target.value)} placeholder="Example: 1-5, 8" className={`mt-2 w-full rounded-xl border px-3 py-2.5 text-sm outline-none focus:border-blue-500 ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`} />}</div><SettingRow label="Paper size" icon={<FileText size={16} />}><select value={settings.paperSize} onChange={(event) => updateSettings("paperSize", event.target.value as PaperSize)} className={`rounded-xl border px-3 py-2 text-xs font-bold outline-none ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`}>{(["A4", "Letter", "Legal"] as PaperSize[]).map((size) => <option key={size}>{size}</option>)}</select></SettingRow><SettingRow label="Pages per sheet" icon={<LayoutGrid size={16} />}><Segmented value={String(settings.pagesPerSheet)} options={["1", "2", "4"]} labels={["1", "2 in 1", "4 in 1"]} onChange={(value) => updateSettings("pagesPerSheet", Number(value) as 1 | 2 | 4)} /></SettingRow></div><button onClick={() => setIsSettingsOpen(false)} className="mt-7 w-full rounded-xl bg-blue-600 py-3.5 text-sm font-black text-white">Apply settings</button></div></div>}

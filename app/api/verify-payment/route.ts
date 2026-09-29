@@ -50,6 +50,12 @@ export async function GET(request: Request) {
       // pending_payment is included in this same poll and showing a ticket
       // code before they've paid would be misleading.
       ticketNumber: reconciled.status === "pending_payment" ? undefined : reconciled.ticketNumber,
+      // Lets the status page distinguish "print_failed, refund issued" from
+      // "print_failed, refund itself also failed" (attemptRefund in
+      // lib/refund.ts only sets this once the refund genuinely succeeded at
+      // the gateway) — a double-failure the customer needs to see, not one
+      // silently masked behind a generic "failed" message.
+      refundedAt: reconciled.refundedAt,
     });
   } catch (error) {
     console.error("verify-payment error:", error);

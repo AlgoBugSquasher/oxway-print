@@ -58,6 +58,28 @@ export async function submitPrintJob(filePath: string, settings: PrintSettingsSn
   return match[1];
 }
 
+/**
+ * Cancels a submitted job in CUPS — called whenever a job transitions to
+ * print_failed (see failJob in print-agent/index.ts), so a stuck or errored
+ * job can never later get physically printed once whatever blocked it
+ * clears (e.g. a disabled queue getting re-enabled), well after the
+ * customer's already been auto-refunded for it. That exact gap — a refund
+ * issued while the job sat live in CUPS's queue, then printed anyway once
+ * the queue came back — is a confirmed real bug this closes.
+ *
+ * Best-effort: if the job already finished or was already removed by the
+ * time this runs, `cancel` exits non-zero — fine, there's nothing left to
+ * cancel, not a reason to leave the job print_failed/refunded without ever
+ * marking that in the DB.
+ */
+export async function cancelPrintJob(cupsJobId: string): Promise<void> {
+  try {
+    await execFileAsync("cancel", [cupsJobId]);
+  } catch (error) {
+    console.error(`[cups] Could not cancel job ${cupsJobId} (may already be gone):`, error);
+  }
+}
+
 export type CupsJobQueueState = "active" | "completed" | "error";
 
 // Matched (case-insensitively) against a job's lpstat -l block — both while
