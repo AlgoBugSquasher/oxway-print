@@ -40,6 +40,8 @@ export interface UpdateKioskCountersInput {
   cartridgePages?: number;
   trayMaxPages?: number;
   cartridgeMaxPages?: number;
+  allowColor?: boolean;
+  allowBw?: boolean;
 }
 
 export async function updateKioskCounters(input: UpdateKioskCountersInput): Promise<void> {
@@ -50,7 +52,34 @@ export async function updateKioskCounters(input: UpdateKioskCountersInput): Prom
     p_cartridge_pages: input.cartridgePages ?? null,
     p_tray_max_pages: input.trayMaxPages ?? null,
     p_cartridge_max_pages: input.cartridgeMaxPages ?? null,
+    p_allow_color: input.allowColor ?? null,
+    p_allow_bw: input.allowBw ?? null,
   });
+  if (error) throw new Error(error.message);
+}
+
+/**
+ * Owner-only (it controls messaging spend, see the RPC's own role check in
+ * supabase/schema.sql) — a separate RPC from updateKioskCounters above
+ * rather than a third parameter on it, same split as update_pricing being
+ * its own owner-only RPC.
+ */
+export async function updateKioskWhatsappAvailability(kioskId: string, allowWhatsapp: boolean): Promise<void> {
+  const supabase = createSupabaseBrowserClient();
+  const { error } = await supabase.rpc("update_kiosk_whatsapp_availability", { p_kiosk_id: kioskId, p_allow_whatsapp: allowWhatsapp });
+  if (error) throw new Error(error.message);
+}
+
+/**
+ * Remote "Update kiosk" / "Restart agent" — inserts the kiosk_commands row
+ * the print agent's own poll loop picks up (print-agent/kiosk-update.ts).
+ * The RPC itself refuses a second command while one's already
+ * pending/running for that kiosk; kiosk-card.tsx's disabled button state is
+ * just the UX mirror of that same guard.
+ */
+export async function requestKioskCommand(kioskId: string, command: "update" | "restart"): Promise<void> {
+  const supabase = createSupabaseBrowserClient();
+  const { error } = await supabase.rpc("request_kiosk_command", { p_kiosk_id: kioskId, p_command: command });
   if (error) throw new Error(error.message);
 }
 

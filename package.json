@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "print-agent": "tsx print-agent/index.ts"
+    "print-agent": "tsx print-agent/boot-guard.ts"
   },
   "dependencies": {
     "@cashfreepayments/cashfree-js": "^1.0.7",

@@ -17,6 +17,8 @@ export interface AdminJobRow {
   settings: PrintSettingsSnapshot;
   total_price: number | null;
   phone_number: string;
+  notify_opt_in: boolean;
+  notified_at: string | null;
   include_banner_page: boolean;
   provider: "cashfree" | "razorpay";
   provider_order_id: string;
@@ -44,6 +46,28 @@ export interface AdminKioskRow {
   total_revenue: number | null;
   total_lifetime_prints: number;
   updated_at: string;
+  allow_color: boolean;
+  allow_bw: boolean;
+  /** Written by the print agent on every boot — null until it's booted at least once since this column was added. */
+  agent_commit: string | null;
+  agent_updated_at: string | null;
+  /** Owner-only admin toggle — whether the WhatsApp opt-in is even offered at this kiosk. Defaults false. */
+  allow_whatsapp: boolean;
+}
+
+export type AdminKioskCommandName = "update" | "restart";
+export type AdminKioskCommandStatus = "pending" | "running" | "done" | "failed";
+
+/** Row shape returned by kiosk_commands_admin_view — one remote "Update kiosk"/"Restart agent" request. */
+export interface AdminKioskCommandRow {
+  id: string;
+  kiosk_id: string;
+  command: AdminKioskCommandName;
+  status: AdminKioskCommandStatus;
+  requested_by: string | null;
+  requested_at: string;
+  finished_at: string | null;
+  result: string | null;
 }
 
 /** Row shape returned by pricing_config — owner-only table, no masking needed. */

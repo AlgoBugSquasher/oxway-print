@@ -24,13 +24,29 @@ create table print_jobs (
   settings jsonb not null,
   total_price numeric not null,
 
-  -- disabled feature (§1 phone number) — column exists, checkout form's
-  -- input is commented out, so every row gets this default.
+  -- Customer's phone number, only ever populated when notify_opt_in is
+  -- true (WhatsApp "print ready" updates) — the checkout form never
+  -- collects or sends it otherwise, and the server re-enforces that
+  -- regardless of what a request claims (see app/api/create-order).
   phone_number text not null default '',
+  -- WhatsApp opt-in — gates both whether phone_number is ever collected
+  -- and whether lib/notify/'s MSG91 provider sends anything for this job
+  -- at all (see notified_at below for the send-exactly-once guard).
+  notify_opt_in boolean not null default false,
+  -- Set the instant a terminal-state WhatsApp notification is actually
+  -- sent for this job (print completion, or print_failed-and-refunded) —
+  -- the atomic claim app/api/agent/notify's UPDATE ... WHERE notified_at
+  -- IS NULL relies on, so a job can never get notified twice even if the
+  -- print agent calls that endpoint more than once for the same job.
+  notified_at timestamptz,
 
-  -- disabled feature (§5 banner page) — column exists, checkbox + print
-  -- agent's banner-prepend step are commented out.
-  include_banner_page boolean not null default false,
+  -- Pickup-ID banner page — mandatory on every job (the opt-in checkbox
+  -- was removed from the checkout form; app/api/create-order hardcodes
+  -- this true server-side regardless of what a request sends). The column
+  -- stays boolean rather than being dropped, in case it's ever made
+  -- optional again — see lib/print/sheets.ts and lib/print/banner.ts,
+  -- which already branch on this value rather than assuming it's always true.
+  include_banner_page boolean not null default true,
 
   content_hash text not null default '',
   provider text not null,
@@ -118,7 +134,36 @@ create table kiosk_status (
   -- agent's own 20s timer, deliberately separate from updated_at (which also
   -- moves on every print-counter update) so "last alive" and "last printed"
   -- can never be confused with each other.
-  last_seen_at timestamptz
+  last_seen_at timestamptz,
+
+  -- Per-kiosk admin control over which color modes customers can select —
+  -- e.g. toner running low, temporarily disable color without taking the
+  -- whole kiosk offline. Both default true (nothing disabled until an
+  -- owner/staff explicitly turns one off via update_kiosk_counters below).
+  -- update_kiosk_counters itself refuses a write that would leave both
+  -- false — there is no server-side invariant enforcing that here at the
+  -- column level, intentionally, since a CHECK constraint can't see the
+  -- *other* column's about-to-be-written value in the same statement as
+  -- cleanly as the RPC's own pre-update guard can.
+  allow_color boolean not null default true,
+  allow_bw boolean not null default true,
+
+  -- Owner-only (it controls messaging spend, see update_kiosk_whatsapp_
+  -- availability below) — whether the WhatsApp "print ready" opt-in is
+  -- even offered at this kiosk at all. Defaults false (off) rather than
+  -- true like allow_color/allow_bw above: those two gate an existing,
+  -- always-available choice, this one gates a feature that costs real
+  -- money per message the moment a real MSG91 provider is wired up, so the
+  -- safe default is "not offered" until an owner deliberately turns it on.
+  allow_whatsapp boolean not null default false,
+
+  -- Remote "Update kiosk" command — written by the print agent itself (never
+  -- by the website), on every boot, so the admin panel can confirm which
+  -- code a kiosk is actually running and when it last restarted. Nullable
+  -- because a kiosk that has never booted the updated agent code has
+  -- nothing to report yet.
+  agent_commit text,
+  agent_updated_at timestamptz
 );
 
 insert into kiosk_status (id) values ('oxway_01');
@@ -172,6 +217,39 @@ create table kiosk_ticket_counters (
 alter table kiosk_ticket_counters enable row level security;
 -- No policies — only touched via next_ticket_number(), called server-side
 -- with the service-role key from /api/create-order.
+
+-- ============================================================================
+-- 6b. kiosk_commands — remote "Update kiosk" / "Restart agent" commands
+-- ============================================================================
+--
+-- One row per admin-requested command. The print agent polls for its own
+-- kiosk's pending rows in its existing loop (print-agent/kiosk-update.ts) —
+-- it never executes anything from `command`'s text directly, it only ever
+-- switches on the two whitelisted values enforced by the check constraint
+-- below and maps each to a fixed code path. status moves pending (just
+-- requested) -> running (the agent claimed it, atomically, same UPDATE ...
+-- WHERE pattern as print_jobs' claim functions) -> done | failed.
+
+create table kiosk_commands (
+  id uuid primary key default gen_random_uuid(),
+  kiosk_id text not null,
+  command text not null check (command in ('update', 'restart')),
+  status text not null default 'pending' check (status in ('pending', 'running', 'done', 'failed')),
+  requested_by uuid references auth.users(id),
+  requested_at timestamptz not null default now(),
+  finished_at timestamptz,
+  result text
+);
+
+create index kiosk_commands_kiosk_status_idx on kiosk_commands (kiosk_id, status);
+create index kiosk_commands_kiosk_requested_idx on kiosk_commands (kiosk_id, requested_at desc);
+
+alter table kiosk_commands enable row level security;
+-- No policies — the print agent polls/claims/finishes rows with the
+-- service-role key (bypasses RLS, same as print_jobs/kiosk_status above);
+-- the admin panel only ever reads via kiosk_commands_admin_view and writes
+-- via the role-gated request_kiosk_command() RPC below, never this table
+-- directly.
 
 -- ============================================================================
 -- 7. Functions
@@ -300,25 +378,70 @@ begin
 end;
 $$;
 
+-- Dropped first because adding the two new trailing parameters changes this
+-- function's argument-type signature — CREATE OR REPLACE only actually
+-- replaces a function when its parameter *types* match exactly; otherwise
+-- Postgres creates a second, overloaded version instead of replacing the
+-- old 5-arg one, leaving both reachable. Same reasoning next_ticket_number
+-- above already documents for its own return-type change.
+drop function if exists public.update_kiosk_counters(text, integer, integer, integer, integer);
 create or replace function public.update_kiosk_counters(
   p_kiosk_id text,
   p_tray_pages integer default null,
   p_cartridge_pages integer default null,
   p_tray_max_pages integer default null,
-  p_cartridge_max_pages integer default null
+  p_cartridge_max_pages integer default null,
+  p_allow_color boolean default null,
+  p_allow_bw boolean default null
 )
 returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_resulting_allow_color boolean;
+  v_resulting_allow_bw boolean;
 begin
   if public.current_app_role() not in ('owner', 'staff') then
     raise exception 'Not authorized.';
   end if;
+
+  -- Refuse a write that would leave both color and B&W disabled — the
+  -- customer page would have nothing sellable left to offer. Computed
+  -- against what the row would actually end up as (coalesce of the new
+  -- value or whatever's already there), not just the raw params, so this
+  -- still catches e.g. "turn color off" when B&W is already off from an
+  -- earlier edit.
+  select coalesce(p_allow_color, allow_color), coalesce(p_allow_bw, allow_bw)
+    into v_resulting_allow_color, v_resulting_allow_bw
+  from kiosk_status where id = p_kiosk_id;
+
+  if v_resulting_allow_color is false and v_resulting_allow_bw is false then
+    raise exception 'At least one of Color or B&W must stay enabled.';
+  end if;
+
   update kiosk_status set
     tray_pages = coalesce(p_tray_pages, tray_pages),
     cartridge_pages = coalesce(p_cartridge_pages, cartridge_pages),
     tray_max_pages = coalesce(p_tray_max_pages, tray_max_pages),
     cartridge_max_pages = coalesce(p_cartridge_max_pages, cartridge_max_pages),
+    allow_color = coalesce(p_allow_color, allow_color),
+    allow_bw = coalesce(p_allow_bw, allow_bw),
     updated_at = now()
   where id = p_kiosk_id;
+end;
+$$;
+
+-- Owner-only, separate from update_kiosk_counters above (which is owner
+-- AND staff) rather than a third parameter on it — this one controls real
+-- messaging spend once a paid provider is wired up, so it gets its own
+-- single-purpose RPC with its own stricter role check, same split as
+-- update_pricing being its own owner-only RPC rather than a parameter on
+-- update_kiosk_counters.
+create or replace function public.update_kiosk_whatsapp_availability(p_kiosk_id text, p_allow_whatsapp boolean)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if public.current_app_role() <> 'owner' then
+    raise exception 'Only an owner can change WhatsApp availability.';
+  end if;
+  update kiosk_status set allow_whatsapp = p_allow_whatsapp, updated_at = now() where id = p_kiosk_id;
 end;
 $$;
 
@@ -338,11 +461,39 @@ begin
 end;
 $$;
 
+-- Remote "Update kiosk" / "Restart agent" — inserts the command row the
+-- print agent's own poll loop picks up. Refuses a second command while one
+-- is still pending/running for the same kiosk (the admin UI also disables
+-- the button for this, but that's a UX nicety, not the real guard — same
+-- division of responsibility as update_kiosk_counters' both-disabled check
+-- above).
+create or replace function public.request_kiosk_command(p_kiosk_id text, p_command text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if public.current_app_role() not in ('owner', 'staff') then
+    raise exception 'Not authorized.';
+  end if;
+  if p_command not in ('update', 'restart') then
+    raise exception 'Unknown command.';
+  end if;
+  if exists (
+    select 1 from kiosk_commands
+    where kiosk_id = p_kiosk_id and status in ('pending', 'running')
+  ) then
+    raise exception 'A command is already pending or running for this kiosk.';
+  end if;
+  insert into kiosk_commands (kiosk_id, command, requested_by)
+  values (p_kiosk_id, p_command, auth.uid());
+end;
+$$;
+
 grant execute on function public.mark_job_refunded(uuid) to authenticated;
 grant execute on function public.force_reprint_job(uuid) to authenticated;
 grant execute on function public.cancel_job(uuid) to authenticated;
-grant execute on function public.update_kiosk_counters(text, integer, integer, integer, integer) to authenticated;
+grant execute on function public.update_kiosk_counters(text, integer, integer, integer, integer, boolean, boolean) to authenticated;
 grant execute on function public.update_pricing(numeric, numeric) to authenticated;
+grant execute on function public.request_kiosk_command(text, text) to authenticated;
+grant execute on function public.update_kiosk_whatsapp_availability(text, boolean) to authenticated;
 
 -- ============================================================================
 -- 8. Policies that depend on current_app_role() existing (§7 above)
@@ -371,18 +522,28 @@ select
   case when public.current_app_role() = 'owner' then total_price else null end as total_price,
   phone_number, include_banner_page, provider, provider_order_id, pdf_storage_path,
   kiosk_id, ticket_number, ticket_date, collected_at,
-  created_at, updated_at, error, cups_job_id, refunded_at
+  created_at, updated_at, error, cups_job_id, refunded_at,
+  notify_opt_in, notified_at
 from public.print_jobs;
 
 create view public.kiosk_status_admin_view as
 select
   id, tray_pages, cartridge_pages, tray_max_pages, cartridge_max_pages,
   case when public.current_app_role() = 'owner' then total_revenue else null end as total_revenue,
-  total_lifetime_prints, updated_at
+  total_lifetime_prints, updated_at, allow_color, allow_bw,
+  agent_commit, agent_updated_at, allow_whatsapp
 from public.kiosk_status;
+
+-- Nothing in kiosk_commands is financial/sensitive — no column masking
+-- needed, this view exists purely so `authenticated` never gets a direct
+-- table grant (same reasoning as the two views above).
+create view public.kiosk_commands_admin_view as
+select id, kiosk_id, command, status, requested_by, requested_at, finished_at, result
+from public.kiosk_commands;
 
 grant select on public.print_jobs_admin_view to authenticated;
 grant select on public.kiosk_status_admin_view to authenticated;
+grant select on public.kiosk_commands_admin_view to authenticated;
 
 -- ============================================================================
 -- 10. Anonymous read access for the customer status page's Realtime signal

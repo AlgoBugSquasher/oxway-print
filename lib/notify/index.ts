@@ -1,13 +1,14 @@
-import { OWNER_ALERT_PHONE } from "../config";
+import { getActiveNotifyProvider, OWNER_ALERT_PHONE } from "../config";
 import { shortRequestId } from "../request-id";
 import { consoleProvider } from "./console";
+import { msg91Provider } from "./msg91";
 import type { NotifyProvider } from "./types";
 
 export type { NotifyProvider } from "./types";
 
-/** No real provider wired up yet — see the note in ./console.ts. */
+/** Picks the provider per NOTIFY_PROVIDER (lib/config.ts) — console until that's explicitly set to "msg91", same toggle pattern lib/payment/ uses for the gateway. */
 function activeProvider(): NotifyProvider {
-  return consoleProvider;
+  return getActiveNotifyProvider() === "msg91" ? msg91Provider : consoleProvider;
 }
 
 /**
@@ -28,13 +29,33 @@ export async function notifyPaymentConfirmed(job: { id: string; phoneNumber: str
 }
 
 /**
- * Trigger 2 of 3 from ROADMAP.md #2. Called from print-agent/index.ts right
- * after a job leaves the CUPS queue.
+ * Called from app/api/agent/notify (the print agent's terminal-state ping,
+ * see that route) once a job reaches `printed` — only when the job opted
+ * into WhatsApp updates, see that route's own notify_opt_in check. Leads
+ * with the ticket code rather than the Request ID, since that's the actual
+ * v2.5 pickup mechanism (ROADMAP.md §21-23) — the customer matches this
+ * same code against the kiosk screen, not the Request ID.
  */
-export async function notifyPrintCompleted(job: { id: string; phoneNumber: string }): Promise<void> {
+export async function notifyPrintCompleted(job: { id: string; phoneNumber: string; ticketNumber?: number }): Promise<void> {
+  const pickupCode = job.ticketNumber != null ? `#${String(job.ticketNumber).padStart(3, "0")}` : shortRequestId(job.id);
   await activeProvider().send(
     job.phoneNumber,
-    `OXWAY: Your print is ready for pickup! Request ID: ${shortRequestId(job.id)}.`
+    `OXWAY: Your print is ready! Show pickup code ${pickupCode} at the kiosk to collect it.`
+  );
+}
+
+/**
+ * Called from the same place as notifyPrintCompleted above, for the other
+ * terminal state that opted-in customers hear about: a print that failed
+ * and was successfully auto-refunded (lib/refund.ts). Deliberately NOT
+ * sent when the refund itself also failed — see app/api/agent/notify's own
+ * comment for why that case is left to staff follow-up instead of a
+ * WhatsApp message that would be claiming something that isn't true yet.
+ */
+export async function notifyPrintFailedRefunded(job: { id: string; phoneNumber: string }): Promise<void> {
+  await activeProvider().send(
+    job.phoneNumber,
+    `OXWAY: Sorry, your print couldn't be completed. Your payment has been refunded — Request ID: ${shortRequestId(job.id)}. See kiosk staff if you'd like to try again.`
   );
 }
 

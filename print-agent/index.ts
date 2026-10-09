@@ -25,16 +25,17 @@ loadEnv({ path: path.resolve(process.cwd(), ".env.local"), override: true });
 
 import { writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { KIOSK_HEARTBEAT_INTERVAL_MS, KIOSK_ID, PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
-import { recordCompletedPrint, touchKioskHeartbeat } from "../lib/kiosk-stats";
-// ROADMAP.md §2 (notifications) is disabled for v2.5 — see the call site
-// below for why, and lib/payment-reconciliation.ts for the other trigger.
-// import { notifyPrintCompleted } from "../lib/notify";
+import { AGENT_API_SECRET, BASE_URL, KIOSK_HEARTBEAT_INTERVAL_MS, KIOSK_ID, PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
+import { failDanglingRunningCommand, finishKioskCommand } from "../lib/kiosk-commands";
+import { recordAgentBoot, recordCompletedPrint, touchKioskHeartbeat } from "../lib/kiosk-stats";
 import { prependBannerPage } from "../lib/print/banner";
 import { cancelPrintJob, getCupsJobQueueState, submitPrintJob } from "../lib/print/cups";
 import { physicalSheetsForJob } from "../lib/print/sheets";
 import { attemptRefund } from "../lib/refund";
 import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
+import { getCurrentCommit, flushPendingResult, processKioskCommand } from "./kiosk-update";
+import { readPendingCommandResult } from "./pending-command-result";
+import { clearUpdateMarker, readUpdateMarker } from "./update-marker";
 
 // Polls CUPS aggressively (every second) so the moment a job leaves the
 // queue, the customer's Realtime-subscribed status page updates near-
@@ -43,6 +44,41 @@ const QUEUE_POLL_INTERVAL_MS = 1000;
 // A job stuck in the CUPS queue this long is treated as failed rather than
 // leaving the customer waiting forever — see failJob below.
 const QUEUE_POLL_TIMEOUT_MS = 2 * 60 * 1000;
+
+/**
+ * Pings the website's app/api/agent/notify whenever this job hits a
+ * terminal state it might need a WhatsApp update for (printed, or
+ * print_failed-after-a-successful-refund — see the two call sites below).
+ * That route owns every actual decision (opted in? already sent? which
+ * message?) and the real MSG91 credentials — this agent only ever needs to
+ * know "something happened," never the notification business rules
+ * themselves or any send-provider secrets.
+ *
+ * Best-effort and silent on missing config: AGENT_API_SECRET is optional
+ * (WhatsApp notifications are an opt-in feature on top of an already-
+ * working print flow), so a kiosk that hasn't set it up yet shouldn't log
+ * a warning on every single job — same reasoning as OWNER_ALERT_PHONE
+ * being optional elsewhere. A request that fails once it's actually
+ * configured does get logged, since that's a real, actionable problem.
+ */
+async function notifyAgentTerminalState(jobId: string): Promise<void> {
+  if (!AGENT_API_SECRET) return;
+  try {
+    const response = await fetch(`${BASE_URL}/api/agent/notify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${AGENT_API_SECRET}` },
+      body: JSON.stringify({ jobId }),
+    });
+    if (!response.ok) {
+      console.error(`[print-agent] notify-terminal-state failed for job ${jobId}: HTTP ${response.status}`);
+    }
+  } catch (error) {
+    // Must never crash the poll loop or mask the actual print/refund
+    // outcome this is just reporting on — same reasoning as the
+    // recordCompletedPrint/attemptRefund calls around this one.
+    console.error(`[print-agent] notify-terminal-state request failed for job ${jobId}:`, error);
+  }
+}
 
 async function processJob(job: PrintJobRecord): Promise<void> {
   const claimed = await claimJobForPrinting(job.id);
@@ -105,6 +141,10 @@ async function failJob(job: PrintJobRecord, reason: string, cupsJobId?: string):
     const result = await attemptRefund(job);
     if (result.ok) {
       console.log(`[print-agent] Auto-refunded job ${job.id}: ${result.refundId}`);
+      // Only on a genuine refund success — see notifyPrintFailedRefunded's
+      // own docstring for why a failed refund must never produce a message
+      // claiming one happened.
+      await notifyAgentTerminalState(job.id);
     } else if (result.reason === "no_captured_payment") {
       console.warn(`[print-agent] Could not auto-refund job ${job.id}: no captured payment reference.`);
     }
@@ -126,13 +166,7 @@ async function watchUntilPrinted(job: PrintJobRecord, cupsJobId: string): Promis
       await updateJob(job.id, { status: "printed" });
       console.log(`[print-agent] Job ${job.id} printed.`);
 
-      // Disabled for v2.5 — the customer already has their ticket code
-      // (ROADMAP.md §21-23) instead of a "ready for pickup" text.
-      // try {
-      //   await notifyPrintCompleted(job);
-      // } catch (notifyError) {
-      //   console.error(`[print-agent] notifyPrintCompleted failed for job ${job.id}:`, notifyError);
-      // }
+      await notifyAgentTerminalState(job.id);
 
       await recordCompletedPrint(job.kioskId, {
         pagesPrinted: physicalSheetsForJob(job),
@@ -156,13 +190,47 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Resolves whatever an `update` command left behind from a previous boot —
+ * see print-agent/boot-guard.ts for the full rollback design this is one
+ * half of. Called once, after this process has already proven itself by
+ * completing a full poll cycle without throwing (not immediately on
+ * startup): boot-guard is watching this same marker file to decide whether
+ * to roll back, and clearing it too early would let it stop watching before
+ * a crash moments into startup (e.g. inside recordAgentBoot or the first
+ * listPaidJobs call) ever gets a chance to happen.
+ */
+async function confirmBootIfPending(): Promise<void> {
+  const marker = readUpdateMarker();
+  if (!marker) return;
+
+  if (marker.status === "verifying") {
+    await finishKioskCommand(marker.commandId, "done", `Updated successfully to ${getCurrentCommit().slice(0, 7)}.`);
+    console.log(`[print-agent] Update ${marker.commandId} confirmed healthy.`);
+  } else if (marker.status === "rolled_back") {
+    await finishKioskCommand(marker.commandId, "failed", `New version failed to start — rolled back to ${marker.previousCommit.slice(0, 7)}.`);
+    console.log(`[print-agent] Update ${marker.commandId} reported as failed — this boot is running the rolled-back code.`);
+  }
+  clearUpdateMarker();
+}
+
 async function pollLoop(): Promise<void> {
   console.log(`[print-agent] Kiosk "${KIOSK_ID}" watching for paid jobs every ${PRINT_AGENT_POLL_INTERVAL_MS}ms...`);
+  let hasConfirmedBoot = false;
   for (;;) {
     try {
       const paidJobs = await listPaidJobs(KIOSK_ID);
       for (const job of paidJobs) {
         await processJob(job);
+      }
+      // Only reached once the paid-job queue for this tick is fully
+      // drained — the single-threaded await chain above is exactly what
+      // guarantees nothing is mid-claim or mid-print the moment this runs,
+      // satisfying "update only when idle" without a separate busy flag.
+      await processKioskCommand(KIOSK_ID);
+      if (!hasConfirmedBoot) {
+        await confirmBootIfPending();
+        hasConfirmedBoot = true; // Only set once the above actually succeeds — a thrown error here should retry next tick, not strand the marker unresolved forever.
       }
     } catch (error) {
       console.error("[print-agent] Poll cycle failed:", error);
@@ -179,5 +247,35 @@ function startHeartbeat(): void {
   setInterval(() => void touchKioskHeartbeat(KIOSK_ID), KIOSK_HEARTBEAT_INTERVAL_MS);
 }
 
-startHeartbeat();
-pollLoop();
+/**
+ * One-time boot bookkeeping, run before either loop starts:
+ *   - Report this kiosk's current commit, every boot, not just after an
+ *     update (see lib/kiosk-stats.ts's recordAgentBoot) — the admin panel's
+ *     "agent version" needs this from the very first boot ever, regardless
+ *     of whether a remote command was ever involved.
+ *   - Flush a result kiosk-update.ts couldn't report last time because the
+ *     Pi's own network happened to be down at that exact moment (see
+ *     reportOutcome in that file) — done BEFORE the dangling-row cleanup
+ *     below, so a real "failed: npm install errored" result gets first
+ *     crack at landing rather than being overwritten by that cleanup's
+ *     generic "interrupted" message.
+ *   - Clean up a kiosk_commands row still stuck "running" after the above
+ *     two — from a boot that ended some other way entirely (e.g. the Pi
+ *     lost power mid-update, before anything got a chance to write
+ *     anything) — excluding whatever command this boot's own update-marker
+ *     or just-flushed pending result already accounted for, so the cleanup
+ *     paths can never race over the same row.
+ */
+async function reportBoot(): Promise<void> {
+  const commit = getCurrentCommit();
+  await recordAgentBoot(KIOSK_ID, commit);
+  await flushPendingResult();
+  const marker = readUpdateMarker();
+  const stillPendingResult = readPendingCommandResult();
+  await failDanglingRunningCommand(KIOSK_ID, marker?.commandId ?? stillPendingResult?.commandId ?? null);
+}
+
+void reportBoot().then(() => {
+  startHeartbeat();
+  pollLoop();
+});

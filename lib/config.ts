@@ -74,3 +74,45 @@ export const ONLINE_THRESHOLD_SECONDS = 60;
 
 /** Where low-supply / kiosk-silent alerts (ROADMAP.md #8) go — the owner, not a customer. No real SMS/WhatsApp provider is wired yet (see lib/notify/console.ts), so this only matters once one is. */
 export const OWNER_ALERT_PHONE = process.env.OWNER_ALERT_PHONE || "";
+
+export type NotifyProviderName = "console" | "msg91";
+
+/**
+ * Which notify provider is actually live — same toggle pattern as
+ * getActiveProvider() above for payments. Defaults to "console" (logs
+ * instead of sending) rather than throwing when unset, unlike the payment
+ * toggle: until real MSG91 credentials exist there's nothing to flip this
+ * to yet, and the whole point is that nothing about re-enabling WhatsApp
+ * notifications later should require touching code — just set
+ * NOTIFY_PROVIDER=msg91 plus the MSG91_* vars below once there's a real
+ * account and an approved WhatsApp template.
+ */
+export function getActiveNotifyProvider(): NotifyProviderName {
+  return process.env.NOTIFY_PROVIDER === "msg91" ? "msg91" : "console";
+}
+
+/**
+ * MSG91 WhatsApp send API — see lib/notify/msg91.ts for the request shape
+ * built from these. NEEDS VERIFICATION once a real account/template
+ * exists; see that file's own docstring.
+ */
+export const MSG91_AUTH_KEY = process.env.MSG91_AUTH_KEY || "";
+export const MSG91_WHATSAPP_TEMPLATE_NAME = process.env.MSG91_WHATSAPP_TEMPLATE_NAME || "";
+export const MSG91_WHATSAPP_SENDER = process.env.MSG91_WHATSAPP_SENDER || "";
+
+/**
+ * Shared secret the print agent authenticates with when calling
+ * app/api/agent/notify — the Pi is the only caller, so a simple bearer
+ * token (same pattern as CRON_SECRET on the cron routes) is enough; there's
+ * no browser/RLS context on that side to issue a real session to.
+ */
+export const AGENT_API_SECRET = process.env.AGENT_API_SECRET || "";
+
+/**
+ * Remote "Update kiosk" command (Pi-only) — the branch the print agent
+ * fast-forwards to on an `update` command. Deliberately read from this
+ * Pi's own env, never from the command row itself — an admin can only ever
+ * trigger "pull whatever the agent is already configured to trust," never
+ * point a kiosk at an arbitrary ref. See print-agent/kiosk-update.ts.
+ */
+export const UPDATE_BRANCH = process.env.UPDATE_BRANCH || "main";

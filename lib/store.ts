@@ -26,8 +26,12 @@ export interface PrintJobRecord {
   selectedPages: number[];
   settings: PrintSettingsSnapshot;
   totalPrice: number;
-  /** Customer's phone number, collected at checkout — see ROADMAP.md #1. */
+  /** Customer's phone number — only ever populated when notifyOptIn is true. */
   phoneNumber: string;
+  /** WhatsApp "print ready" opt-in, checked at checkout. Gates both phoneNumber collection and whether lib/notify/'s provider ever sends anything for this job. */
+  notifyOptIn: boolean;
+  /** Set once a terminal-state WhatsApp notification is actually sent — the atomic claim guard in claimJobForNotification below relies on this being null beforehand. */
+  notifiedAt?: string;
   provider: "cashfree" | "razorpay";
   /** Gateway's own order id, used to look the job up from webhooks and polling. */
   providerOrderId: string;
@@ -83,6 +87,8 @@ interface PrintJobRow {
   settings: PrintSettingsSnapshot;
   total_price: number;
   phone_number: string;
+  notify_opt_in: boolean;
+  notified_at: string | null;
   include_banner_page: boolean;
   content_hash: string;
   provider: "cashfree" | "razorpay";
@@ -108,6 +114,8 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     settings: row.settings,
     totalPrice: row.total_price,
     phoneNumber: row.phone_number,
+    notifyOptIn: row.notify_opt_in,
+    notifiedAt: row.notified_at ?? undefined,
     includeBannerPage: row.include_banner_page,
     contentHash: row.content_hash,
     provider: row.provider,
@@ -134,6 +142,7 @@ function toInsertRow(job: PrintJobRecord): Partial<PrintJobRow> {
     settings: job.settings,
     total_price: job.totalPrice,
     phone_number: job.phoneNumber,
+    notify_opt_in: job.notifyOptIn,
     include_banner_page: job.includeBannerPage,
     content_hash: job.contentHash,
     provider: job.provider,
@@ -256,6 +265,27 @@ export async function claimJobForPrinting(jobId: string): Promise<PrintJobRecord
     .select("*")
     .maybeSingle();
   if (error) throw new Error(`Could not claim job: ${error.message}`);
+  return data ? fromRow(data as PrintJobRow) : null;
+}
+
+/**
+ * Atomically claims a job for WhatsApp notification: only succeeds if
+ * notified_at is still null. Same atomic UPDATE ... WHERE pattern as
+ * claimJobForPrinting/claimJobAsPaid above — app/api/agent/notify calls
+ * this before ever sending anything, so a retried or duplicate call from
+ * the print agent (it's allowed to call this endpoint more than once per
+ * job, see that route's own comment) can never result in two WhatsApp
+ * messages for the same job.
+ */
+export async function claimJobForNotification(jobId: string): Promise<PrintJobRecord | null> {
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .update({ notified_at: new Date().toISOString() })
+    .eq("id", jobId)
+    .is("notified_at", null)
+    .select("*")
+    .maybeSingle();
+  if (error) throw new Error(`Could not claim job for notification: ${error.message}`);
   return data ? fromRow(data as PrintJobRow) : null;
 }
 

@@ -3,6 +3,18 @@
 # ever crashes (a Supabase blip, an unhandled exception, etc.) without
 # anyone needing to notice and manually restart it. See pi/launch-kiosk.sh
 # for the matching autostart piece (the kiosk-display browser).
+#
+# Runs print-agent/boot-guard.ts (not index.ts directly) — the admin panel's
+# remote "Update kiosk" command (see print-agent/kiosk-update.ts) runs
+# `git fetch`/`git merge --ff-only` from this WorkingDirectory, so it needs
+# `git pull` to already work unattended here before installing this unit:
+#   - If github.com/<org>/oxway-print-v2.5 is PRIVATE, this Pi needs its own
+#     read-only deploy key (GitHub repo -> Settings -> Deploy keys -> Add
+#     deploy key, generated on the Pi with `ssh-keygen`, no passphrase so an
+#     unattended pull can use it) — set up once, by hand, outside this repo's
+#     code; nothing here builds or manages that key for you.
+#   - Confirm `git pull` succeeds with no prompts as the `User=` below,
+#     logged in as that user, before relying on the remote command.
 Description=OXWAY print agent
 After=network-online.target
 Wants=network-online.target

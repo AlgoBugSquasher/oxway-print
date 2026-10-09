@@ -40,3 +40,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# print agent (Pi-only) — remote-update rollback state, must survive a
+# `git reset --hard` on the Pi, so it must never be a tracked file.
+.kiosk-update-state.json
+# print agent (Pi-only) — a kiosk command's outcome, held locally when the
+# Pi couldn't reach Supabase to report it, retried on the next poll tick.
+.kiosk-command-result.json

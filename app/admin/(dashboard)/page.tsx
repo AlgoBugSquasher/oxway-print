@@ -2,14 +2,39 @@
 
 import { useEffect, useState } from "react";
 import { IndianRupee, Printer, RefreshCw } from "lucide-react";
+import { fetchJson } from "@/lib/fetch-json";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
-import type { AdminJobRow, AdminKioskRow } from "@/lib/admin/types";
+import type { AdminJobRow, AdminKioskCommandRow, AdminKioskRow } from "@/lib/admin/types";
 import KioskCard from "./kiosk-card";
 import StatusBadge from "./status-badge";
+
+/**
+ * kiosk_commands_admin_view has one row per request ever made, not one per
+ * kiosk — this reduces it to "the most recent command for each kiosk,"
+ * which is all kiosk-card.tsx needs (to disable its buttons while
+ * pending/running, and to show the last result). Ordering by requested_at
+ * descending before this runs means the first row seen per kiosk_id is
+ * already the latest.
+ */
+function latestCommandPerKiosk(commands: AdminKioskCommandRow[]): Map<string, AdminKioskCommandRow> {
+  const latest = new Map<string, AdminKioskCommandRow>();
+  for (const command of commands) {
+    if (!latest.has(command.kiosk_id)) latest.set(command.kiosk_id, command);
+  }
+  return latest;
+}
 
 export default function AdminOverviewPage() {
   const [kiosks, setKiosks] = useState<AdminKioskRow[]>([]);
   const [recentJobs, setRecentJobs] = useState<AdminJobRow[]>([]);
+  const [latestCommands, setLatestCommands] = useState<Map<string, AdminKioskCommandRow>>(new Map());
+  // Server-only env var (lib/config.ts) — fetched via a small authenticated
+  // route rather than imported directly, same reasoning kiosk-card.tsx
+  // already documents for why client code in this codebase never pulls
+  // that module in. Defaults to true (assume console/not-sending) so the
+  // "messages are only logged" warning fails toward being shown rather than
+  // silently hidden before this resolves.
+  const [notifyProviderIsConsole, setNotifyProviderIsConsole] = useState(true);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -18,14 +43,19 @@ export default function AdminOverviewPage() {
     setError("");
     try {
       const supabase = createSupabaseBrowserClient();
-      const [kiosksResult, jobsResult] = await Promise.all([
+      const [kiosksResult, jobsResult, commandsResult, notifyProviderResult] = await Promise.all([
         supabase.from("kiosk_status_admin_view").select("*"),
         supabase.from("print_jobs_admin_view").select("*").order("created_at", { ascending: false }).limit(15),
+        supabase.from("kiosk_commands_admin_view").select("*").order("requested_at", { ascending: false }).limit(50),
+        fetchJson<{ provider: "console" | "msg91" }>("/api/admin/notify-provider").catch(() => ({ provider: "console" as const })),
       ]);
       if (kiosksResult.error) throw new Error(kiosksResult.error.message);
       if (jobsResult.error) throw new Error(jobsResult.error.message);
+      if (commandsResult.error) throw new Error(commandsResult.error.message);
       setKiosks((kiosksResult.data as AdminKioskRow[]) ?? []);
       setRecentJobs((jobsResult.data as AdminJobRow[]) ?? []);
+      setLatestCommands(latestCommandPerKiosk((commandsResult.data as AdminKioskCommandRow[]) ?? []));
+      setNotifyProviderIsConsole(notifyProviderResult.provider !== "msg91");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load dashboard data.");
     } finally {
@@ -68,7 +98,16 @@ export default function AdminOverviewPage() {
       <section>
         <h2 className="mb-3 text-sm font-black uppercase tracking-[0.15em] text-slate-500">Kiosks</h2>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {kiosks.map((kiosk) => <KioskCard key={kiosk.id} kiosk={kiosk} onChanged={() => void load()} />)}
+          {kiosks.map((kiosk) => (
+            <KioskCard
+              key={kiosk.id}
+              kiosk={kiosk}
+              latestCommand={latestCommands.get(kiosk.id) ?? null}
+              isOwner={totalRevenueKnown}
+              notifyProviderIsConsole={notifyProviderIsConsole}
+              onChanged={() => void load()}
+            />
+          ))}
           {!isLoading && kiosks.length === 0 && <p className="text-sm text-slate-500">No kiosk_status rows yet — see SUPABASE_SETUP.md.</p>}
         </div>
       </section>

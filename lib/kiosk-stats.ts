@@ -42,6 +42,26 @@ export async function getKioskLastSeenAt(kioskId: string): Promise<string | null
   return (data as { last_seen_at: string | null } | null)?.last_seen_at ?? null;
 }
 
+export interface KioskColorModes {
+  allowColor: boolean;
+  allowBw: boolean;
+}
+
+/**
+ * Used by both the customer-facing /api/kiosk-status (to grey out a
+ * disabled mode) and /api/create-order (to actually reject one server-side
+ * — the UI check alone isn't trustworthy). Defaults both to true (fail
+ * open) if the kiosk_status row can't be found at all, consistent with
+ * this file's other best-effort reads — a missing/misconfigured row should
+ * never itself be the reason printing becomes unavailable.
+ */
+export async function getKioskColorModes(kioskId: string): Promise<KioskColorModes> {
+  const { data, error } = await supabaseAdmin().from("kiosk_status").select("allow_color, allow_bw").eq("id", kioskId).maybeSingle();
+  if (error) throw new Error(`Could not read kiosk color modes: ${error.message}`);
+  const row = data as { allow_color: boolean; allow_bw: boolean } | null;
+  return { allowColor: row?.allow_color ?? true, allowBw: row?.allow_bw ?? true };
+}
+
 // Proactive threshold for both tray and cartridge — ROADMAP.md #8 previously
 // had cartridge only warn at 100% (too late to act) while tray warned at
 // 90%; both now use the same proactive 90% threshold.
@@ -127,6 +147,70 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
   } catch (error) {
     console.error("Failed to record completed print in Supabase:", error);
     return null;
+  }
+}
+
+export interface KioskWhatsappAvailability {
+  allowWhatsapp: boolean;
+}
+
+/**
+ * Owner-only admin control — whether the WhatsApp "print ready" opt-in is
+ * even offered at this kiosk at all, independent of whether a real MSG91
+ * provider is actually configured (NOTIFY_PROVIDER). Used by
+ * /api/kiosk-status (hide the opt-in checkbox entirely) and
+ * /api/create-order (refuse to honor a client-sent notifyOptIn/phone when
+ * this is false). Fails CLOSED (false on a missing/misconfigured row) —
+ * unlike getKioskColorModes' fail-open default just below, offering an
+ * opt-in nobody explicitly turned on is the wrong default here, not the
+ * safe one (see allow_whatsapp's own default in supabase/schema.sql).
+ */
+export async function getKioskWhatsappAvailability(kioskId: string): Promise<KioskWhatsappAvailability> {
+  const { data, error } = await supabaseAdmin().from("kiosk_status").select("allow_whatsapp").eq("id", kioskId).maybeSingle();
+  if (error) throw new Error(`Could not read kiosk WhatsApp availability: ${error.message}`);
+  const row = data as { allow_whatsapp: boolean } | null;
+  return { allowWhatsapp: row?.allow_whatsapp ?? false };
+}
+
+export interface KioskUpdateState {
+  isUpdating: boolean;
+}
+
+/**
+ * Used by /api/kiosk-status (customer page order-blocking) and the kiosk
+ * display's connectivity hook (maintenance screen) — true while this
+ * kiosk has a remote command still pending or running. `pending` counts as
+ * updating too, not just `running`: a customer shouldn't be able to pay in
+ * the few seconds between staff clicking "Update kiosk" and the agent's
+ * own poll loop actually claiming the row (print-agent/kiosk-update.ts).
+ */
+export async function getKioskUpdateState(kioskId: string): Promise<KioskUpdateState> {
+  const { data, error } = await supabaseAdmin()
+    .from("kiosk_commands")
+    .select("id")
+    .eq("kiosk_id", kioskId)
+    .in("status", ["pending", "running"])
+    .limit(1);
+  if (error) throw new Error(`Could not read kiosk update state: ${error.message}`);
+  return { isUpdating: (data?.length ?? 0) > 0 };
+}
+
+/**
+ * Written by the print agent on every boot (not just after an update) — see
+ * print-agent/index.ts. Lets the admin panel's kiosk card confirm which
+ * commit a kiosk is actually running and when it last restarted, independent
+ * of whether a kiosk_commands row even exists yet (e.g. the very first boot
+ * ever, before any remote command has been sent).
+ */
+export async function recordAgentBoot(kioskId: string, commitHash: string): Promise<void> {
+  try {
+    const { error } = await supabaseAdmin()
+      .from("kiosk_status")
+      .update({ agent_commit: commitHash, agent_updated_at: new Date().toISOString() })
+      .eq("id", kioskId);
+    if (error) console.error("Failed to record agent boot commit:", error.message);
+  } catch (error) {
+    console.error("Failed to record agent boot commit:", error);
   }
 }
 

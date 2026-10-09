@@ -1,9 +1,9 @@
 "use client";
 
 import { type FormEvent, useState, useSyncExternalStore } from "react";
-import { AlertTriangle, Pencil, RefreshCw, Save, WifiOff } from "lucide-react";
-import { updateKioskCounters } from "@/lib/admin/actions";
-import type { AdminKioskRow } from "@/lib/admin/types";
+import { AlertTriangle, Download, MessageCircle, Pencil, RefreshCw, RotateCw, Save, WifiOff } from "lucide-react";
+import { requestKioskCommand, updateKioskCounters, updateKioskWhatsappAvailability } from "@/lib/admin/actions";
+import type { AdminKioskCommandRow, AdminKioskRow } from "@/lib/admin/types";
 
 const LOW_SUPPLY_THRESHOLD = 0.9;
 // Mirrors lib/config.ts's KIOSK_SILENT_THRESHOLD_MINUTES — kept as a plain
@@ -44,14 +44,77 @@ function getServerClockSnapshot() {
   return 0;
 }
 
-export default function KioskCard({ kiosk, onChanged }: { kiosk: AdminKioskRow; onChanged: () => void }) {
+export default function KioskCard({
+  kiosk,
+  latestCommand,
+  isOwner,
+  notifyProviderIsConsole,
+  onChanged,
+}: {
+  kiosk: AdminKioskRow;
+  latestCommand: AdminKioskCommandRow | null;
+  /** Mirrors page.tsx's own totalRevenueKnown signal — the view already nulls owner-only columns for staff, so "did a real value come back" is the same role check RLS already enforces, not a separate client-side guess. */
+  isOwner: boolean;
+  notifyProviderIsConsole: boolean;
+  onChanged: () => void;
+}) {
   const [isEditing, setIsEditing] = useState(false);
   const [trayPages, setTrayPages] = useState(String(kiosk.tray_pages));
   const [trayMaxPages, setTrayMaxPages] = useState(String(kiosk.tray_max_pages));
   const [cartridgePages, setCartridgePages] = useState(String(kiosk.cartridge_pages));
   const [cartridgeMaxPages, setCartridgeMaxPages] = useState(String(kiosk.cartridge_max_pages));
+  const [allowColor, setAllowColor] = useState(kiosk.allow_color);
+  const [allowBw, setAllowBw] = useState(kiosk.allow_bw);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState("");
+  const [commandError, setCommandError] = useState("");
+  const [requestingCommand, setRequestingCommand] = useState<"update" | "restart" | null>(null);
+  const [allowWhatsapp, setAllowWhatsapp] = useState(kiosk.allow_whatsapp);
+  const [isSavingWhatsapp, setIsSavingWhatsapp] = useState(false);
+  const [whatsappError, setWhatsappError] = useState("");
+
+  // Owner-only write, immediate (not folded into the counters form's Save
+  // button) — separate RPC, separate concern, see
+  // update_kiosk_whatsapp_availability's own comment in supabase/schema.sql
+  // for why this isn't just a third parameter on updateKioskCounters.
+  const handleToggleWhatsapp = async (nextValue: boolean) => {
+    setWhatsappError("");
+    setAllowWhatsapp(nextValue); // Optimistic — reverted below on failure.
+    setIsSavingWhatsapp(true);
+    try {
+      await updateKioskWhatsappAvailability(kiosk.id, nextValue);
+      onChanged();
+    } catch (err) {
+      setAllowWhatsapp(!nextValue);
+      setWhatsappError(err instanceof Error ? err.message : "Could not update WhatsApp availability.");
+    } finally {
+      setIsSavingWhatsapp(false);
+    }
+  };
+
+  // A command still pending or running blocks starting a new one — the
+  // request_kiosk_command RPC enforces this for real; this is just the same
+  // guard mirrored into the button's disabled state.
+  const isCommandInFlight = latestCommand?.status === "pending" || latestCommand?.status === "running";
+
+  const handleRequestCommand = async (command: "update" | "restart") => {
+    setCommandError("");
+    setRequestingCommand(command);
+    try {
+      await requestKioskCommand(kiosk.id, command);
+      onChanged();
+    } catch (err) {
+      setCommandError(err instanceof Error ? err.message : `Could not request a ${command}.`);
+    } finally {
+      setRequestingCommand(null);
+    }
+  };
+
+  // Client-side pre-check so the customer-facing reason (nothing left to
+  // sell) shows up instantly instead of only after a round trip — the RPC's
+  // own guard (supabase/schema.sql's update_kiosk_counters) is still the
+  // real boundary, this is purely a UX nicety mirroring it.
+  const bothDisabled = !allowColor && !allowBw;
 
   const trayRatio = kiosk.tray_pages / kiosk.tray_max_pages;
   const cartridgeRatio = kiosk.cartridge_pages / kiosk.cartridge_max_pages;
@@ -64,6 +127,10 @@ export default function KioskCard({ kiosk, onChanged }: { kiosk: AdminKioskRow; 
   const handleSave = async (event: FormEvent) => {
     event.preventDefault();
     setError("");
+    if (bothDisabled) {
+      setError("At least one of Color or B&W must stay enabled.");
+      return;
+    }
     setIsSaving(true);
     try {
       await updateKioskCounters({
@@ -72,6 +139,8 @@ export default function KioskCard({ kiosk, onChanged }: { kiosk: AdminKioskRow; 
         trayMaxPages: Number(trayMaxPages),
         cartridgePages: Number(cartridgePages),
         cartridgeMaxPages: Number(cartridgeMaxPages),
+        allowColor,
+        allowBw,
       });
       setIsEditing(false);
       onChanged();
@@ -101,7 +170,63 @@ export default function KioskCard({ kiosk, onChanged }: { kiosk: AdminKioskRow; 
           <div className="flex justify-between"><span className="text-slate-500">Cartridge</span><b>{kiosk.cartridge_pages} / {kiosk.cartridge_max_pages} pages ({Math.round(cartridgeRatio * 100)}%)</b></div>
           <div className="flex justify-between"><span className="text-slate-500">Lifetime prints</span><b>{kiosk.total_lifetime_prints}</b></div>
           {kiosk.total_revenue !== null && <div className="flex justify-between"><span className="text-slate-500">Revenue</span><b>&#8377;{Number(kiosk.total_revenue).toFixed(2)}</b></div>}
+          <div className="flex justify-between"><span className="text-slate-500">Available modes</span><b>{kiosk.allow_color && kiosk.allow_bw ? "Color & B&W" : kiosk.allow_color ? "Color only" : "B&W only"}</b></div>
           <div className="flex justify-between"><span className="text-slate-500">Last updated</span><b>{new Date(kiosk.updated_at).toLocaleString("en-IN")}</b></div>
+          <div className="flex justify-between"><span className="text-slate-500">Agent version</span><b>{kiosk.agent_commit ? kiosk.agent_commit.slice(0, 7) : "not reported yet"}</b></div>
+          <div className="flex justify-between"><span className="text-slate-500">Agent last booted</span><b>{kiosk.agent_updated_at ? new Date(kiosk.agent_updated_at).toLocaleString("en-IN") : "—"}</b></div>
+
+          <div className="mt-3 border-t border-slate-100 pt-3">
+            <label className={`flex items-center gap-1.5 text-xs font-medium ${isOwner ? "text-slate-700" : "text-slate-400"}`}>
+              <input
+                type="checkbox"
+                checked={allowWhatsapp}
+                disabled={!isOwner || isSavingWhatsapp}
+                onChange={(event) => void handleToggleWhatsapp(event.target.checked)}
+                className="size-3.5 accent-blue-600"
+              />
+              <MessageCircle size={12} className="text-blue-500" /> WhatsApp opt-in {!isOwner && "(owner only)"}
+            </label>
+            {allowWhatsapp && notifyProviderIsConsole && (
+              <p className="mt-1 flex items-center gap-1 text-[11px] font-medium text-amber-600">
+                <AlertTriangle size={11} /> Messages are only logged, not sent — set NOTIFY_PROVIDER=msg91 to actually deliver them.
+              </p>
+            )}
+            {whatsappError && <p className="mt-1 text-[11px] font-medium text-red-500">{whatsappError}</p>}
+          </div>
+
+          <div className="mt-3 border-t border-slate-100 pt-3">
+            <div className="flex gap-2">
+              <button
+                onClick={() => void handleRequestCommand("update")}
+                disabled={isCommandInFlight || requestingCommand !== null}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-blue-500 disabled:opacity-50"
+              >
+                {requestingCommand === "update" || (latestCommand?.status === "running" && latestCommand.command === "update")
+                  ? <RefreshCw size={12} className="animate-spin" />
+                  : <Download size={12} />}
+                Update kiosk
+              </button>
+              <button
+                onClick={() => void handleRequestCommand("restart")}
+                disabled={isCommandInFlight || requestingCommand !== null}
+                className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+              >
+                {requestingCommand === "restart" || (latestCommand?.status === "running" && latestCommand.command === "restart")
+                  ? <RefreshCw size={12} className="animate-spin" />
+                  : <RotateCw size={12} />}
+                Restart agent
+              </button>
+            </div>
+            {commandError && <p className="mt-1.5 text-[11px] font-medium text-red-500">{commandError}</p>}
+            {latestCommand && !isCommandInFlight && (
+              <p className="mt-1.5 text-[11px] text-slate-500">
+                Last {latestCommand.command}: <span className={latestCommand.status === "failed" ? "font-bold text-red-500" : "font-bold text-emerald-600"}>{latestCommand.status}</span>
+                {latestCommand.result ? ` — ${latestCommand.result}` : ""}
+                {latestCommand.finished_at ? ` (${new Date(latestCommand.finished_at).toLocaleString("en-IN")})` : ""}
+              </p>
+            )}
+            {isCommandInFlight && <p className="mt-1.5 text-[11px] font-medium text-blue-600">{latestCommand?.command === "update" ? "Updating…" : "Restarting…"} the agent will come back on its own.</p>}
+          </div>
         </div>
       ) : (
         <form onSubmit={handleSave} className="space-y-3">
@@ -109,9 +234,21 @@ export default function KioskCard({ kiosk, onChanged }: { kiosk: AdminKioskRow; 
           <CounterField label="Tray — max capacity" value={trayMaxPages} onChange={setTrayMaxPages} />
           <CounterField label="Cartridge — pages used" value={cartridgePages} onChange={setCartridgePages} />
           <CounterField label="Cartridge — max capacity" value={cartridgeMaxPages} onChange={setCartridgeMaxPages} />
+          <div>
+            <span className="mb-1 block text-[11px] font-bold text-slate-500">Available to customers</span>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700">
+                <input type="checkbox" checked={allowColor} onChange={(event) => setAllowColor(event.target.checked)} className="size-3.5 accent-blue-600" /> Color
+              </label>
+              <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700">
+                <input type="checkbox" checked={allowBw} onChange={(event) => setAllowBw(event.target.checked)} className="size-3.5 accent-blue-600" /> B&amp;W
+              </label>
+            </div>
+            {bothDisabled && <p className="mt-1 text-[11px] font-medium text-red-500">At least one must stay enabled.</p>}
+          </div>
           {error && <p className="text-xs font-medium text-red-500">{error}</p>}
           <div className="flex gap-2">
-            <button type="submit" disabled={isSaving} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-blue-500 disabled:opacity-50">
+            <button type="submit" disabled={isSaving || bothDisabled} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-blue-500 disabled:opacity-50">
               {isSaving ? <RefreshCw size={12} className="animate-spin" /> : <Save size={12} />} Save
             </button>
             <button type="button" onClick={() => setIsEditing(false)} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100">Cancel</button>

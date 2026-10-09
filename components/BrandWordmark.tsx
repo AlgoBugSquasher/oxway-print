@@ -21,10 +21,10 @@ import Image from "next/image";
  * reads cleanly regardless of the surrounding page's background color or
  * theme (the source image has a plain white background, not transparent).
  */
-export default function BrandWordmark({ className = "h-10" }: { className?: string }) {
+export default function BrandWordmark({ className = "h-10", draggable }: { className?: string; draggable?: boolean }) {
   return (
     <span className="inline-flex w-fit items-center rounded-lg bg-white px-2.5 py-1.5">
-      <Image src="/brand/oxway-wordmark-cropped.jpeg" alt="OXWAY" width={1127} height={260} className={`w-auto ${className}`} priority />
+      <Image src="/brand/oxway-wordmark-cropped.jpeg" alt="OXWAY" width={1127} height={260} className={`w-auto ${className}`} priority draggable={draggable} />
     </span>
   );
 }

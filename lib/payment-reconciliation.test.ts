@@ -37,6 +37,7 @@ function makeJob(overrides: Partial<PrintJobRecord> = {}): PrintJobRecord {
     settings: { copies: 1, layout: "portrait", isColor: false, paperSize: "A4", pagesPerSheet: 1 },
     totalPrice: 10,
     phoneNumber: "9876543210",
+    notifyOptIn: false,
     includeBannerPage: false,
     contentHash: "hash",
     provider: "razorpay",
