@@ -23,6 +23,29 @@ export const PAYMENT_TIMEOUT_SECONDS = Number(process.env.PAYMENT_TIMEOUT_SECOND
 /** Supabase Storage bucket final print-ready PDFs are uploaded to. */
 export const SUPABASE_PRINT_BUCKET = process.env.SUPABASE_PRINT_BUCKET || "print-jobs";
 
+/**
+ * Max accepted upload size — enforced in /api/create-upload-url (before
+ * issuing a signed URL) and re-checked in /api/create-order against the
+ * actual downloaded bytes (the client's declared size is never trusted
+ * alone). 50MB rather than the old 25MB: that number was never a technical
+ * ceiling, just a round one picked before uploads went direct-to-storage —
+ * now that the file never passes through a Vercel serverless function's
+ * request body (see lib/store.ts's temp-upload functions), there's no
+ * platform-imposed reason to keep it lower.
+ */
+export const MAX_UPLOAD_FILE_SIZE_BYTES = 50 * 1024 * 1024;
+
+/**
+ * How long a temporary direct-to-storage upload (lib/store.ts's
+ * tempUploadStoragePath, under the "uploads/" prefix) can sit unclaimed
+ * before the cleanup cron sweeps it as an orphan — e.g. the customer
+ * uploaded the file, then closed the tab before /api/create-order ever
+ * ran. Short, not matched to TERMINAL_JOB_RETENTION_HOURS above: an orphan
+ * was never a real order to begin with, so there's no reprint/complaint
+ * window worth holding it for.
+ */
+export const TEMP_UPLOAD_STALE_HOURS = 1;
+
 /** CUPS printer name on the kiosk Pi. Leave unset to use the system default printer. */
 export const PRINTER_NAME = process.env.PRINTER_NAME || "";
 

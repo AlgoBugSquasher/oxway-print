@@ -59,6 +59,20 @@ export interface ExtractedPdf {
   pageCount: number;
 }
 
+/**
+ * Cheap, fast check that the bytes at least *start* like a PDF — the
+ * `%PDF` magic header every valid PDF file begins with. Not a full
+ * validation (a truncated or corrupted file can still start correctly and
+ * fail later) — see extractSelectedPages below, whose own pdf-lib parse
+ * failure is the real "is this actually readable" check. This just avoids
+ * spending a full parse on something that was never a PDF at all (e.g. a
+ * renamed .docx, or a storage upload that silently failed) and lets the
+ * caller give a clearer, faster error.
+ */
+export function looksLikePdf(bytes: Uint8Array): boolean {
+  return bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+}
+
 type PageRotation = 0 | 90 | 180 | 270;
 
 /** Folds any angle (a source page's raw `/Rotate`, or that plus our own +90) back into the canonical four pdf-lib itself restricts page rotations to. */

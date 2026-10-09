@@ -36,6 +36,7 @@ import { fetchJson } from "@/lib/fetch-json";
 import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
 import type { CreateOrderOutput } from "@/lib/payment";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
+import { uploadFileWithProgress } from "@/lib/upload-with-progress";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
@@ -70,7 +71,13 @@ type PrintSettings = {
   pagesPerSheet: 1 | 2 | 4;
 };
 
-const MAX_FILE_SIZE = 25 * 1024 * 1024;
+// Matches MAX_UPLOAD_FILE_SIZE_BYTES in lib/config.ts (server-side, re-checked
+// there against the actual uploaded bytes — this is only ever a fast local
+// check). Raised from the old 25MB now that the file uploads directly to
+// Supabase Storage (see handleStartPayment below) instead of through a
+// Vercel serverless function's request body, which is what actually
+// capped uploads around ~4.5MB regardless of what this constant said.
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const PRICE_BW = 2;
 const PRICE_COLOR = 10;
 // Once a job reaches one of these, nothing about it changes again — no point
@@ -171,6 +178,11 @@ export default function PdfPageSelector() {
   // print_failed messaging further down.
   const [refundedAt, setRefundedAt] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // 0-100 while the raw file itself is uploading directly to Supabase
+  // Storage (see handleStartPayment) — null the rest of the time,
+  // including during the brief order-creation/gateway step right after,
+  // which isLoading alone already covers.
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   // Holds the converted PDF's bytes so the final file can be uploaded again at
   // payment time — pdfjs consumes the response body when rendering thumbnails.
   const pdfBytesRef = useRef<Uint8Array | null>(null);
@@ -287,7 +299,7 @@ export default function PdfPageSelector() {
   const processFile = async (uploadedFile: File) => {
     setError("");
     if (!isSupportedClientFile(uploadedFile)) return setError("Unsupported file. Upload a PDF, PNG, JPG, JPEG, WEBP, HEIC, HEIF, or DOCX file.");
-    if (uploadedFile.size > MAX_FILE_SIZE) return setError("This file is larger than the 25 MB kiosk limit.");
+    if (uploadedFile.size > MAX_FILE_SIZE) return setError("This file is larger than the 50 MB kiosk limit.");
     setFile(uploadedFile);
     setIsLoading(true);
     setThumbnails([]);
@@ -406,24 +418,52 @@ export default function PdfPageSelector() {
     setError("");
     setIsLoading(true);
     try {
-      const formData = new FormData();
-      formData.append("file", new Blob([pdfBytesRef.current.slice().buffer], { type: "application/pdf" }), file.name);
-      formData.append("fileName", file.name);
-      formData.append("selectedPages", JSON.stringify(activePages));
-      formData.append("settings", JSON.stringify(settings));
-      formData.append("totalPrice", String(totalPrice));
-      formData.append("notifyOptIn", String(notifyOptIn));
-      // Only sent when opted in — the server never collects/stores a phone
-      // number otherwise, regardless of whatever stale value might be in
-      // this field (e.g. typed, then the checkbox unticked again).
-      if (notifyOptIn) formData.append("phone", phone);
       // kioskId (state, above) is read from the QR's ?k=<kiosk-id> param on
       // mount; only sent when explicitly present so the server's own
       // single-kiosk default still applies otherwise.
       const paramKioskId = new URLSearchParams(window.location.search).get("k");
-      if (paramKioskId) formData.append("kioskId", paramKioskId);
 
-      const order = await fetchJson<{ jobId: string } & CreateOrderOutput>("/api/create-order", { method: "POST", body: formData });
+      // Step 1: ask for a place to put the file — the file itself never
+      // goes through our own server's request body, only this tiny JSON
+      // call does (see app/api/create-upload-url/route.ts for why: a
+      // multi-MB body sent straight to a Vercel serverless function used
+      // to come back as an opaque 413, well under this kiosk's own stated
+      // size limit).
+      const pdfBlob = new Blob([pdfBytesRef.current.slice().buffer], { type: "application/pdf" });
+      const uploadTarget = await fetchJson<{ path: string; token: string; signedUrl: string }>("/api/create-upload-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileName: file.name, fileSize: pdfBlob.size, contentType: "application/pdf" }),
+      });
+
+      // Step 2: upload directly to Supabase Storage with that signed URL —
+      // this is the request that actually carries the file's bytes, and it
+      // never touches our own server at all.
+      setUploadProgress(0);
+      await uploadFileWithProgress(uploadTarget.signedUrl, pdfBlob, (fraction) => setUploadProgress(Math.round(fraction * 100)));
+      setUploadProgress(null);
+
+      // Step 3: create the order from the storage path alone — this
+      // request is just metadata (page selection, settings, price), tiny
+      // regardless of how large the actual file was.
+      const order = await fetchJson<{ jobId: string } & CreateOrderOutput>("/api/create-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pdfStoragePath: uploadTarget.path,
+          fileName: file.name,
+          selectedPages: activePages,
+          settings,
+          totalPrice,
+          notifyOptIn,
+          // Only sent when opted in — the server never collects/stores a
+          // phone number otherwise, regardless of whatever stale value
+          // might be in this field (e.g. typed, then the checkbox
+          // unticked again).
+          phone: notifyOptIn ? phone : undefined,
+          kioskId: paramKioskId || undefined,
+        }),
+      });
 
       setJobId(order.jobId);
       setOrderStatus("pending_payment");
@@ -459,6 +499,7 @@ export default function PdfPageSelector() {
       setOrderStatus("idle");
     } finally {
       setIsLoading(false);
+      setUploadProgress(null);
     }
   };
 
@@ -596,7 +637,7 @@ export default function PdfPageSelector() {
     )}
     <main className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[1fr_330px] lg:px-8"><section className="min-w-0"><div className="mb-7 flex items-end justify-between gap-4"><div><p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-blue-500">01 / Upload</p><h1 className="text-3xl font-black tracking-tight sm:text-4xl">Print without the queue.</h1><p className={`mt-2 text-sm ${muted}`}>Upload a PDF, tune your print settings, and send it straight to the kiosk.</p></div>{file && <button onClick={() => fileInputRef.current?.click()} className="hidden rounded-xl border border-blue-500/30 px-3 py-2 text-xs font-bold text-blue-500 sm:block">Change file</button>}</div><button type="button" onClick={() => setIsPreviewOpen(true)} className={`mb-4 flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${panel}`}><span>Preview print</span><span className="text-blue-500">View sheet</span></button>
       <input ref={fileInputRef} type="file" accept="application/pdf,image/png,image/jpeg,image/webp,image/heic,image/heif,.pdf,.png,.jpg,.jpeg,.webp,.heic,.heif,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" className="hidden" onChange={handleFileInput} />
-      {!file && !isLoading && <button type="button" onClick={() => fileInputRef.current?.click()} onDragEnter={(event) => { event.preventDefault(); setIsDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); const droppedFile = event.dataTransfer.files[0]; if (droppedFile) void processFile(droppedFile); }} className={`group flex min-h-[320px] w-full flex-col items-center justify-center rounded-[2rem] border-2 border-dashed p-8 text-center transition ${isDragging ? "border-blue-500 bg-blue-500/10" : `${isDark ? "border-white/15 bg-white/[0.04]" : "border-slate-300 bg-white/70 hover:border-blue-300 hover:bg-white"}`}`}><span className="mb-5 grid size-16 place-items-center rounded-3xl bg-blue-600 text-white shadow-xl shadow-blue-600/20 transition group-hover:-translate-y-1"><FileUp size={27} /></span><span className="text-lg font-bold">Drop your file here</span><span className={`mt-2 text-sm ${muted}`}>PDF, image, or Word document</span><span className={`mt-6 rounded-full px-3 py-1 text-[11px] ${isDark ? "bg-white/10 text-slate-300" : "bg-slate-100 text-slate-500"}`}>PDF · PNG · JPG · HEIC · DOCX · max 25 MB</span></button>}
+      {!file && !isLoading && <button type="button" onClick={() => fileInputRef.current?.click()} onDragEnter={(event) => { event.preventDefault(); setIsDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); const droppedFile = event.dataTransfer.files[0]; if (droppedFile) void processFile(droppedFile); }} className={`group flex min-h-[320px] w-full flex-col items-center justify-center rounded-[2rem] border-2 border-dashed p-8 text-center transition ${isDragging ? "border-blue-500 bg-blue-500/10" : `${isDark ? "border-white/15 bg-white/[0.04]" : "border-slate-300 bg-white/70 hover:border-blue-300 hover:bg-white"}`}`}><span className="mb-5 grid size-16 place-items-center rounded-3xl bg-blue-600 text-white shadow-xl shadow-blue-600/20 transition group-hover:-translate-y-1"><FileUp size={27} /></span><span className="text-lg font-bold">Drop your file here</span><span className={`mt-2 text-sm ${muted}`}>PDF, image, or Word document</span><span className={`mt-6 rounded-full px-3 py-1 text-[11px] ${isDark ? "bg-white/10 text-slate-300" : "bg-slate-100 text-slate-500"}`}>PDF · PNG · JPG · HEIC · DOCX · max 50 MB</span></button>}
       {isLoading && <div className={`flex min-h-[320px] flex-col items-center justify-center rounded-[2rem] border p-8 ${panel}`}>{previewUrl && <img src={previewUrl} alt="Uploaded image preview" className="mb-5 max-h-48 max-w-full rounded-xl object-contain shadow-md" />}<RefreshCw className="mb-4 animate-spin text-blue-500" size={30} /><p className="font-semibold">Preparing your document...</p><p className={`mt-1 text-sm ${muted}`}>Converting to a printable A4 PDF</p></div>}
       {file && !isLoading && <><div className={`mb-5 flex items-center gap-4 rounded-2xl border p-4 ${panel}`}><div className="grid size-11 shrink-0 place-items-center rounded-xl bg-red-500/10 text-red-500"><FileText size={21} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{file.name}</p><p className={`mt-1 text-xs ${muted}`}>{(file.size / (1024 * 1024)).toFixed(2)} MB · {totalPages} pages</p></div><button onClick={() => fileInputRef.current?.click()} className="rounded-xl p-2 text-blue-500 sm:hidden"><RefreshCw size={17} /></button></div><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">02 / Select pages</p><p className={`mt-1 text-sm ${muted}`}>{activePages.length} active pages · tap a page to include or exclude</p></div><div className="flex gap-2"><button onClick={() => setSelectedPages(Array.from({ length: totalPages }, (_, index) => index + 1))} className="text-xs font-bold text-blue-500">All</button><button onClick={() => setSelectedPages([])} className={`text-xs font-bold ${muted}`}>Clear</button></div></div><div className={`grid max-h-[560px] grid-cols-2 gap-3 overflow-y-auto rounded-3xl border p-3 sm:grid-cols-3 xl:grid-cols-4 ${isDark ? "border-white/10 bg-white/[0.03]" : "border-slate-200 bg-slate-100/70"}`}>{thumbnails.map((thumbnail) => { const selected = selectedPages.includes(thumbnail.pageNumber); return <button key={thumbnail.pageNumber} onClick={() => togglePage(thumbnail.pageNumber)} className={`relative overflow-hidden rounded-2xl border-2 bg-white p-1 text-left transition hover:-translate-y-0.5 ${selected ? "border-blue-500 shadow-lg shadow-blue-500/10" : "border-transparent opacity-45 grayscale"}`}><img src={thumbnail.dataUrl} alt={`Page ${thumbnail.pageNumber}`} className="aspect-[1/1.35] w-full object-contain" /><span className="absolute left-3 top-3 rounded-md bg-white/90 px-1.5 py-1 text-[10px] font-black text-slate-600">{thumbnail.pageNumber}</span><span className="absolute right-3 top-3 text-blue-600">{selected ? <CheckCircle2 size={19} fill="white" /> : <Circle size={19} />}</span></button>; })}</div></>}
       {error && <div className="mt-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
@@ -640,7 +681,7 @@ export default function PdfPageSelector() {
          price throughout, rather than duplicating the same number twice
          on screen at two very different sizes. */}
       <div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>
-      {orderStatus === "idle" && <button onClick={handleStartPayment} disabled={isLoading || activePages.length === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>}
+      {orderStatus === "idle" && <button onClick={handleStartPayment} disabled={isLoading || activePages.length === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>}
       {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
       {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
       {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}

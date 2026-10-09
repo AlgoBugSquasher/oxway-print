@@ -31,15 +31,29 @@ const mockAdmin = vi.hoisted(() => ({
   // goes through .rpc(), a different call shape entirely.
   rpcResult: null as { data: unknown; error: unknown } | null,
   rpcCalls: [] as { name: string; args: unknown }[],
+  // listStaleTempUploads' own input — defaults to "nothing in storage" so
+  // every other test in this file (which never touches it) doesn't need
+  // its own stub.
+  storageListResult: { data: [] as unknown[] | null, error: null as unknown },
+  storageRemoveCalls: [] as string[][],
 }));
 
 vi.mock("./supabase-admin", () => ({
   supabaseAdmin: () => ({
     from: () => mockAdmin.current,
-    // deleteJob also removes the Storage object after a successful row
-    // delete — stubbed as a no-op success so that path doesn't need its own
-    // dedicated mock per test.
-    storage: { from: () => ({ remove: async () => ({ error: null }) }) },
+    storage: {
+      from: () => ({
+        // deleteJob/deleteStorageObject remove the Storage object after a
+        // successful row delete — stubbed as a no-op success so most tests
+        // don't need their own dedicated mock, while still recording which
+        // paths were asked for (listStaleTempUploads' own tests check this).
+        remove: async (paths: string[]) => {
+          mockAdmin.storageRemoveCalls.push(paths);
+          return { error: null };
+        },
+        list: async () => mockAdmin.storageListResult,
+      }),
+    },
     rpc: async (name: string, args: unknown) => {
       mockAdmin.rpcCalls.push({ name, args });
       return mockAdmin.rpcResult;
@@ -158,5 +172,40 @@ describe("assignTicketNumber", () => {
     mockAdmin.rpcResult = { data: [], error: null };
     const { assignTicketNumber } = await import("./store");
     await expect(assignTicketNumber("oxway_01")).rejects.toThrow();
+  });
+});
+
+// listStaleTempUploads is the only thing standing between a customer who
+// uploads a file and then closes the tab (see app/api/create-upload-url)
+// and that raw upload sitting in Supabase Storage forever — getting the
+// age comparison backwards here would either sweep uploads that are still
+// genuinely mid-checkout, or (the actual regression risk) never sweep
+// anything at all.
+describe("listStaleTempUploads", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.storageListResult = { data: [], error: null };
+  });
+
+  it("returns only uploads older than the cutoff, with the 'uploads/' prefix restored", async () => {
+    const now = Date.now();
+    mockAdmin.storageListResult = {
+      data: [
+        { name: "old-upload.pdf", created_at: new Date(now - 2 * 60 * 60 * 1000).toISOString() },
+        { name: "fresh-upload.pdf", created_at: new Date(now - 60 * 1000).toISOString() },
+      ],
+      error: null,
+    };
+    const { listStaleTempUploads } = await import("./store");
+
+    const stale = await listStaleTempUploads(60 * 60 * 1000); // 1 hour
+
+    expect(stale).toEqual(["uploads/old-upload.pdf"]);
+  });
+
+  it("throws rather than silently treating a list failure as 'nothing to clean up'", async () => {
+    mockAdmin.storageListResult = { data: null, error: { message: "network error" } };
+    const { listStaleTempUploads } = await import("./store");
+    await expect(listStaleTempUploads(60 * 60 * 1000)).rejects.toThrow("network error");
   });
 });

@@ -319,6 +319,71 @@ export async function downloadJobPdf(storagePath: string): Promise<Uint8Array> {
   return new Uint8Array(await data.arrayBuffer());
 }
 
+// ----------------------------------------------------------------------------
+// Direct-to-storage uploads — the customer's browser uploads straight to
+// Supabase Storage via a signed URL (app/api/create-upload-url), never
+// through /api/create-order's own request body. That route previously
+// received the full PDF as multipart form data, which hit Vercel's ~4.5MB
+// serverless function request-body limit well under the app's own
+// (client-side-only, never actually enforced server-side at the transport
+// layer) file-size ceiling — a 6.5MB upload failed with an opaque 413
+// before any of this app's own code ever ran. Everything below exists so
+// the only thing that ever crosses into a Vercel function is JSON metadata
+// and a storage path, regardless of how large the actual file is.
+// ----------------------------------------------------------------------------
+
+/** Separate from job-id-keyed final paths ("<jobId>.pdf", pdfStoragePathForJob above) so a raw, not-yet-validated upload can never collide with — or be mistaken for — an actual job's print-ready file. */
+const TEMP_UPLOAD_PREFIX = "uploads/";
+
+export function tempUploadStoragePath(uploadId: string): string {
+  return `${TEMP_UPLOAD_PREFIX}${uploadId}.pdf`;
+}
+
+/**
+ * Issues a signed upload URL + token for a temp path (app/api/create-upload-url)
+ * — the customer's browser then uploads directly to Supabase Storage with
+ * it, never touching our own server. Requires only the service-role key
+ * (bypasses RLS to create it); the signed token itself is what authorizes
+ * the subsequent upload, not any bucket policy — see createSignedUploadUrl's
+ * own "RLS policy permissions required: objects table permissions: insert"
+ * note, satisfied here by the service-role client regardless.
+ */
+export async function createTempUploadUrl(path: string): Promise<{ signedUrl: string; token: string }> {
+  const { data, error } = await supabaseAdmin().storage.from(SUPABASE_PRINT_BUCKET).createSignedUploadUrl(path);
+  if (error || !data) throw new Error(`Could not create upload URL: ${error?.message || "no data returned"}`);
+  return { signedUrl: data.signedUrl, token: data.token };
+}
+
+/** Best-effort single-object delete — used for a temp upload that turned out invalid, was already consumed into a job's final PDF, or (see listStaleTempUploads) was abandoned. Never throws; a leaked temp object is a storage-cost nuisance, not a correctness problem, and the caller's own flow (rejecting an order, say) matters more than this cleanup succeeding. */
+export async function deleteStorageObject(path: string): Promise<void> {
+  const { error } = await supabaseAdmin().storage.from(SUPABASE_PRINT_BUCKET).remove([path]);
+  if (error) console.error(`Could not delete storage object ${path}:`, error.message);
+}
+
+/**
+ * Orphaned temp uploads: a signed URL was issued and used, but
+ * /api/create-order was never (successfully) called afterward — the
+ * customer closed the tab mid-checkout, a request failed, etc. Used by
+ * /api/cron/cleanup-jobs, which otherwise only ever looks at print_jobs
+ * rows and would never notice a file that no row ever referenced.
+ * Age-based, not job-linked, by necessity: nothing in Postgres tracks these
+ * at all (deliberately — a temp upload isn't a job yet), so the Storage
+ * object's own created_at is the only signal available.
+ */
+export async function listStaleTempUploads(olderThanMs: number): Promise<string[]> {
+  const { data, error } = await supabaseAdmin()
+    .storage.from(SUPABASE_PRINT_BUCKET)
+    .list(TEMP_UPLOAD_PREFIX, { limit: 1000, sortBy: { column: "created_at", order: "asc" } });
+  if (error) throw new Error(`Could not list temp uploads: ${error.message}`);
+
+  const cutoff = Date.now() - olderThanMs;
+  return (data ?? [])
+    .filter((entry) => entry.created_at && new Date(entry.created_at).getTime() < cutoff)
+    // list() returns names relative to the prefix passed in — the actual
+    // object path (what remove() needs) has to have it put back.
+    .map((entry) => `${TEMP_UPLOAD_PREFIX}${entry.name}`);
+}
+
 /**
  * Jobs eligible for auto-delete (ROADMAP.md #4): terminal-state jobs past
  * their short retention window, plus pending_payment jobs old enough to

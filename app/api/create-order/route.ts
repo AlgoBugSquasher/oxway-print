@@ -1,13 +1,15 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
-import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider } from "@/lib/config";
+import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_UPLOAD_FILE_SIZE_BYTES } from "@/lib/config";
 import { getKioskColorModes, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
 import { createOrder, type CreateOrderOutput } from "@/lib/payment";
-import { extractSelectedPages } from "@/lib/print/pdf";
+import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
 import { getClientIp, isWithinCreateOrderRateLimit } from "@/lib/rate-limit";
 import {
   assignTicketNumber,
   createJob,
+  deleteStorageObject,
+  downloadJobPdf,
   findRecentDuplicateJob,
   getPricingConfig,
   updateJob,
@@ -27,15 +29,19 @@ export const dynamic = "force-dynamic";
 // checked again here since the client check alone isn't trustworthy.
 const PHONE_PATTERN = /^[6-9]\d{9}$/;
 
-// Same limit as PdfPageSelector.tsx's client-side check (ROADMAP.md #19) —
-// the client check alone isn't trustworthy, and without a server-side
-// bound, an oversized file's PDF processing below can push past the
-// platform's memory/time limit and crash the function outright, before its
-// own try/catch ever gets to run — the exact failure mode #19 describes.
-const MAX_FILE_SIZE = 25 * 1024 * 1024;
-
 function jsonError(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
+}
+
+interface CreateOrderRequestBody {
+  pdfStoragePath?: unknown;
+  fileName?: unknown;
+  selectedPages?: unknown;
+  settings?: unknown;
+  totalPrice?: unknown;
+  notifyOptIn?: unknown;
+  phone?: unknown;
+  kioskId?: unknown;
 }
 
 /** Reconstructs the same response shape /api/create-order normally returns, from an existing job — used for the duplicate-order short-circuit (ROADMAP.md #13). */
@@ -58,41 +64,60 @@ function buildOrderResponse(job: PrintJobRecord): { jobId: string } & CreateOrde
 }
 
 /**
- * Uploads the final print-ready PDF to Supabase Storage and writes a job row,
- * then creates an order with the active payment gateway. The website and the
+ * Downloads the just-uploaded raw PDF from its temp storage path, uploads
+ * the final print-ready PDF to Supabase Storage, and writes a job row, then
+ * creates an order with the active payment gateway. The website and the
  * Pi's print agent only ever talk to each other through that Supabase row.
+ *
+ * The file itself never passes through this route's own request body —
+ * see app/api/create-upload-url/route.ts, which the client calls first to
+ * upload directly to Storage. This route only ever receives JSON metadata
+ * and the resulting storage path, regardless of how large the file is, so
+ * it can never hit Vercel's serverless function request-body limit the way
+ * the old multipart-upload version of this route did.
  */
 export async function POST(request: Request) {
+  // Tracks the temp upload across every early-return below so it's always
+  // cleaned up exactly once, however this request ends — set the moment
+  // it's known, read in the `finally` block at the very end.
+  let tempUploadPath: string | null = null;
+
   try {
     const clientIp = getClientIp(request);
     if (!(await isWithinCreateOrderRateLimit(clientIp))) {
       return jsonError("Too many print orders from this connection — please wait a minute and try again.", 429);
     }
 
-    const formData = await request.formData();
-    const file = formData.get("file");
-    const fileName = String(formData.get("fileName") || "");
-    const selectedPages = JSON.parse(String(formData.get("selectedPages") || "[]")) as number[];
-    const settings = JSON.parse(String(formData.get("settings") || "{}")) as PrintSettingsSnapshot;
-    const totalPrice = Number(formData.get("totalPrice") || 0);
+    const body = (await request.json()) as CreateOrderRequestBody;
+    const pdfStoragePath = typeof body.pdfStoragePath === "string" ? body.pdfStoragePath : "";
+    const fileName = typeof body.fileName === "string" ? body.fileName : "";
+    const selectedPages = Array.isArray(body.selectedPages) ? (body.selectedPages as number[]) : [];
+    const settings = (typeof body.settings === "object" && body.settings !== null ? body.settings : {}) as PrintSettingsSnapshot;
+    const totalPrice = typeof body.totalPrice === "number" ? body.totalPrice : 0;
     // Which physical kiosk this order is for — the customer's QR encodes it
     // as a URL query param, the frontend forwards it here. Defaults to the
     // single kiosk this project started with, so today's QR (no param)
     // keeps working unchanged. Read before the WhatsApp fields below since
     // the per-kiosk allow_whatsapp check needs it.
-    const kioskId = String(formData.get("kioskId") || "oxway_01");
+    const kioskId = typeof body.kioskId === "string" && body.kioskId ? body.kioskId : "oxway_01";
+
+    if (!pdfStoragePath) return jsonError("Missing uploaded file reference.");
+    tempUploadPath = pdfStoragePath;
+    if (!fileName) return jsonError("Missing file name.");
+    if (selectedPages.length === 0) return jsonError("Select at least one page.");
+    if (!totalPrice || totalPrice <= 0) return jsonError("Invalid order total.");
 
     // WhatsApp opt-in (re-enabled ROADMAP.md §1) — a phone number is only
     // ever stored when the customer actually opted in; the client is never
-    // trusted on this (same reasoning as totalPrice below), so both fields
+    // trusted on this (same reasoning as totalPrice above), so both fields
     // are re-derived from scratch here rather than just re-validated. When
     // the owner has WhatsApp turned off for this kiosk, any opt-in/phone
     // the client sends is silently ignored (not an error — there's no
     // checkbox to even tamper with in that state, see
     // components/PdfPageSelector.tsx) rather than rejecting the order.
     const whatsappAvailability = await getKioskWhatsappAvailability(kioskId);
-    const notifyOptIn = whatsappAvailability.allowWhatsapp && String(formData.get("notifyOptIn") || "") === "true";
-    const rawPhone = notifyOptIn ? String(formData.get("phone") || "").trim() : "";
+    const notifyOptIn = whatsappAvailability.allowWhatsapp && body.notifyOptIn === true;
+    const rawPhone = notifyOptIn && typeof body.phone === "string" ? body.phone.trim() : "";
     if (notifyOptIn && !PHONE_PATTERN.test(rawPhone)) {
       return jsonError("Enter a valid 10-digit phone number, or untick WhatsApp updates.");
     }
@@ -101,12 +126,6 @@ export async function POST(request: Request) {
     // client (there's no checkbox for it anymore in PdfPageSelector.tsx,
     // but even if a request forged this field, it's ignored).
     const includeBannerPage = true;
-
-    if (!(file instanceof File)) return jsonError("Missing print-ready PDF.");
-    if (file.size > MAX_FILE_SIZE) return jsonError("This file is larger than the 25 MB kiosk limit.");
-    if (!fileName) return jsonError("Missing file name.");
-    if (!Array.isArray(selectedPages) || selectedPages.length === 0) return jsonError("Select at least one page.");
-    if (!totalPrice || totalPrice <= 0) return jsonError("Invalid order total.");
 
     // Admin can disable color or B&W per kiosk (owner/staff only, see
     // update_kiosk_counters in supabase/schema.sql) — the customer page
@@ -129,7 +148,23 @@ export async function POST(request: Request) {
       return jsonError("This kiosk is being updated right now — please try again in a minute.");
     }
 
-    const originalBytes = new Uint8Array(await file.arrayBuffer());
+    const originalBytes = await downloadJobPdf(pdfStoragePath);
+
+    // The client already declared a size when requesting the upload URL
+    // (app/api/create-upload-url), but that was only ever a pre-check —
+    // this is the actual uploaded content, so it's the one that counts.
+    if (originalBytes.length > MAX_UPLOAD_FILE_SIZE_BYTES) {
+      return jsonError(`This file is larger than the ${Math.round(MAX_UPLOAD_FILE_SIZE_BYTES / (1024 * 1024))} MB kiosk limit.`);
+    }
+    // Cheap magic-header check before spending a full parse on something
+    // that was never a PDF at all (see looksLikePdf's own docstring) —
+    // genuinely malformed uploads, a failed/corrupted direct-to-storage
+    // transfer, or (ROADMAP.md #19-style) anything else that isn't what it
+    // claims to be.
+    if (!looksLikePdf(originalBytes)) {
+      return jsonError("The uploaded file isn't a valid PDF. Please upload it again.");
+    }
+
     const contentHash = crypto.createHash("sha256").update(originalBytes).digest("hex");
 
     // Extraction has to happen before pricing now — the true billable page
@@ -137,7 +172,18 @@ export async function POST(request: Request) {
     // selectedPages.length (out-of-range page numbers get silently dropped
     // here, which would otherwise let the price basis and the actual
     // printed page count quietly diverge). See ExtractedPdf's docstring.
-    const extracted = await extractSelectedPages(originalBytes, selectedPages, settings.layout);
+    // Also doubles as this upload's real validity check — the magic-byte
+    // check above only confirms the file *starts* like a PDF; a pdf-lib
+    // parse failure here means it isn't a genuinely readable one, and
+    // "readable page count" (this function's only way to succeed at all)
+    // is exactly the bar requested.
+    let extracted;
+    try {
+      extracted = await extractSelectedPages(originalBytes, selectedPages, settings.layout);
+    } catch (parseError) {
+      console.error("create-order: uploaded file failed to parse as a PDF:", parseError);
+      return jsonError("The uploaded file could not be read as a PDF. Please upload it again.");
+    }
 
     // Server-side price recalculation (ROADMAP.md #13's flagged gap) — the
     // client-submitted totalPrice was previously trusted with only a >0
@@ -166,7 +212,7 @@ export async function POST(request: Request) {
     if (duplicate) return NextResponse.json(buildOrderResponse(duplicate));
 
     const jobId = crypto.randomUUID();
-    const pdfStoragePath = await uploadJobPdf(jobId, extracted.bytes);
+    const finalPdfStoragePath = await uploadJobPdf(jobId, extracted.bytes);
 
     const now = new Date().toISOString();
     const provider = getActiveProvider();
@@ -194,7 +240,7 @@ export async function POST(request: Request) {
       contentHash,
       provider,
       providerOrderId: "",
-      pdfStoragePath,
+      pdfStoragePath: finalPdfStoragePath,
       kioskId,
       ticketNumber,
       ticketDate,
@@ -218,5 +264,15 @@ export async function POST(request: Request) {
       { error: error instanceof Error ? error.message : "Could not create the payment order." },
       { status: 500 }
     );
+  } finally {
+    // Whatever happened above — success, a validation rejection, an
+    // invalid-PDF rejection, or an unexpected throw — the temp upload this
+    // request named is never needed again afterward: either it's now
+    // copied into a real job's own final path (uploadJobPdf above), or the
+    // order was never created from it at all. Best-effort (see
+    // deleteStorageObject); a leaked temp object is still caught later by
+    // the cleanup cron's orphan sweep (listStaleTempUploads), so a failure
+    // here is never the only safety net.
+    if (tempUploadPath) await deleteStorageObject(tempUploadPath);
   }
 }

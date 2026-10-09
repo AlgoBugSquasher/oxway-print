@@ -19,6 +19,17 @@ export async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit)
   try {
     body = await response.json();
   } catch {
+    // A 413 (Payload Too Large) never reaches our own route handlers at
+    // all — the platform itself rejects the request before any of our
+    // code runs, so there's no JSON error body to parse, just this
+    // generic failure. Worth a specific, readable message rather than
+    // the raw status-code fallback below: it's also the one case where
+    // this used to be a real possibility for a large file upload (see
+    // app/api/create-upload-url/route.ts's own docstring) before uploads
+    // moved to going directly to Supabase Storage.
+    if (response.status === 413) {
+      throw new Error("File is too large or the upload failed, please try again.");
+    }
     throw new Error(
       response.ok
         ? "The server sent back something unexpected. Please try again."
