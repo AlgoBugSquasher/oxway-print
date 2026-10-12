@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { IndianRupee, Printer, RefreshCw } from "lucide-react";
 import { fetchJson } from "@/lib/fetch-json";
+import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import type { AdminJobRow, AdminKioskCommandRow, AdminKioskRow } from "@/lib/admin/types";
 import KioskCard from "./kiosk-card";
+import LiveIndicator from "./live-indicator";
 import StatusBadge from "./status-badge";
 
 /**
@@ -35,41 +37,44 @@ export default function AdminOverviewPage() {
   // "messages are only logged" warning fails toward being shown rather than
   // silently hidden before this resolves.
   const [notifyProviderIsConsole, setNotifyProviderIsConsole] = useState(true);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState("");
 
-  const load = async () => {
-    setIsLoading(true);
-    setError("");
-    try {
-      const supabase = createSupabaseBrowserClient();
-      const [kiosksResult, jobsResult, commandsResult, notifyProviderResult] = await Promise.all([
-        supabase.from("kiosk_status_admin_view").select("*"),
-        supabase.from("print_jobs_admin_view").select("*").order("created_at", { ascending: false }).limit(15),
-        supabase.from("kiosk_commands_admin_view").select("*").order("requested_at", { ascending: false }).limit(50),
-        fetchJson<{ provider: "console" | "msg91" }>("/api/admin/notify-provider").catch(() => ({ provider: "console" as const })),
-      ]);
-      if (kiosksResult.error) throw new Error(kiosksResult.error.message);
-      if (jobsResult.error) throw new Error(jobsResult.error.message);
-      if (commandsResult.error) throw new Error(commandsResult.error.message);
-      setKiosks((kiosksResult.data as AdminKioskRow[]) ?? []);
-      setRecentJobs((jobsResult.data as AdminJobRow[]) ?? []);
-      setLatestCommands(latestCommandPerKiosk((commandsResult.data as AdminKioskCommandRow[]) ?? []));
-      setNotifyProviderIsConsole(notifyProviderResult.provider !== "msg91");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load dashboard data.");
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    // Classic fetch-on-mount, reusing `load` so the refresh button and
-    // action callbacks below share the same fetch logic — not the
-    // derived-state/anti-pattern this compiler rule is really aimed at.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load();
+  // Which kiosk cards currently have an edit/save/command in flight — a
+  // Set kept in a ref (not state) since it only needs to be read inside
+  // useAutoRefresh's isPaused callback, never rendered itself; each
+  // KioskCard reports its own busy state in via onBusyChange below so a
+  // background refresh never quietly overwrites counters someone's
+  // mid-typing or a toggle that's mid-save (task requirement #5).
+  const busyKioskIdsRef = useRef<Set<string>>(new Set());
+  const setKioskBusy = useCallback((kioskId: string, isBusy: boolean) => {
+    if (isBusy) busyKioskIdsRef.current.add(kioskId);
+    else busyKioskIdsRef.current.delete(kioskId);
   }, []);
+
+  const fetchData = useCallback(async () => {
+    const supabase = createSupabaseBrowserClient();
+    const [kiosksResult, jobsResult, commandsResult, notifyProviderResult] = await Promise.all([
+      supabase.from("kiosk_status_admin_view").select("*"),
+      supabase.from("print_jobs_admin_view").select("*").order("created_at", { ascending: false }).limit(15),
+      supabase.from("kiosk_commands_admin_view").select("*").order("requested_at", { ascending: false }).limit(50),
+      fetchJson<{ provider: "console" | "msg91" }>("/api/admin/notify-provider").catch(() => ({ provider: "console" as const })),
+    ]);
+    if (kiosksResult.error) throw new Error(kiosksResult.error.message);
+    if (jobsResult.error) throw new Error(jobsResult.error.message);
+    if (commandsResult.error) throw new Error(commandsResult.error.message);
+    setKiosks((kiosksResult.data as AdminKioskRow[]) ?? []);
+    setRecentJobs((jobsResult.data as AdminJobRow[]) ?? []);
+    setLatestCommands(latestCommandPerKiosk((commandsResult.data as AdminKioskCommandRow[]) ?? []));
+    setNotifyProviderIsConsole(notifyProviderResult.provider !== "msg91");
+  }, []);
+
+  // See lib/hooks/useAutoRefresh.ts for the shared polling behavior (every
+  // admin page under /admin uses this same hook) — 5s normal cadence,
+  // paused while any kiosk card is busy or the tab is hidden, backing off
+  // to 15s after repeated failures.
+  const { isRefreshing, lastUpdatedAt, error, refreshNow } = useAutoRefresh(fetchData, {
+    isPaused: () => busyKioskIdsRef.current.size > 0,
+  });
+  const isLoading = isRefreshing && lastUpdatedAt === null;
 
   const totalRevenueKnown = kiosks.some((kiosk) => kiosk.total_revenue !== null);
   const totalRevenue = kiosks.reduce((sum, kiosk) => sum + (kiosk.total_revenue ?? 0), 0);
@@ -81,9 +86,12 @@ export default function AdminOverviewPage() {
           <p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Overview</p>
           <h1 className="mt-1 text-2xl font-black">Kiosk health &amp; recent activity</h1>
         </div>
-        <button onClick={() => void load()} className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-600 hover:border-slate-300">
-          <RefreshCw size={13} className={isLoading ? "animate-spin" : ""} /> Refresh
-        </button>
+        <div className="flex items-center gap-3">
+          <LiveIndicator isRefreshing={isRefreshing} lastUpdatedAt={lastUpdatedAt} />
+          <button onClick={() => void refreshNow()} className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-600 hover:border-slate-300">
+            <RefreshCw size={13} className={isRefreshing ? "animate-spin" : ""} /> Refresh
+          </button>
+        </div>
       </div>
 
       {error && <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
@@ -105,7 +113,8 @@ export default function AdminOverviewPage() {
               latestCommand={latestCommands.get(kiosk.id) ?? null}
               isOwner={totalRevenueKnown}
               notifyProviderIsConsole={notifyProviderIsConsole}
-              onChanged={() => void load()}
+              onBusyChange={(isBusy) => setKioskBusy(kiosk.id, isBusy)}
+              onChanged={() => void refreshNow()}
             />
           ))}
           {!isLoading && kiosks.length === 0 && <p className="text-sm text-slate-500">No kiosk_status rows yet — see SUPABASE_SETUP.md.</p>}

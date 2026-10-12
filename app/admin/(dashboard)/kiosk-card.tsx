@@ -1,6 +1,6 @@
 "use client";
 
-import { type FormEvent, useState, useSyncExternalStore } from "react";
+import { type FormEvent, useEffect, useState, useSyncExternalStore } from "react";
 import { AlertTriangle, Download, MessageCircle, Pencil, RefreshCw, RotateCw, Save, WifiOff } from "lucide-react";
 import { requestKioskCommand, updateKioskCounters, updateKioskWhatsappAvailability } from "@/lib/admin/actions";
 import type { AdminKioskCommandRow, AdminKioskRow } from "@/lib/admin/types";
@@ -49,6 +49,7 @@ export default function KioskCard({
   latestCommand,
   isOwner,
   notifyProviderIsConsole,
+  onBusyChange,
   onChanged,
 }: {
   kiosk: AdminKioskRow;
@@ -56,6 +57,8 @@ export default function KioskCard({
   /** Mirrors page.tsx's own totalRevenueKnown signal — the view already nulls owner-only columns for staff, so "did a real value come back" is the same role check RLS already enforces, not a separate client-side guess. */
   isOwner: boolean;
   notifyProviderIsConsole: boolean;
+  /** Reports whether this card has an edit/save/command in flight right now — page.tsx feeds this into its useAutoRefresh's isPaused check, so a background refresh never overwrites counters someone's mid-typing or a toggle that's mid-save. */
+  onBusyChange: (isBusy: boolean) => void;
   onChanged: () => void;
 }) {
   const [isEditing, setIsEditing] = useState(false);
@@ -72,6 +75,28 @@ export default function KioskCard({
   const [allowWhatsapp, setAllowWhatsapp] = useState(kiosk.allow_whatsapp);
   const [isSavingWhatsapp, setIsSavingWhatsapp] = useState(false);
   const [whatsappError, setWhatsappError] = useState("");
+
+  // Reported up to page.tsx so its background auto-refresh skips this card
+  // entirely while there's something here it could clobber — editing the
+  // counters form, or any of the three independent saves in flight.
+  //
+  // One effect, not two — page.tsx passes a fresh `onBusyChange` closure on
+  // every one of its own re-renders (including every successful background
+  // poll), so this effect's dependency array changes constantly even when
+  // `isBusy` itself hasn't. Deliberately set-then-cleanup within the SAME
+  // effect: on any re-run, React calls this effect's own previous cleanup
+  // (onBusyChange(false)) immediately followed by its new body
+  // (onBusyChange(isBusy)), in that order, so the net result after every
+  // commit is always correct. Splitting "set" and "unmount cleanup" into
+  // two separate effects was tried and is actually wrong: because effects
+  // run in declaration order, the second effect's stale cleanup would fire
+  // *after* the first effect's fresh update on the very same render,
+  // silently resetting busy back to false while still mid-edit.
+  const isBusy = isEditing || isSaving || isSavingWhatsapp || requestingCommand !== null;
+  useEffect(() => {
+    onBusyChange(isBusy);
+    return () => onBusyChange(false);
+  }, [isBusy, onBusyChange]);
 
   // Owner-only write, immediate (not folded into the counters form's Save
   // button) — separate RPC, separate concern, see

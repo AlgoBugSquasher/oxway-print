@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { type FormEvent, useCallback, useRef, useState } from "react";
 import { Ban, IndianRupee, RefreshCw, RotateCcw, Search } from "lucide-react";
 import { cancelJob, forceReprintJob, markJobRefunded } from "@/lib/admin/actions";
+import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
 import type { AdminJobRow, AdminRole } from "@/lib/admin/types";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
+import LiveIndicator from "../live-indicator";
 import StatusBadge from "../status-badge";
 
 const STATUS_OPTIONS = ["", "pending_payment", "paid", "printing", "printed", "print_failed", "payment_failed", "expired", "cancelled"];
@@ -12,59 +14,72 @@ const REPRINTABLE_STATUSES = ["print_failed", "printed"];
 const CANCELLABLE_STATUSES = ["pending_payment", "paid", "printing"];
 const REFUNDABLE_STATUSES = ["print_failed", "payment_failed"];
 
+interface JobFilters {
+  search: string;
+  statusFilter: string;
+  sinceDate: string;
+}
+
 export default function AdminJobsPage() {
   const [role, setRole] = useState<AdminRole>("none");
   const [jobs, setJobs] = useState<AdminJobRow[]>([]);
+  // The form's own draft values — typing here never touches the actual
+  // query (see appliedFiltersRef below), so a background refresh re-running
+  // the last *submitted* search can never clobber a half-typed one.
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [sinceDate, setSinceDate] = useState("");
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
 
-  const load = async () => {
-    setIsLoading(true);
-    setError("");
-    try {
-      const supabase = createSupabaseBrowserClient();
+  // What the table is actually querying by — only ever updated on submit
+  // (handleSearchSubmit below). A ref, not state: fetchData reads it fresh
+  // on every call, so its own identity can stay stable (no dependency on
+  // filter state), and updating it ahead of a manual refreshNow() call is
+  // immediate rather than waiting on React's next render the way a state
+  // update would.
+  const appliedFiltersRef = useRef<JobFilters>({ search: "", statusFilter: "", sinceDate: "" });
 
-      const { data: { user } } = await supabase.auth.getUser();
-      setRole(((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none");
+  const fetchData = useCallback(async () => {
+    const supabase = createSupabaseBrowserClient();
 
-      let query = supabase.from("print_jobs_admin_view").select("*").order("created_at", { ascending: false }).limit(100);
-      if (statusFilter) query = query.eq("status", statusFilter);
-      if (sinceDate) query = query.gte("created_at", new Date(sinceDate).toISOString());
-      if (search.trim()) {
-        // Request ID is the job's raw uuid here (short-code display only happens client-side) — phone search is a plain substring match.
-        query = query.or(`id.ilike.%${search.trim()}%,phone_number.ilike.%${search.trim()}%`);
-      }
+    const { data: { user } } = await supabase.auth.getUser();
+    setRole(((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none");
 
-      const { data, error: queryError } = await query;
-      if (queryError) throw new Error(queryError.message);
-      setJobs((data as AdminJobRow[]) ?? []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load jobs.");
-    } finally {
-      setIsLoading(false);
+    const { search: appliedSearch, statusFilter: appliedStatusFilter, sinceDate: appliedSinceDate } = appliedFiltersRef.current;
+    let query = supabase.from("print_jobs_admin_view").select("*").order("created_at", { ascending: false }).limit(100);
+    if (appliedStatusFilter) query = query.eq("status", appliedStatusFilter);
+    if (appliedSinceDate) query = query.gte("created_at", new Date(appliedSinceDate).toISOString());
+    if (appliedSearch.trim()) {
+      // Request ID is the job's raw uuid here (short-code display only happens client-side) — phone search is a plain substring match.
+      query = query.or(`id.ilike.%${appliedSearch.trim()}%,phone_number.ilike.%${appliedSearch.trim()}%`);
     }
-  };
 
-  useEffect(() => {
-    // Fetch-on-mount, reusing `load` so search/filter submits and post-action
-    // reloads share the same fetch logic — not the derived-state anti-pattern
-    // this compiler rule targets.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const { data, error: queryError } = await query;
+    if (queryError) throw new Error(queryError.message);
+    setJobs((data as AdminJobRow[]) ?? []);
   }, []);
+
+  // Paused while an action (reprint/cancel/refund) is in flight — not for
+  // merely typing in the search form, which never touches the query until
+  // submitted anyway (see appliedFiltersRef above).
+  const { isRefreshing, lastUpdatedAt, error, refreshNow } = useAutoRefresh(fetchData, {
+    isPaused: () => pendingJobId !== null,
+  });
+  const isLoading = isRefreshing && lastUpdatedAt === null;
+
+  const handleSearchSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    appliedFiltersRef.current = { search, statusFilter, sinceDate };
+    void refreshNow();
+  };
 
   const runAction = async (jobId: string, action: () => Promise<void>) => {
     setActionError("");
     setPendingJobId(jobId);
     try {
       await action();
-      await load();
+      await refreshNow();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Action failed.");
     } finally {
@@ -74,13 +89,16 @@ export default function AdminJobsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Jobs</p>
-        <h1 className="mt-1 text-2xl font-black">Search &amp; history</h1>
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Jobs</p>
+          <h1 className="mt-1 text-2xl font-black">Search &amp; history</h1>
+        </div>
+        <LiveIndicator isRefreshing={isRefreshing} lastUpdatedAt={lastUpdatedAt} />
       </div>
 
       <form
-        onSubmit={(event) => { event.preventDefault(); void load(); }}
+        onSubmit={handleSearchSubmit}
         className="flex flex-wrap items-end gap-3 rounded-2xl border border-slate-200 bg-white p-4"
       >
         <div className="min-w-[200px] flex-1">

@@ -1,48 +1,50 @@
 "use client";
 
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useState } from "react";
 import { RefreshCw, Save, ShieldAlert } from "lucide-react";
 import { updatePricing } from "@/lib/admin/actions";
+import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
 import type { AdminRole, PricingConfigRow } from "@/lib/admin/types";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
+import LiveIndicator from "../live-indicator";
 
 export default function AdminPricingPage() {
   const [role, setRole] = useState<AdminRole | null>(null);
   const [priceBw, setPriceBw] = useState("");
   const [priceColor, setPriceColor] = useState("");
   const [updatedAt, setUpdatedAt] = useState("");
-  const [isLoading, setIsLoading] = useState(true);
+  // What the server last actually reported — compared against the two
+  // live input values below to detect an unsaved edit in progress. Kept
+  // separate from priceBw/priceColor themselves (which are what the form
+  // inputs are bound to) specifically so that comparison is possible.
+  const [baseline, setBaseline] = useState<{ priceBw: string; priceColor: string } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
 
-  const load = async () => {
-    setIsLoading(true);
-    setError("");
-    try {
-      const supabase = createSupabaseBrowserClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      setRole(((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none");
+  const fetchData = useCallback(async () => {
+    const supabase = createSupabaseBrowserClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    setRole(((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none");
 
-      const { data, error: queryError } = await supabase.from("pricing_config").select("*").eq("id", "default").single();
-      if (queryError) throw new Error(queryError.message);
-      const row = data as PricingConfigRow;
-      setPriceBw(String(row.price_bw));
-      setPriceColor(String(row.price_color));
-      setUpdatedAt(row.updated_at);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load pricing.");
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    // Fetch-on-mount, reusing `load` so the post-save reload shares the same
-    // fetch logic — not the derived-state anti-pattern this rule targets.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load();
+    const { data, error: queryError } = await supabase.from("pricing_config").select("*").eq("id", "default").single();
+    if (queryError) throw new Error(queryError.message);
+    const row = data as PricingConfigRow;
+    setPriceBw(String(row.price_bw));
+    setPriceColor(String(row.price_color));
+    setBaseline({ priceBw: String(row.price_bw), priceColor: String(row.price_color) });
+    setUpdatedAt(row.updated_at);
   }, []);
+
+  // An edit sitting in either field, not yet saved, pauses background
+  // refreshes the same way isSaving does below — overwriting a price an
+  // owner is actively typing (even with the server's own, equally valid
+  // number) is exactly the kind of clobber task requirement #5 is about.
+  const isDirty = baseline !== null && (priceBw !== baseline.priceBw || priceColor !== baseline.priceColor);
+  const { isRefreshing, lastUpdatedAt, error: loadError, refreshNow } = useAutoRefresh(fetchData, {
+    isPaused: () => isSaving || isDirty,
+  });
+  const isLoading = isRefreshing && lastUpdatedAt === null;
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -58,7 +60,7 @@ export default function AdminPricingPage() {
     try {
       await updatePricing(bw, color);
       setSaved(true);
-      await load();
+      await refreshNow();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save pricing.");
     } finally {
@@ -77,10 +79,13 @@ export default function AdminPricingPage() {
 
   return (
     <div className="max-w-md space-y-6">
-      <div>
-        <p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Pricing</p>
-        <h1 className="mt-1 text-2xl font-black">Per-sheet pricing</h1>
-        <p className="mt-1 text-sm text-slate-500">Applies to every new order immediately — see ROADMAP.md #13 for how create-order enforces this server-side.</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Pricing</p>
+          <h1 className="mt-1 text-2xl font-black">Per-sheet pricing</h1>
+          <p className="mt-1 text-sm text-slate-500">Applies to every new order immediately — see ROADMAP.md #13 for how create-order enforces this server-side.</p>
+        </div>
+        <LiveIndicator isRefreshing={isRefreshing} lastUpdatedAt={lastUpdatedAt} />
       </div>
 
       {isLoading ? (
@@ -96,7 +101,7 @@ export default function AdminPricingPage() {
             <input type="number" step="0.01" min="0.01" value={priceColor} onChange={(event) => setPriceColor(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-500" />
           </div>
           {updatedAt && <p className="text-xs text-slate-400">Last changed {new Date(updatedAt).toLocaleString("en-IN")}</p>}
-          {error && <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
+          {(error || loadError) && <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error || loadError}</div>}
           {saved && <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-600">Saved.</div>}
           <button type="submit" disabled={isSaving} className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-black text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">
             {isSaving ? <RefreshCw className="animate-spin" size={15} /> : <Save size={15} />} Save pricing

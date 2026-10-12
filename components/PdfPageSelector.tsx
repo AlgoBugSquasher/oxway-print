@@ -1,5 +1,11 @@
 "use client";
 
+// Must stay the very first import — it's a side-effect-only polyfill that
+// has to be in place before pdfjs-dist's own code ever runs. See that
+// file's own docstring for why this exists alongside (not instead of) the
+// pdfjs-dist/legacy import just below.
+import "@/lib/polyfills/map-get-or-insert";
+
 import { type ChangeEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { load as loadCashfree } from "@cashfreepayments/cashfree-js";
@@ -25,7 +31,17 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import * as pdfjsLib from "pdfjs-dist";
+// The "legacy" build, not the bare `pdfjs-dist` (which resolves to the
+// modern build) — ROADMAP-style fix for a real iPhone 15/15 Plus Safari
+// crash: pdf.js's own transport/message-handler code calls
+// `Map.prototype.getOrInsertComputed`, a method new enough (2024/2025 TC39)
+// that plenty of iOS Safari installs still don't have it natively. The
+// modern build assumes it's always there; the legacy build bundles its own
+// core-js polyfill for it (confirmed directly in pdfjs-dist's own published
+// files — the modern build has zero such polyfill code at all). Android
+// Chrome was never affected, which is exactly consistent with this: V8
+// shipped the method earlier than Safari's WebKit did.
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import BrandWatermark from "@/components/BrandWatermark";
 import BrandWordmark from "@/components/BrandWordmark";
@@ -38,7 +54,19 @@ import type { CreateOrderOutput } from "@/lib/payment";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+// Resolved by the bundler (new URL(..., import.meta.url), the standard
+// pattern pdf.js itself documents for Webpack-family bundlers, Turbopack
+// included) rather than a CDN URL — the CDN previously served the file at
+// a version-matched path, but always the *modern* build, meaning switching
+// just the main thread to legacy while the worker stayed on the CDN would
+// have reintroduced the exact mismatch this task warned against (main
+// thread and worker must be the same build, not just the same version).
+// Resolving it this way also means Next.js copies the real file into the
+// production build output and serves it from this app's own domain — no
+// dependency on a third-party CDN being reachable/correctly configured on
+// Vercel, which is the real answer to "bundled and served correctly in
+// production," not just "works in dev."
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.min.mjs", import.meta.url).toString();
 
 interface PageThumbnail {
   pageNumber: number;
@@ -313,10 +341,10 @@ export default function PdfPageSelector() {
     // debug iPhone 15/15 Plus Safari PDF-upload failures that can't be
     // reproduced on desktop. `stage` records how far processing got before
     // it broke, `stallTimer` catches the other failure shape a thrown error
-    // can't: pdf.js's worker (loaded from a CDN — see the workerSrc setup at
-    // the top of this file) hanging instead of rejecting, which would
-    // otherwise leave the "Preparing your document..." spinner running
-    // forever with nothing in any log at all.
+    // can't: pdf.js's worker (see the workerSrc setup at the top of this
+    // file) hanging instead of rejecting, which would otherwise leave the
+    // "Preparing your document..." spinner running forever with nothing in
+    // any log at all.
     const fileMeta = { name: uploadedFile.name, type: uploadedFile.type, size: uploadedFile.size };
     let stage = "convert";
     let settled = false;
@@ -354,7 +382,19 @@ export default function PdfPageSelector() {
       reportClientError(`upload-failed:${stage}`, loadError, fileMeta);
       setFile(null);
       setPreviewUrl("");
-      setError(loadError instanceof Error ? loadError.message : "We could not read this file. Please try another one.");
+      // pdf.js itself (getDocument/getPage/render) is the one stage whose
+      // thrown errors are internal engine details, not something written
+      // for a customer to read — e.g. the exact "getOrInsertComputed is
+      // not a function" crash this file's pdfjs-dist import was fixed for.
+      // convertFileInBrowser's own errors (lib/client-file-converter.ts),
+      // by contrast, are already written in plain language, so those still
+      // surface as-is.
+      const isPdfjsStage = stage === "pdfjs-load" || stage.startsWith("render-page");
+      setError(
+        isPdfjsStage
+          ? "Couldn't read this file, please try another."
+          : loadError instanceof Error ? loadError.message : "We could not read this file. Please try another one."
+      );
     } finally {
       settled = true;
       clearTimeout(stallTimer);
