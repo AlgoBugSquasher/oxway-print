@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
-import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_UPLOAD_FILE_SIZE_BYTES } from "@/lib/config";
+import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT } from "@/lib/config";
 import { getKioskColorModes, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
 import { createOrder, type CreateOrderOutput } from "@/lib/payment";
+import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
 import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
 import { getClientIp, isWithinCreateOrderRateLimit } from "@/lib/rate-limit";
 import {
@@ -185,6 +186,16 @@ export async function POST(request: Request) {
       return jsonError("The uploaded file could not be read as a PDF. Please upload it again.");
     }
 
+    // Multi-file basket uploads (components/PdfPageSelector.tsx) are merged
+    // into one PDF client-side before reaching here — lib/pdf-merge.ts — so
+    // this one check is what actually enforces the combined basket's own
+    // page-count limit (lib/hooks/useFileBasket.ts's MAX_TOTAL_PAGES_PER_BASKET)
+    // server-side, against the real page count, not whatever the client
+    // claimed.
+    if (extracted.pageCount > MAX_UPLOAD_PAGE_COUNT) {
+      return jsonError(`This document has ${extracted.pageCount} pages, over the ${MAX_UPLOAD_PAGE_COUNT}-page kiosk limit.`);
+    }
+
     // Server-side price recalculation (ROADMAP.md #13's flagged gap) — the
     // client-submitted totalPrice was previously trusted with only a >0
     // check, meaning a tampered request could pay less than it should.
@@ -192,8 +203,8 @@ export async function POST(request: Request) {
     // page count, and reject outright on any mismatch rather than silently
     // preferring either value.
     const pricing = await getPricingConfig();
-    const billableSheets = Math.ceil(extracted.pageCount / settings.pagesPerSheet) * settings.copies;
-    const expectedPrice = billableSheets * (settings.isColor ? pricing.priceColor : pricing.priceBw);
+    const billableSheets = computeBillableSheets(extracted.pageCount, settings.pagesPerSheet, settings.copies);
+    const expectedPrice = computeOrderPrice(billableSheets, settings.isColor, pricing);
     if (Math.abs(expectedPrice - totalPrice) > PRICE_EPSILON) {
       return jsonError("Price mismatch — please refresh and try again.");
     }

@@ -57,6 +57,48 @@ export async function verifyRazorpayOrder(orderId: string): Promise<VerifyResult
   return { paid: true, paymentRef };
 }
 
+/** Bounds how long the banner's payment-detail enrichment ever waits on Razorpay — see fetchRazorpayPaymentDetails. */
+const PAYMENT_DETAILS_FETCH_TIMEOUT_MS = 3000;
+
+export interface RazorpayPaymentDetails {
+  paymentId: string;
+  /** acquirer_data.upi_transaction_id (the RRN/UTR) — confirmed against the installed razorpay SDK's own type declarations, not assumed; only ever populated for UPI payments, and not always immediately at capture time. */
+  upiTxnId?: string;
+  paidAmountRupees: number;
+}
+
+/**
+ * GET /payments/:id — fetched separately from verifyRazorpayOrder's own
+ * orders.fetchPayments call above because this is the only Razorpay
+ * endpoint documented to return the full acquirer_data object (RRN/UTR
+ * included); the order-level payments list isn't guaranteed to carry it.
+ * Used by lib/payment-reconciliation.ts to print "Total paid"/"UPI Txn ID"
+ * on the banner (lib/print/banner.ts) — nothing else depends on this.
+ *
+ * Best-effort and time-boxed: a slow or failing Razorpay call must never
+ * block marking a job paid or printing it, so this never throws — a null
+ * return just means "couldn't get the details this time," not an error.
+ */
+export async function fetchRazorpayPaymentDetails(paymentId: string): Promise<RazorpayPaymentDetails | null> {
+  try {
+    const razorpay = client();
+    const payment = await Promise.race([
+      razorpay.payments.fetch(paymentId),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("Razorpay payment fetch timed out")), PAYMENT_DETAILS_FETCH_TIMEOUT_MS);
+      }),
+    ]);
+    return {
+      paymentId: payment.id,
+      upiTxnId: payment.acquirer_data?.upi_transaction_id || undefined,
+      paidAmountRupees: Number(payment.amount) / 100,
+    };
+  } catch (error) {
+    console.warn(`Could not fetch Razorpay payment details for ${paymentId}:`, error);
+    return null;
+  }
+}
+
 /**
  * ROADMAP.md #10 — real money movement, called only from the owner-gated
  * app/api/admin/refund route (never a Postgres RPC: RAZORPAY_KEY_SECRET must

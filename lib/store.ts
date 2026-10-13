@@ -74,6 +74,19 @@ export interface PrintJobRecord {
    * row was incremented (see that function's own comment in schema.sql).
    */
   ticketDate?: string;
+  /**
+   * Razorpay payment id (pay_XXXX), the UPI transaction id (RRN/UTR, from
+   * acquirer_data.upi_transaction_id) and the gateway-confirmed paid amount
+   * — populated best-effort when a Razorpay payment is reconciled (see
+   * lib/payment-reconciliation.ts) and printed on the banner (see
+   * lib/print/banner.ts). Always null for Cashfree jobs and for jobs paid
+   * before this existed. Deliberately NOT exposed to the anon role, the
+   * customer-facing job endpoint, Realtime, or the admin view — see the
+   * migration that added these columns.
+   */
+  paymentId?: string;
+  upiTxnId?: string;
+  paidAmount?: number;
 }
 
 const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled"];
@@ -103,6 +116,9 @@ interface PrintJobRow {
   refunded_at: string | null;
   ticket_number: number | null;
   ticket_date: string | null;
+  payment_id: string | null;
+  upi_txn_id: string | null;
+  paid_amount: number | null;
 }
 
 function fromRow(row: PrintJobRow): PrintJobRecord {
@@ -130,6 +146,9 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     refundedAt: row.refunded_at ?? undefined,
     ticketNumber: row.ticket_number ?? undefined,
     ticketDate: row.ticket_date ?? undefined,
+    paymentId: row.payment_id ?? undefined,
+    upiTxnId: row.upi_txn_id ?? undefined,
+    paidAmount: row.paid_amount ?? undefined,
   };
 }
 
@@ -165,6 +184,9 @@ function toUpdateRow(patch: Partial<PrintJobRecord>): Partial<PrintJobRow> {
   if (patch.error !== undefined) row.error = patch.error;
   if (patch.cupsJobId !== undefined) row.cups_job_id = patch.cupsJobId;
   if (patch.refundedAt !== undefined) row.refunded_at = patch.refundedAt;
+  if (patch.paymentId !== undefined) row.payment_id = patch.paymentId;
+  if (patch.upiTxnId !== undefined) row.upi_txn_id = patch.upiTxnId;
+  if (patch.paidAmount !== undefined) row.paid_amount = patch.paidAmount;
   return row;
 }
 

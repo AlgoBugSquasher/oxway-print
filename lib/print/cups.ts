@@ -11,18 +11,23 @@ const MEDIA_BY_PAPER_SIZE: Record<PrintSettingsSnapshot["paperSize"], string> = 
   Legal: "legal",
 };
 
-function buildLpArgs(filePath: string, settings: PrintSettingsSnapshot): string[] {
+/** Exported so tests can assert on the exact arguments built for a given settings combination, directly — no need to mock execFile/lp just to catch an accidental change to one of these -o options. */
+export function buildLpArgs(filePath: string, settings: PrintSettingsSnapshot): string[] {
   const args: string[] = [];
   if (PRINTER_NAME) args.push("-d", PRINTER_NAME);
-  args.push("-n", String(Math.max(1, settings.copies)));
-  // Explicit, not left to CUPS's own default — a >1-copy job otherwise
-  // prints uncollated (every copy of page 1, then every copy of page 2,
-  // etc.) rather than each full copy in sequence. Confirmed via
-  // `lpoptions -p <printer> -l` that this printer's PPD exposes no
-  // Collate option of its own — it isn't a driver/hardware feature here,
-  // it's CUPS's own generic job-level page ordering, so this is safe to
-  // set unconditionally regardless of which printer/PPD is in use.
-  args.push("-o", "collate=true");
+  // Always exactly one CUPS-level copy. Copies (and their collation) are
+  // baked directly into the submitted PDF itself before it ever reaches
+  // this function — see expandCopies in lib/print/pdf.ts, called from
+  // print-agent/index.ts — specifically so the mandatory banner page
+  // (lib/print/banner.ts's appendBannerPage) can be appended once, after
+  // every copy of the actual content, rather than printing once per copy
+  // the way letting CUPS's own -n flag replicate the whole submitted file
+  // would. This also sidesteps relying on this printer's own collate
+  // behavior at all (its PPD exposes no Collate option of its own —
+  // confirmed via `lpoptions -p <printer> -l` — so collation here was
+  // always CUPS's own generic, somewhat driver-dependent page ordering,
+  // not something baked into the page sequence itself).
+  args.push("-n", "1");
   args.push("-o", `media=${MEDIA_BY_PAPER_SIZE[settings.paperSize]}`);
   // Deliberately NOT setting orientation-requested here (ROADMAP.md #15).
   // The generated PDF's own content geometry is already the source of

@@ -28,8 +28,10 @@ import { tmpdir } from "node:os";
 import { AGENT_API_SECRET, BASE_URL, KIOSK_HEARTBEAT_INTERVAL_MS, KIOSK_ID, PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
 import { failDanglingRunningCommand, finishKioskCommand } from "../lib/kiosk-commands";
 import { recordAgentBoot, recordCompletedPrint, touchKioskHeartbeat } from "../lib/kiosk-stats";
-import { prependBannerPage } from "../lib/print/banner";
+import { enrichJobWithRazorpayPaymentDetails } from "../lib/payment-reconciliation";
+import { appendBannerPage } from "../lib/print/banner";
 import { cancelPrintJob, getCupsJobQueueState, submitPrintJob } from "../lib/print/cups";
+import { expandCopies } from "../lib/print/pdf";
 import { physicalSheetsForJob } from "../lib/print/sheets";
 import { attemptRefund } from "../lib/refund";
 import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
@@ -95,8 +97,21 @@ async function processJob(job: PrintJobRecord): Promise<void> {
   try {
     console.log(`[print-agent] Printing job ${job.id} (${job.fileName})...`);
     let pdfBytes = await downloadJobPdf(job.pdfStoragePath);
+    // Copies are baked directly into the PDF (copy 1's pages, then copy
+    // 2's, etc.) rather than left to CUPS's own -n/collate handling — see
+    // expandCopies' own docstring for why — so the single banner page
+    // appended next lands once at the very end of the whole job, not once
+    // per copy.
+    pdfBytes = await expandCopies(pdfBytes, job.settings.copies);
     if (job.includeBannerPage) {
-      pdfBytes = await prependBannerPage(pdfBytes, job);
+      // The UPI transaction id is usually already saved by the time a job
+      // reaches printing (see reconcilePendingPayment's own enrichment
+      // call) — this is only a second, best-effort try for the case it
+      // genuinely wasn't settled at Razorpay yet back then.
+      if (job.provider === "razorpay" && !job.upiTxnId) {
+        job = await enrichJobWithRazorpayPaymentDetails(job);
+      }
+      pdfBytes = await appendBannerPage(pdfBytes, job);
     }
     await writeFile(tempPdfPath, pdfBytes);
 

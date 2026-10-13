@@ -68,6 +68,16 @@ create table print_jobs (
   ticket_number integer,
   ticket_date date,
 
+  -- Payment details for the printed banner's "Total paid" / "UPI Txn ID"
+  -- lines (see lib/print/banner.ts) — populated best-effort when a
+  -- Razorpay payment is confirmed (lib/payment-reconciliation.ts). Always
+  -- null for Cashfree jobs. Deliberately NOT included in the anon grant
+  -- (§10 below) or in print_jobs_admin_view (§9) — never exposed to the
+  -- customer-facing status page, Realtime, or the admin panel.
+  payment_id text,
+  upi_txn_id text,
+  paid_amount numeric,
+
   -- reserved, unused this build — see ROADMAP.md §24/§25. The real
   -- pickup-confirmation trigger (customer self-confirm? flap sensor? a
   -- timeout?) isn't decided yet, so no code sets this column. It exists now

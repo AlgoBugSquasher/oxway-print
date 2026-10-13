@@ -36,6 +36,18 @@ export const SUPABASE_PRINT_BUCKET = process.env.SUPABASE_PRINT_BUCKET || "print
 export const MAX_UPLOAD_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 
 /**
+ * Max pages app/api/create-order accepts in the final uploaded PDF (after
+ * extractSelectedPages re-derives the real page count server-side — the
+ * client's own claim is never trusted). Matches MAX_TOTAL_PAGES_PER_BASKET
+ * in lib/hooks/useFileBasket.ts, which bounds this client-side before a
+ * customer ever gets to checkout — this is the authoritative copy of that
+ * same limit, independently enforced, the same relationship
+ * MAX_UPLOAD_FILE_SIZE_BYTES above already has with that hook's own
+ * MAX_FILE_SIZE_BYTES.
+ */
+export const MAX_UPLOAD_PAGE_COUNT = 300;
+
+/**
  * How long a temporary direct-to-storage upload (lib/store.ts's
  * tempUploadStoragePath, under the "uploads/" prefix) can sit unclaimed
  * before the cleanup cron sweeps it as an orphan — e.g. the customer

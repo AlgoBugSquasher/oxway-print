@@ -1,11 +1,5 @@
 "use client";
 
-// Must stay the very first import — it's a side-effect-only polyfill that
-// has to be in place before pdfjs-dist's own code ever runs. See that
-// file's own docstring for why this exists alongside (not instead of) the
-// pdfjs-dist/legacy import just below.
-import "@/lib/polyfills/map-get-or-insert";
-
 import { type ChangeEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { load as loadCashfree } from "@cashfreepayments/cashfree-js";
@@ -14,6 +8,7 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ChevronUp,
   Circle,
   Copy,
   FileText,
@@ -31,47 +26,24 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-// The "legacy" build, not the bare `pdfjs-dist` (which resolves to the
-// modern build) — ROADMAP-style fix for a real iPhone 15/15 Plus Safari
-// crash: pdf.js's own transport/message-handler code calls
-// `Map.prototype.getOrInsertComputed`, a method new enough (2024/2025 TC39)
-// that plenty of iOS Safari installs still don't have it natively. The
-// modern build assumes it's always there; the legacy build bundles its own
-// core-js polyfill for it (confirmed directly in pdfjs-dist's own published
-// files — the modern build has zero such polyfill code at all). Android
-// Chrome was never affected, which is exactly consistent with this: V8
-// shipped the method earlier than Safari's WebKit did.
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import BrandWatermark from "@/components/BrandWatermark";
 import BrandWordmark from "@/components/BrandWordmark";
 import LivePrintPreview from "@/components/LivePrintPreview";
-import { convertFileInBrowser, isImageFile, isSupportedClientFile } from "@/lib/client-file-converter";
-import { reportClientError } from "@/lib/client-log";
 import { fetchJson } from "@/lib/fetch-json";
+import {
+  MAX_COMBINED_FILE_SIZE_BYTES,
+  MAX_FILES_PER_BASKET,
+  MAX_FILE_SIZE_BYTES,
+  MAX_TOTAL_PAGES_PER_BASKET,
+  useFileBasket,
+  type FileBasketItem,
+} from "@/lib/hooks/useFileBasket";
 import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
 import type { CreateOrderOutput } from "@/lib/payment";
+import { mergeSelectedPdfPages } from "@/lib/pdf-merge";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
-
-// Resolved by the bundler (new URL(..., import.meta.url), the standard
-// pattern pdf.js itself documents for Webpack-family bundlers, Turbopack
-// included) rather than a CDN URL — the CDN previously served the file at
-// a version-matched path, but always the *modern* build, meaning switching
-// just the main thread to legacy while the worker stayed on the CDN would
-// have reintroduced the exact mismatch this task warned against (main
-// thread and worker must be the same build, not just the same version).
-// Resolving it this way also means Next.js copies the real file into the
-// production build output and serves it from this app's own domain — no
-// dependency on a third-party CDN being reachable/correctly configured on
-// Vercel, which is the real answer to "bundled and served correctly in
-// production," not just "works in dev."
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.min.mjs", import.meta.url).toString();
-
-interface PageThumbnail {
-  pageNumber: number;
-  dataUrl: string;
-}
 
 type PageMode = "all" | "odd" | "even" | "custom";
 type PaperSize = "A4" | "Letter" | "Legal";
@@ -99,13 +71,6 @@ type PrintSettings = {
   pagesPerSheet: 1 | 2 | 4;
 };
 
-// Matches MAX_UPLOAD_FILE_SIZE_BYTES in lib/config.ts (server-side, re-checked
-// there against the actual uploaded bytes — this is only ever a fast local
-// check). Raised from the old 25MB now that the file uploads directly to
-// Supabase Storage (see handleStartPayment below) instead of through a
-// Vercel serverless function's request body, which is what actually
-// capped uploads around ~4.5MB regardless of what this constant said.
-const MAX_FILE_SIZE = 50 * 1024 * 1024;
 // Once a job reaches one of these, nothing about it changes again — no point
 // still polling or staying subscribed to Realtime for it.
 const TERMINAL_ORDER_STATUSES: OrderStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled"];
@@ -163,13 +128,16 @@ function parsePageRange(value: string, totalPages: number) {
   return [...pages].sort((a, b) => a - b);
 }
 
+/** Applies the global pageMode/customRange filter to one basket item's own selectedPages — each file is filtered independently (there's no merged document yet to number pages across, see handleStartPayment's own note on that). */
+function itemActivePages(item: FileBasketItem, pageMode: PageMode, customRange: string): number[] {
+  if (pageMode === "all") return item.selectedPages;
+  if (pageMode === "odd") return item.selectedPages.filter((page) => page % 2 === 1);
+  if (pageMode === "even") return item.selectedPages.filter((page) => page % 2 === 0);
+  return parsePageRange(customRange, item.totalPages).filter((page) => item.selectedPages.includes(page));
+}
+
 export default function PdfPageSelector() {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [totalPages, setTotalPages] = useState(0);
-  const [thumbnails, setThumbnails] = useState<PageThumbnail[]>([]);
-  const [previewUrl, setPreviewUrl] = useState("");
-  const [selectedPages, setSelectedPages] = useState<number[]>([]);
   const [settings, setSettings] = useState<PrintSettings>({
     copies: 1,
     layout: "portrait",
@@ -188,6 +156,10 @@ export default function PdfPageSelector() {
   const [phoneTouched, setPhoneTouched] = useState(false);
   const [isDark, setIsDark] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  // True only while a payment is actually being submitted (upload +
+  // create-order + opening the gateway modal) — file conversion no longer
+  // sets this; each basket item tracks its own "converting" status instead
+  // (see useFileBasket).
   const [isLoading, setIsLoading] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
@@ -209,9 +181,13 @@ export default function PdfPageSelector() {
   // including during the brief order-creation/gateway step right after,
   // which isLoading alone already covers.
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  // Holds the converted PDF's bytes so the final file can be uploaded again at
-  // payment time — pdfjs consumes the response body when rendering thumbnails.
-  const pdfBytesRef = useRef<Uint8Array | null>(null);
+
+  // Owns the list of selected files, their client-side conversion, page
+  // selection and reordering — see lib/hooks/useFileBasket.ts. Disabled
+  // (add/remove/reorder/reconversion all become no-ops) once a payment is
+  // in progress or has succeeded, same reasoning as the old single-file
+  // "Change file" button's own guard had.
+  const basket = useFileBasket({ layout: settings.layout, enabled: orderStatus === "idle" });
 
   // Which kiosk this customer scanned (?k=<kiosk-id> in the QR URL) — a lazy
   // initializer rather than an effect+setState, since it never needs to
@@ -281,7 +257,7 @@ export default function PdfPageSelector() {
   // doesn't fight the customer's own choice on every poll tick.
   useEffect(() => {
     // queueMicrotask defers past this effect's own synchronous body, same
-    // reason/pattern as the Layout-reconversion effect above.
+    // reason/pattern as the Layout-reconversion effect inside useFileBasket.
     queueMicrotask(() => {
       setSettings((current) => {
         if (current.isColor && !allowColor && allowBw) return { ...current, isColor: false };
@@ -320,14 +296,18 @@ export default function PdfPageSelector() {
 
   const isPhoneValid = PHONE_PATTERN.test(phone);
 
-  const activePages = useMemo(() => {
-    if (settings.pageMode === "all") return selectedPages;
-    if (settings.pageMode === "odd") return selectedPages.filter((page) => page % 2 === 1);
-    if (settings.pageMode === "even") return selectedPages.filter((page) => page % 2 === 0);
-    return parsePageRange(settings.customRange, totalPages).filter((page) => selectedPages.includes(page));
-  }, [selectedPages, settings.customRange, settings.pageMode, totalPages]);
+  // Each basket item's own selectedPages, filtered by the shared
+  // pageMode/customRange setting — see itemActivePages' own comment on why
+  // that's applied per file rather than across some not-yet-existing merged
+  // document.
+  const activePagesPerItem = useMemo(
+    () => basket.items.map((item) => itemActivePages(item, settings.pageMode, settings.customRange)),
+    [basket.items, settings.pageMode, settings.customRange]
+  );
+  const totalPages = useMemo(() => basket.items.reduce((sum, item) => sum + item.totalPages, 0), [basket.items]);
+  const totalActivePages = useMemo(() => activePagesPerItem.reduce((sum, pages) => sum + pages.length, 0), [activePagesPerItem]);
 
-  const billableSheets = Math.ceil(activePages.length / settings.pagesPerSheet) * settings.copies;
+  const billableSheets = Math.ceil(totalActivePages / settings.pagesPerSheet) * settings.copies;
   // Never includes the pickup-ID banner — it's mandatory on every job (see
   // app/api/create-order/route.ts, which hardcodes includeBannerPage: true
   // server-side regardless of what the client sends) but absorbed as a
@@ -335,116 +315,10 @@ export default function PdfPageSelector() {
   const totalPrice = billableSheets * (settings.isColor ? priceColor : priceBw);
   const updateSettings = <K extends keyof PrintSettings>(key: K, value: PrintSettings[K]) => setSettings((current) => ({ ...current, [key]: value }));
 
-  const processFile = async (uploadedFile: File) => {
-    setError("");
-    if (!isSupportedClientFile(uploadedFile)) return setError("Unsupported file. Upload a PDF, PNG, JPG, JPEG, WEBP, HEIC, HEIF, or DOCX file.");
-    if (uploadedFile.size > MAX_FILE_SIZE) return setError("This file is larger than the 50 MB kiosk limit.");
-    setFile(uploadedFile);
-    setIsLoading(true);
-    setThumbnails([]);
-    const isBrowserPreviewableImage = uploadedFile.type.startsWith("image/") && !/\.(heic|heif)$/i.test(uploadedFile.name) && !["image/heic", "image/heif"].includes(uploadedFile.type);
-    setPreviewUrl(isBrowserPreviewableImage ? URL.createObjectURL(uploadedFile) : "");
-    setOrderStatus("idle");
-    setJobId(null);
-    pdfBytesRef.current = null;
-
-    // Diagnostic context for reportClientError below — added specifically to
-    // debug iPhone 15/15 Plus Safari PDF-upload failures that can't be
-    // reproduced on desktop. `stage` records how far processing got before
-    // it broke, `stallTimer` catches the other failure shape a thrown error
-    // can't: pdf.js's worker (see the workerSrc setup at the top of this
-    // file) hanging instead of rejecting, which would otherwise leave the
-    // "Preparing your document..." spinner running forever with nothing in
-    // any log at all.
-    const fileMeta = { name: uploadedFile.name, type: uploadedFile.type, size: uploadedFile.size };
-    let stage = "convert";
-    let settled = false;
-    const stallTimer = setTimeout(() => {
-      if (!settled) reportClientError("upload-stalled", new Error(`Still stuck at "${stage}" after 15s`), fileMeta);
-    }, 15000);
-
-    try {
-      stage = "convert";
-      const normalizedPdfBytes = await convertFileInBrowser(uploadedFile, settings.layout);
-      pdfBytesRef.current = normalizedPdfBytes;
-      stage = "pdfjs-load";
-      const pdf = await pdfjsLib.getDocument({ data: normalizedPdfBytes.slice() }).promise;
-      setTotalPages(pdf.numPages);
-      setSelectedPages(Array.from({ length: pdf.numPages }, (_, index) => index + 1));
-      const renderedPages: PageThumbnail[] = [];
-      for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-        stage = `render-page-${pageNumber}`;
-        const page = await pdf.getPage(pageNumber);
-        const viewport = page.getViewport({ scale: 0.38 });
-        const canvas = document.createElement("canvas");
-        const context = canvas.getContext("2d");
-        const devicePixelRatio = window.devicePixelRatio || 2;
-        canvas.width = Math.floor(viewport.width * devicePixelRatio);
-        canvas.height = Math.floor(viewport.height * devicePixelRatio);
-        canvas.style.width = `${viewport.width}px`;
-        canvas.style.height = `${viewport.height}px`;
-        if (!context) continue;
-        context.scale(devicePixelRatio, devicePixelRatio);
-        await page.render({ canvas, canvasContext: context, viewport }).promise;
-        renderedPages.push({ pageNumber, dataUrl: canvas.toDataURL("image/jpeg", 0.8) });
-      }
-      setThumbnails(renderedPages);
-    } catch (loadError) {
-      reportClientError(`upload-failed:${stage}`, loadError, fileMeta);
-      setFile(null);
-      setPreviewUrl("");
-      // pdf.js itself (getDocument/getPage/render) is the one stage whose
-      // thrown errors are internal engine details, not something written
-      // for a customer to read — e.g. the exact "getOrInsertComputed is
-      // not a function" crash this file's pdfjs-dist import was fixed for.
-      // convertFileInBrowser's own errors (lib/client-file-converter.ts),
-      // by contrast, are already written in plain language, so those still
-      // surface as-is.
-      const isPdfjsStage = stage === "pdfjs-load" || stage.startsWith("render-page");
-      setError(
-        isPdfjsStage
-          ? "Couldn't read this file, please try another."
-          : loadError instanceof Error ? loadError.message : "We could not read this file. Please try another one."
-      );
-    } finally {
-      settled = true;
-      clearTimeout(stallTimer);
-      setIsLoading(false);
-    }
-  };
-
-  // Images bake their canvas shape (portrait vs landscape) in at conversion
-  // time (see imageToPdf in lib/client-file-converter.ts) rather than
-  // relying on the server's later whole-page rotation — necessary so a wide
-  // photo actually fills a landscape page instead of being pre-shrunk into
-  // a narrow portrait frame first. That means an image upload has to be
-  // re-converted if the customer changes Layout after uploading, unlike a
-  // PDF/DOCX upload, where the server-side rotation step still has the
-  // real page shape to work with and never needs this. Skipped once an
-  // order exists (orderStatus !== "idle") so a stray Layout change can
-  // never reset jobId/orderStatus out from under an order already in
-  // flight — reaching the settings panel at that point isn't a real UI
-  // path today, but this guard costs nothing and removes the question.
-  useEffect(() => {
-    if (!file || !isImageFile(file) || orderStatus !== "idle") return;
-    // queueMicrotask defers past processFile's own synchronous setState
-    // calls (setError/setFile/setIsLoading, before its first await) — those
-    // are the whole point of calling it here, just not synchronously within
-    // this effect's own body.
-    queueMicrotask(() => void processFile(file));
-    // Intentionally narrow — only a Layout change should trigger a
-    // reconversion; processFile/file/orderStatus in this list would turn
-    // every processFile call (including this one) into another effect run.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.layout]);
-
   const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
-    const uploadedFile = event.target.files?.[0];
-    if (uploadedFile) void processFile(uploadedFile);
+    if (event.target.files && event.target.files.length > 0) basket.addFiles(event.target.files);
     event.target.value = "";
   };
-
-  const togglePage = (pageNumber: number) => setSelectedPages((pages) => pages.includes(pageNumber) ? pages.filter((page) => page !== pageNumber) : [...pages, pageNumber].sort((a, b) => a - b));
 
   const handlePhoneChange = (event: ChangeEvent<HTMLInputElement>) => {
     const digitsOnly = event.target.value.replace(/\D/g, "").slice(0, 10);
@@ -458,8 +332,21 @@ export default function PdfPageSelector() {
   // component never trusts the modal's own success callback by itself, it
   // just kicks off polling (see the effect below) which asks the server,
   // which asks the gateway directly.
+  //
+  // Multi-file: every basket file's own selected pages are combined into
+  // ONE PDF, in basket order, by mergeSelectedPdfPages (lib/pdf-merge.ts) —
+  // entirely in-browser, so only the pages actually chosen ever get
+  // uploaded. From there on this is the exact same single-file upload →
+  // create-order flow the kiosk has always had: one PDF, one job. The
+  // server never trusts totalPrice/selectedPages sent here — see
+  // app/api/create-order/route.ts, which re-derives the real page count,
+  // sheets and price from the merged PDF it actually receives.
   const handleStartPayment = async () => {
-    if (!file || !pdfBytesRef.current || activePages.length === 0) return setError("Select at least one page before paying.");
+    if (basket.items.length === 0) return setError("Add at least one file before paying.");
+    if (basket.isProcessing) return setError("Please wait for your files to finish preparing.");
+    const notReadyItem = basket.items.find((item) => item.status !== "ready" || !item.pdfBytes);
+    if (notReadyItem) return setError(`"${notReadyItem.file.name}" isn't ready — remove it or fix the error on its card before paying.`);
+    if (totalActivePages === 0) return setError("Select at least one page before paying.");
     if (isKioskUpdating) return setError("This kiosk is being updated right now — please try again in a minute.");
     // Phone is only required when the customer opted into WhatsApp updates.
     if (notifyOptIn && !isPhoneValid) {
@@ -469,6 +356,15 @@ export default function PdfPageSelector() {
     setError("");
     setIsLoading(true);
     try {
+      const merged = await mergeSelectedPdfPages(
+        basket.items.map((item, index) => ({
+          fileName: item.file.name,
+          pdfBytes: item.pdfBytes!,
+          selectedPages: activePagesPerItem[index] ?? [],
+        }))
+      );
+      const mergedFileName = basket.items.length === 1 ? basket.items[0].file.name : `${basket.items.length} files (merged).pdf`;
+
       // kioskId (state, above) is read from the QR's ?k=<kiosk-id> param on
       // mount; only sent when explicitly present so the server's own
       // single-kiosk default still applies otherwise.
@@ -480,11 +376,11 @@ export default function PdfPageSelector() {
       // multi-MB body sent straight to a Vercel serverless function used
       // to come back as an opaque 413, well under this kiosk's own stated
       // size limit).
-      const pdfBlob = new Blob([pdfBytesRef.current.slice().buffer], { type: "application/pdf" });
+      const pdfBlob = new Blob([merged.bytes.slice().buffer], { type: "application/pdf" });
       const uploadTarget = await fetchJson<{ path: string; token: string; signedUrl: string }>("/api/create-upload-url", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileName: file.name, fileSize: pdfBlob.size, contentType: "application/pdf" }),
+        body: JSON.stringify({ fileName: mergedFileName, fileSize: pdfBlob.size, contentType: "application/pdf" }),
       });
 
       // Step 2: upload directly to Supabase Storage with that signed URL —
@@ -496,14 +392,19 @@ export default function PdfPageSelector() {
 
       // Step 3: create the order from the storage path alone — this
       // request is just metadata (page selection, settings, price), tiny
-      // regardless of how large the actual file was.
+      // regardless of how large the actual file was. selectedPages is every
+      // page of the merged upload: the real selection already happened
+      // above, per file, before merging — the server re-derives its own
+      // authoritative page count from the uploaded bytes regardless (see
+      // that route's own comment), this is just "print everything in the
+      // file you were just given."
       const order = await fetchJson<{ jobId: string } & CreateOrderOutput>("/api/create-order", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           pdfStoragePath: uploadTarget.path,
-          fileName: file.name,
-          selectedPages: activePages,
+          fileName: mergedFileName,
+          selectedPages: Array.from({ length: merged.pageCount }, (_, index) => index + 1),
           settings,
           totalPrice,
           notifyOptIn,
@@ -531,7 +432,7 @@ export default function PdfPageSelector() {
           amount: order.amount,
           currency: "INR",
           name: "OXWAY Print Kiosk",
-          description: file.name,
+          description: mergedFileName,
           order_id: order.providerOrderId,
           theme: { color: "#2563eb" },
           // Only pre-fills when the customer actually opted in and gave a
@@ -666,6 +567,8 @@ export default function PdfPageSelector() {
   const theme = isDark ? "bg-[#101419] text-slate-100" : "bg-[#f4f6f8] text-slate-950";
   const panel = isDark ? "border-white/10 bg-white/[0.06]" : "border-slate-200 bg-white";
   const muted = isDark ? "text-slate-400" : "text-slate-500";
+  const canEditBasket = orderStatus === "idle";
+  const primaryItem = basket.items[0];
 
   return <div className={`min-h-screen pb-36 transition-colors duration-300 ${theme}`}>
     <header className={`sticky top-0 z-20 border-b backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/85" : "border-slate-200/80 bg-[#f4f6f8]/85"}`}><div className="mx-auto flex max-w-6xl flex-wrap items-center gap-y-2 px-5 py-4 lg:px-8"><div className="flex items-center gap-3"><div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20"><Printer size={19} /></div><div><BrandWordmark className="h-10" /><p className={`mt-1.5 text-xs ${muted}`}>Smart print kiosk</p></div></div><div className="ml-auto flex items-center gap-2">{isKioskOnline
@@ -686,13 +589,68 @@ export default function PdfPageSelector() {
         </div>
       </div>
     )}
-    <main className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[1fr_330px] lg:px-8"><section className="min-w-0"><div className="mb-7 flex items-end justify-between gap-4"><div><p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-blue-500">01 / Upload</p><h1 className="text-3xl font-black tracking-tight sm:text-4xl">Print without the queue.</h1><p className={`mt-2 text-sm ${muted}`}>Upload a PDF, tune your print settings, and send it straight to the kiosk.</p></div>{file && <button onClick={() => fileInputRef.current?.click()} className="hidden rounded-xl border border-blue-500/30 px-3 py-2 text-xs font-bold text-blue-500 sm:block">Change file</button>}</div><button type="button" onClick={() => setIsPreviewOpen(true)} className={`mb-4 flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${panel}`}><span>Preview print</span><span className="text-blue-500">View sheet</span></button>
-      <input ref={fileInputRef} type="file" accept="application/pdf,image/png,image/jpeg,image/webp,image/heic,image/heif,.pdf,.png,.jpg,.jpeg,.webp,.heic,.heif,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" className="hidden" onChange={handleFileInput} />
-      {!file && !isLoading && <button type="button" onClick={() => fileInputRef.current?.click()} onDragEnter={(event) => { event.preventDefault(); setIsDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); const droppedFile = event.dataTransfer.files[0]; if (droppedFile) void processFile(droppedFile); }} className={`group flex min-h-[320px] w-full flex-col items-center justify-center rounded-[2rem] border-2 border-dashed p-8 text-center transition ${isDragging ? "border-blue-500 bg-blue-500/10" : `${isDark ? "border-white/15 bg-white/[0.04]" : "border-slate-300 bg-white/70 hover:border-blue-300 hover:bg-white"}`}`}><span className="mb-5 grid size-16 place-items-center rounded-3xl bg-blue-600 text-white shadow-xl shadow-blue-600/20 transition group-hover:-translate-y-1"><FileUp size={27} /></span><span className="text-lg font-bold">Drop your file here</span><span className={`mt-2 text-sm ${muted}`}>PDF, image, or Word document</span><span className={`mt-6 rounded-full px-3 py-1 text-[11px] ${isDark ? "bg-white/10 text-slate-300" : "bg-slate-100 text-slate-500"}`}>PDF · PNG · JPG · HEIC · DOCX · max 50 MB</span></button>}
-      {isLoading && <div className={`flex min-h-[320px] flex-col items-center justify-center rounded-[2rem] border p-8 ${panel}`}>{previewUrl && <img src={previewUrl} alt="Uploaded image preview" className="mb-5 max-h-48 max-w-full rounded-xl object-contain shadow-md" />}<RefreshCw className="mb-4 animate-spin text-blue-500" size={30} /><p className="font-semibold">Preparing your document...</p><p className={`mt-1 text-sm ${muted}`}>Converting to a printable A4 PDF</p></div>}
-      {file && !isLoading && <><div className={`mb-5 flex items-center gap-4 rounded-2xl border p-4 ${panel}`}><div className="grid size-11 shrink-0 place-items-center rounded-xl bg-red-500/10 text-red-500"><FileText size={21} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{file.name}</p><p className={`mt-1 text-xs ${muted}`}>{(file.size / (1024 * 1024)).toFixed(2)} MB · {totalPages} pages</p></div><button onClick={() => fileInputRef.current?.click()} className="rounded-xl p-2 text-blue-500 sm:hidden"><RefreshCw size={17} /></button></div><div className="mb-4 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">02 / Select pages</p><p className={`mt-1 text-sm ${muted}`}>{activePages.length} active pages · tap a page to include or exclude</p></div><div className="flex gap-2"><button onClick={() => setSelectedPages(Array.from({ length: totalPages }, (_, index) => index + 1))} className="text-xs font-bold text-blue-500">All</button><button onClick={() => setSelectedPages([])} className={`text-xs font-bold ${muted}`}>Clear</button></div></div><div className={`grid max-h-[560px] grid-cols-2 gap-3 overflow-y-auto rounded-3xl border p-3 sm:grid-cols-3 xl:grid-cols-4 ${isDark ? "border-white/10 bg-white/[0.03]" : "border-slate-200 bg-slate-100/70"}`}>{thumbnails.map((thumbnail) => { const selected = selectedPages.includes(thumbnail.pageNumber); return <button key={thumbnail.pageNumber} onClick={() => togglePage(thumbnail.pageNumber)} className={`relative overflow-hidden rounded-2xl border-2 bg-white p-1 text-left transition hover:-translate-y-0.5 ${selected ? "border-blue-500 shadow-lg shadow-blue-500/10" : "border-transparent opacity-45 grayscale"}`}><img src={thumbnail.dataUrl} alt={`Page ${thumbnail.pageNumber}`} className="aspect-[1/1.35] w-full object-contain" /><span className="absolute left-3 top-3 rounded-md bg-white/90 px-1.5 py-1 text-[10px] font-black text-slate-600">{thumbnail.pageNumber}</span><span className="absolute right-3 top-3 text-blue-600">{selected ? <CheckCircle2 size={19} fill="white" /> : <Circle size={19} />}</span></button>; })}</div></>}
+    <main className="mx-auto grid max-w-6xl gap-6 px-5 py-8 lg:grid-cols-[1fr_330px] lg:px-8"><section className="min-w-0"><div className="mb-7"><p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-blue-500">01 / Upload</p><h1 className="text-3xl font-black tracking-tight sm:text-4xl">Print without the queue.</h1><p className={`mt-2 text-sm ${muted}`}>Upload one or more files, tune your print settings, and send them straight to the kiosk.</p></div><button type="button" onClick={() => setIsPreviewOpen(true)} className={`mb-4 flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${panel}`}><span>Preview print</span><span className="text-blue-500">View sheet</span></button>
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept="application/pdf,image/png,image/jpeg,image/webp,image/heic,image/heif,.pdf,.png,.jpg,.jpeg,.webp,.heic,.heif,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        className="hidden"
+        onChange={handleFileInput}
+      />
+      {basket.items.length === 0 && <button
+        type="button"
+        onClick={() => fileInputRef.current?.click()}
+        onDragEnter={(event) => { event.preventDefault(); setIsDragging(true); }}
+        onDragOver={(event) => event.preventDefault()}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setIsDragging(false);
+          if (event.dataTransfer.files.length > 0) basket.addFiles(event.dataTransfer.files);
+        }}
+        className={`group flex min-h-[320px] w-full flex-col items-center justify-center rounded-[2rem] border-2 border-dashed p-8 text-center transition ${isDragging ? "border-blue-500 bg-blue-500/10" : `${isDark ? "border-white/15 bg-white/[0.04]" : "border-slate-300 bg-white/70 hover:border-blue-300 hover:bg-white"}`}`}
+      >
+        <span className="mb-5 grid size-16 place-items-center rounded-3xl bg-blue-600 text-white shadow-xl shadow-blue-600/20 transition group-hover:-translate-y-1"><FileUp size={27} /></span>
+        <span className="text-lg font-bold">Drop your files here</span>
+        <span className={`mt-2 text-sm ${muted}`}>PDF, image, or Word document — select or drop several at once</span>
+        <span className={`mt-6 rounded-full px-3 py-1 text-[11px] ${isDark ? "bg-white/10 text-slate-300" : "bg-slate-100 text-slate-500"}`}>PDF · PNG · JPG · HEIC · DOCX · max {Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))} MB each</span>
+        <span className={`mt-1.5 text-[11px] ${muted}`}>Up to {MAX_FILES_PER_BASKET} files · {Math.round(MAX_COMBINED_FILE_SIZE_BYTES / (1024 * 1024))} MB combined · {MAX_TOTAL_PAGES_PER_BASKET} pages combined</span>
+      </button>}
+
+      {basket.items.length > 0 && <div className="space-y-4">
+        {basket.items.map((item, index) => <FileBasketItemCard
+          key={item.id}
+          item={item}
+          index={index}
+          itemCount={basket.items.length}
+          isDark={isDark}
+          muted={muted}
+          panel={panel}
+          canEdit={canEditBasket}
+          activePages={activePagesPerItem[index] ?? []}
+          onRemove={() => basket.removeFile(item.id)}
+          onMoveUp={() => basket.moveUp(item.id)}
+          onMoveDown={() => basket.moveDown(item.id)}
+          onTogglePage={(pageNumber) => basket.togglePage(item.id, pageNumber)}
+          onSelectAll={() => basket.selectAllPages(item.id)}
+          onClearPages={() => basket.clearPages(item.id)}
+        />)}
+
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={!canEditBasket || basket.items.length >= MAX_FILES_PER_BASKET}
+          className={`flex min-h-11 w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed px-4 text-sm font-bold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-40 ${isDark ? "border-white/15 text-slate-300 hover:enabled:bg-white/5" : "border-slate-300 text-slate-600 hover:enabled:bg-white"}`}
+        >
+          <Plus size={16} className="text-blue-500" /> Add more files
+        </button>
+
+        {basket.basketError && <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600">{basket.basketError}</div>}
+      </div>}
+
       {error && <div className="mt-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
-    </section><aside className="lg:pt-[86px]"><div className={`rounded-[2rem] border p-5 shadow-xl shadow-slate-900/5 ${panel}`}><div className="mb-5 flex items-center justify-between"><div><p className={`text-xs font-bold uppercase tracking-[0.2em] ${muted}`}>Print order</p><p className="mt-1 text-lg font-black">Configure output</p></div><Settings2 className="text-blue-500" size={19} /></div><div className={`mb-4 rounded-2xl p-4 ${isDark ? "bg-blue-500/10" : "bg-blue-50"}`}><div className="flex items-center justify-between"><span className={`text-xs font-semibold ${muted}`}>Estimated total</span><span className="text-2xl font-black text-blue-600">₹{totalPrice}</span></div><div className={`mt-2 text-xs ${muted}`}>{billableSheets} billable sheets · {activePages.length} pages · {settings.copies} {settings.copies === 1 ? "copy" : "copies"}</div></div>
+    </section><aside className="lg:pt-[86px]"><div className={`rounded-[2rem] border p-5 shadow-xl shadow-slate-900/5 ${panel}`}><div className="mb-5 flex items-center justify-between"><div><p className={`text-xs font-bold uppercase tracking-[0.2em] ${muted}`}>Print order</p><p className="mt-1 text-lg font-black">Configure output</p></div><Settings2 className="text-blue-500" size={19} /></div><div className={`mb-4 rounded-2xl p-4 ${isDark ? "bg-blue-500/10" : "bg-blue-50"}`}><div className="flex items-center justify-between"><span className={`text-xs font-semibold ${muted}`}>Estimated total</span><span className="text-2xl font-black text-blue-600">₹{totalPrice}</span></div><div className={`mt-2 text-xs ${muted}`}>{basket.items.length} {basket.items.length === 1 ? "file" : "files"} · {billableSheets} billable sheets · {totalActivePages} of {totalPages} pages · {settings.copies} {settings.copies === 1 ? "copy" : "copies"}</div></div>
       {allowWhatsapp && (
         <div className={`mb-4 rounded-xl border p-3 ${isDark ? "border-white/10" : "border-slate-200"}`}>
           <label className="flex cursor-pointer items-start gap-2.5">
@@ -726,13 +684,13 @@ export default function PdfPageSelector() {
       )}
       <button onClick={() => setIsSettingsOpen(true)} className={`flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${isDark ? "border-white/10" : "border-slate-200"}`}><span className="flex items-center gap-2"><LayoutGrid size={16} className="text-blue-500" /> Print settings</span><ChevronDown size={16} className={muted} /></button><div className={`mt-4 space-y-3 text-xs ${muted}`}><div className="flex justify-between"><span>Color mode</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.isColor ? "Color" : "B&W"}</b></div><div className="flex justify-between"><span>Paper</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.paperSize} · {settings.layout}</b></div><div className="flex justify-between"><span>Pages per sheet</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.pagesPerSheet}</b></div></div></div></aside></main>
     <BrandWatermark isDark={isDark} />
-    {file && <div className={`fixed bottom-0 left-0 right-0 z-30 border-t backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/90" : "border-slate-200 bg-white/90"}`}><div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-4 lg:px-8">
+    {basket.items.length > 0 && <div className={`fixed bottom-0 left-0 right-0 z-30 border-t backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/90" : "border-slate-200 bg-white/90"}`}><div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-4 lg:px-8">
       {/* The ticket code itself now lives in the big hero banner above
          <main> (see ticketNumber !== null below) — this slot stays on
          price throughout, rather than duplicating the same number twice
          on screen at two very different sizes. */}
       <div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>
-      {orderStatus === "idle" && <button onClick={handleStartPayment} disabled={isLoading || activePages.length === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>}
+      {orderStatus === "idle" && <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>}
       {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
       {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
       {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
@@ -754,8 +712,12 @@ export default function PdfPageSelector() {
     {/* Preview used to also render as an always-open floating panel on
        desktop, sitting over the page-selection grid whether you wanted it
        or not. Now button-triggered on every screen size, same as it
-       already was on mobile — one modal, one behavior. */}
-    {isPreviewOpen && <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/50 p-5"><div className="max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-5"><LivePrintPreview settings={settings} activePages={activePages} thumbnails={thumbnails} imagePreviewUrl={previewUrl} fileType={file?.type} isOpen onClose={() => setIsPreviewOpen(false)} /></div></div>}
+       already was on mobile — one modal, one behavior. Still only ever
+       shows the FIRST basket file's own preview (not the merged print job
+       handleStartPayment submits) — live-merging every file just to render
+       a preview on every keystroke isn't worth the cost; out of scope for
+       now. */}
+    {isPreviewOpen && <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/50 p-5"><div className="max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-5"><LivePrintPreview settings={settings} activePages={activePagesPerItem[0] ?? []} thumbnails={primaryItem?.thumbnails ?? []} imagePreviewUrl={primaryItem?.previewUrl} fileType={primaryItem?.file.type} isOpen onClose={() => setIsPreviewOpen(false)} /></div></div>}
   </div>;
 }
 
@@ -775,4 +737,90 @@ function Segmented({ value, options, labels = options, disabledOptions = [], onC
       {labels[index]}
     </button>;
   })}</div>;
+}
+
+/**
+ * One row in the file basket — name/size/page-count, its own page-selection
+ * grid (reusing the same visual language the single-file flow always had),
+ * and the per-file controls (reorder, remove). All disabled together via
+ * `canEdit` once a payment is in progress or has succeeded (see
+ * PdfPageSelector's own `canEditBasket`) — reordering or removing a file an
+ * order already references would leave that order pointing at something
+ * that's no longer what the customer sees on screen.
+ */
+function FileBasketItemCard({
+  item,
+  index,
+  itemCount,
+  isDark,
+  muted,
+  panel,
+  canEdit,
+  activePages,
+  onRemove,
+  onMoveUp,
+  onMoveDown,
+  onTogglePage,
+  onSelectAll,
+  onClearPages,
+}: {
+  item: FileBasketItem;
+  index: number;
+  itemCount: number;
+  isDark: boolean;
+  muted: string;
+  panel: string;
+  canEdit: boolean;
+  activePages: number[];
+  onRemove: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  onTogglePage: (pageNumber: number) => void;
+  onSelectAll: () => void;
+  onClearPages: () => void;
+}) {
+  const controlButtonClass = "grid size-11 shrink-0 place-items-center rounded-xl transition focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-30";
+
+  return <div className={`rounded-2xl border p-4 ${panel}`}>
+    <div className="flex items-center gap-3">
+      <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-red-500/10 text-red-500"><FileText size={21} /></div>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-bold">{item.file.name}</p>
+        <p className={`mt-1 text-xs ${muted}`}>
+          {(item.file.size / (1024 * 1024)).toFixed(2)} MB
+          {item.status === "ready" && ` · ${item.totalPages} ${item.totalPages === 1 ? "page" : "pages"}`}
+          {item.status === "converting" && " · Preparing..."}
+        </p>
+      </div>
+      <div className="flex shrink-0 items-center gap-1">
+        <button type="button" onClick={onMoveUp} disabled={!canEdit || index === 0} aria-label={`Move ${item.file.name} up`} className={`${controlButtonClass} text-blue-500 focus-visible:ring-blue-500 ${isDark ? "hover:enabled:bg-blue-500/10" : "hover:enabled:bg-blue-50"}`}><ChevronUp size={18} /></button>
+        <button type="button" onClick={onMoveDown} disabled={!canEdit || index === itemCount - 1} aria-label={`Move ${item.file.name} down`} className={`${controlButtonClass} text-blue-500 focus-visible:ring-blue-500 ${isDark ? "hover:enabled:bg-blue-500/10" : "hover:enabled:bg-blue-50"}`}><ChevronDown size={18} /></button>
+        <button type="button" onClick={onRemove} disabled={!canEdit} aria-label={`Remove ${item.file.name}`} className={`${controlButtonClass} text-red-500 focus-visible:ring-red-500 ${isDark ? "hover:enabled:bg-red-500/10" : "hover:enabled:bg-red-50"}`}><X size={18} /></button>
+      </div>
+    </div>
+
+    {item.status === "error" && <div className="mt-3 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-500">{item.error}</div>}
+
+    {item.status === "converting" && <div className={`mt-3 flex items-center gap-2 text-xs ${muted}`}><RefreshCw className="animate-spin text-blue-500" size={14} /> Converting to a printable PDF...</div>}
+
+    {item.status === "ready" && <div className="mt-4">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <p className={`text-xs ${muted}`}>{activePages.length} active pages · tap a page to include or exclude</p>
+        <div className="flex shrink-0 gap-2">
+          <button type="button" onClick={onSelectAll} className="text-xs font-bold text-blue-500">All</button>
+          <button type="button" onClick={onClearPages} className={`text-xs font-bold ${muted}`}>Clear</button>
+        </div>
+      </div>
+      <div className={`grid max-h-80 grid-cols-3 gap-2 overflow-y-auto rounded-2xl border p-2 sm:grid-cols-4 ${isDark ? "border-white/10 bg-white/[0.03]" : "border-slate-200 bg-slate-100/70"}`}>
+        {item.thumbnails.map((thumbnail) => {
+          const selected = item.selectedPages.includes(thumbnail.pageNumber);
+          return <button key={thumbnail.pageNumber} type="button" onClick={() => onTogglePage(thumbnail.pageNumber)} className={`relative overflow-hidden rounded-xl border-2 bg-white p-1 text-left transition hover:-translate-y-0.5 ${selected ? "border-blue-500 shadow-lg shadow-blue-500/10" : "border-transparent opacity-45 grayscale"}`}>
+            <img src={thumbnail.dataUrl} alt={`Page ${thumbnail.pageNumber}`} className="aspect-[1/1.35] w-full object-contain" />
+            <span className="absolute left-2 top-2 rounded-md bg-white/90 px-1.5 py-1 text-[10px] font-black text-slate-600">{thumbnail.pageNumber}</span>
+            <span className="absolute right-2 top-2 text-blue-600">{selected ? <CheckCircle2 size={16} fill="white" /> : <Circle size={16} />}</span>
+          </button>;
+        })}
+      </div>
+    </div>}
+  </div>;
 }
