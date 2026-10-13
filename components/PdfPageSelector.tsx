@@ -106,7 +106,7 @@ type PrintSettings = {
 // Vercel serverless function's request body, which is what actually
 // capped uploads around ~4.5MB regardless of what this constant said.
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
-const PRICE_BW = 1;
+const PRICE_BW = 2;
 const PRICE_COLOR = 10;
 // Once a job reaches one of these, nothing about it changes again — no point
 // still polling or staying subscribed to Realtime for it.
