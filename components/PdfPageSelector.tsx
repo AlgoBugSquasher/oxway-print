@@ -48,7 +48,7 @@ type PrintSettings = {
 };
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024;
-const PRICE_BW = 2;
+const PRICE_BW = 1;
 const PRICE_COLOR = 10;
 
 function parsePageRange(value: string, totalPages: number) {
