@@ -13,16 +13,13 @@ import Image from "next/image";
 import BrandWordmark from "@/components/BrandWordmark";
 import { fetchJson } from "@/lib/fetch-json";
 import { type ConnectivityLevel, useConnectivityStatus } from "@/lib/hooks/useConnectivityStatus";
+import { formatTicketCode } from "@/lib/ticket-code";
 
 const POLL_INTERVAL_MS = 3000;
 
 interface KioskDisplayData {
   current: { ticketNumber: number; status: "printing" | "printed" } | null;
   upcoming: { ticketNumber: number }[];
-}
-
-function formatTicket(ticketNumber: number): string {
-  return `#${String(ticketNumber).padStart(3, "0")}`;
 }
 
 /**
@@ -101,9 +98,9 @@ function KioskDisplayView() {
   const headline = !isOnline
     ? "Reconnecting..."
     : current?.status === "printing"
-      ? `Now printing ${formatTicket(current.ticketNumber)}`
+      ? `Now printing ${formatTicketCode(current.ticketNumber)}`
       : current?.status === "printed"
-        ? `${formatTicket(current.ticketNumber)} is ready — please collect`
+        ? `${formatTicketCode(current.ticketNumber)} is ready — please collect`
         : "Scan the QR code to get started";
   const toneClass = !isOnline
     ? "text-slate-500"
@@ -153,7 +150,7 @@ function KioskDisplayView() {
                 <div className="flex flex-wrap gap-2">
                   {upcoming.map((job) => (
                     <span key={job.ticketNumber} className="rounded-xl bg-white/10 px-3 py-1.5 text-lg font-black text-slate-200">
-                      {formatTicket(job.ticketNumber)}
+                      {formatTicketCode(job.ticketNumber)}
                     </span>
                   ))}
                 </div>

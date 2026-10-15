@@ -28,6 +28,15 @@ import { claimJobAsPaid, expireJobIfPending, getJob, updateJob, type PrintJobRec
  * job unchanged, and the banner's payment lines fall back accordingly.
  */
 export async function enrichJobWithRazorpayPaymentDetails(job: PrintJobRecord): Promise<PrintJobRecord> {
+  // A free staff print's `provider` column is still set to a real gateway
+  // value (see lib/store.ts's own comment on why) even though it never had
+  // one — check paymentMethod first so this never even considers calling
+  // out to Razorpay for a job that was never a Razorpay payment. This is
+  // the only guard that actually matters here, since job.paymentId and
+  // job.providerMeta?.paymentRef are both always empty for a staff job
+  // regardless, which the check two lines down would already catch safely
+  // — this one is just more honest about why.
+  if (job.paymentMethod === "staff") return job;
   if (job.provider !== "razorpay") return job;
   const paymentId = job.paymentId || job.providerMeta?.paymentRef;
   if (!paymentId) return job;

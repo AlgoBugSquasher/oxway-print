@@ -29,6 +29,7 @@ function createMockQueryBuilder(results: { data: unknown; error: unknown }[]) {
 
 const mockAdmin = vi.hoisted(() => ({
   current: null as ReturnType<typeof createMockQueryBuilder> | null,
+  logAuditCalls: [] as Record<string, unknown>[],
 }));
 
 vi.mock("./supabase-admin", () => ({
@@ -37,9 +38,17 @@ vi.mock("./supabase-admin", () => ({
   }),
 }));
 
+vi.mock("./audit", () => ({
+  logAudit: (input: Record<string, unknown>) => {
+    mockAdmin.logAuditCalls.push(input);
+    return Promise.resolve();
+  },
+}));
+
 beforeEach(() => {
   vi.resetModules();
   mockAdmin.current = null;
+  mockAdmin.logAuditCalls.length = 0;
 });
 
 describe("claimPendingKioskCommand", () => {
@@ -94,5 +103,34 @@ describe("finishKioskCommand", () => {
     expect(patch.status).toBe("done");
     expect(patch.result).toBe("Updated successfully to abc1234.");
     expect(typeof patch.finished_at).toBe("string");
+  });
+
+  it("logs the result once the updated row comes back — requirement #2's 'with result'", async () => {
+    mockAdmin.current = createMockQueryBuilder([
+      { data: { kiosk_id: "oxway_01", command: "restart", requested_by: "owner-1" }, error: null },
+    ]);
+    const { finishKioskCommand } = await import("./kiosk-commands");
+
+    await finishKioskCommand("cmd-1", "failed", "Agent offline.");
+
+    expect(mockAdmin.logAuditCalls).toEqual([
+      {
+        action: "kiosk_command_finished",
+        actorUserId: "owner-1",
+        kioskId: "oxway_01",
+        targetType: "kiosk",
+        targetId: "oxway_01",
+        details: { command: "restart", status: "failed", result: "Agent offline." },
+      },
+    ]);
+  });
+
+  it("never logs when the updated row can't be read back (e.g. the command id no longer exists)", async () => {
+    mockAdmin.current = createMockQueryBuilder([{ data: null, error: null }]);
+    const { finishKioskCommand } = await import("./kiosk-commands");
+
+    await finishKioskCommand("cmd-missing", "done", "ok");
+
+    expect(mockAdmin.logAuditCalls).toHaveLength(0);
   });
 });

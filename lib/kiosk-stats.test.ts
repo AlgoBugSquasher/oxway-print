@@ -15,19 +15,23 @@ interface MockKioskRow {
   cartridge_max_pages: number;
   total_revenue: number;
   total_lifetime_prints: number;
+  free_print_count: number;
+  free_print_pages: number;
+  free_print_waived_amount: number;
 }
 
 const mock = vi.hoisted(() => ({
   kioskRowsById: new Map<string, MockKioskRow>(),
   selectedIds: [] as string[],
   updateCalls: [] as { id: string; patch: Record<string, unknown> }[],
+  printOrdersInsertCalls: [] as Record<string, unknown>[],
 }));
 
 vi.mock("./supabase-admin", () => ({
   supabaseAdmin: () => ({
     from: (table: string) => {
       if (table === "print_orders") {
-        return { insert: () => Promise.resolve({ data: null, error: null }) };
+        return { insert: (row: Record<string, unknown>) => { mock.printOrdersInsertCalls.push(row); return Promise.resolve({ data: null, error: null }); } };
       }
       // table === "kiosk_status"
       return {
@@ -59,6 +63,9 @@ function seedKiosk(id: string, overrides: Partial<MockKioskRow> = {}) {
     cartridge_max_pages: 1500,
     total_revenue: 0,
     total_lifetime_prints: 0,
+    free_print_count: 0,
+    free_print_pages: 0,
+    free_print_waived_amount: 0,
     ...overrides,
   });
 }
@@ -71,6 +78,7 @@ describe("recordCompletedPrint", () => {
     mock.kioskRowsById.clear();
     mock.selectedIds = [];
     mock.updateCalls = [];
+    mock.printOrdersInsertCalls = [];
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
@@ -129,5 +137,56 @@ describe("recordCompletedPrint", () => {
 
     const trayAlerts = warnSpy.mock.calls.filter((call: unknown[]) => String(call[0]).includes("paper tray"));
     expect(trayAlerts).toHaveLength(1);
+  });
+
+  // Free staff prints (ROADMAP-style staff-print feature, #13): excluded
+  // from revenue, tracked in their own running counters instead, still
+  // counted toward physical paper/toner consumption like any other print.
+  describe("isFree", () => {
+    it("bumps free_print_* instead of total_revenue, using `amount` as the waived value", async () => {
+      seedKiosk("oxway_01", { total_revenue: 50, free_print_count: 2, free_print_pages: 8, free_print_waived_amount: 16 });
+      const { recordCompletedPrint } = await import("./kiosk-stats");
+
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 3, amount: 6, colorMode: false, isFree: true });
+
+      const patch = mock.updateCalls[0].patch;
+      expect(patch.total_revenue).toBeUndefined(); // never touched for a free print
+      expect(patch.free_print_count).toBe(3);
+      expect(patch.free_print_pages).toBe(11);
+      expect(patch.free_print_waived_amount).toBe(22);
+    });
+
+    it("still increments physical paper/toner consumption for a free print — the paper was real even if the print wasn't billed", async () => {
+      seedKiosk("oxway_01", { tray_pages: 10, cartridge_pages: 10, total_lifetime_prints: 20 });
+      const { recordCompletedPrint } = await import("./kiosk-stats");
+
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 4, amount: 8, colorMode: false, isFree: true });
+
+      const patch = mock.updateCalls[0].patch;
+      expect(patch.tray_pages).toBe(14);
+      expect(patch.cartridge_pages).toBe(14);
+      expect(patch.total_lifetime_prints).toBe(24);
+    });
+
+    it("skips the print_orders revenue-history insert entirely for a free print", async () => {
+      seedKiosk("oxway_01");
+      const { recordCompletedPrint } = await import("./kiosk-stats");
+
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 1, amount: 2, colorMode: false, isFree: true });
+
+      expect(mock.printOrdersInsertCalls).toHaveLength(0);
+    });
+
+    it("still inserts into print_orders for a normal (non-free) print — the existing behavior is unchanged", async () => {
+      seedKiosk("oxway_01");
+      const { recordCompletedPrint } = await import("./kiosk-stats");
+
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 1, amount: 2, colorMode: false });
+
+      expect(mock.printOrdersInsertCalls).toHaveLength(1);
+      const patch = mock.updateCalls[0].patch;
+      expect(patch.total_revenue).toBe(2);
+      expect(patch.free_print_count).toBeUndefined();
+    });
   });
 });

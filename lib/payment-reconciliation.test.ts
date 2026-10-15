@@ -12,20 +12,23 @@ const mocks = vi.hoisted(() => ({
   claimJobAsPaid: vi.fn(),
   expireJobIfPending: vi.fn(),
   getJob: vi.fn(),
+  updateJob: vi.fn(),
   notifyPaymentConfirmed: vi.fn(),
   estimateMinutesUntilReady: vi.fn(),
+  fetchRazorpayPaymentDetails: vi.fn(),
 }));
 
 vi.mock("./config", () => ({ PAYMENT_TIMEOUT_SECONDS: 300 }));
 vi.mock("./payment", () => ({ verifyOrder: mocks.verifyOrder }));
+vi.mock("./payment/razorpay", () => ({ fetchRazorpayPaymentDetails: mocks.fetchRazorpayPaymentDetails }));
 vi.mock("./notify", () => ({ notifyPaymentConfirmed: mocks.notifyPaymentConfirmed }));
 vi.mock("./eta", () => ({ estimateMinutesUntilReady: mocks.estimateMinutesUntilReady }));
 vi.mock("./store", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./store")>();
-  return { ...actual, claimJobAsPaid: mocks.claimJobAsPaid, expireJobIfPending: mocks.expireJobIfPending, getJob: mocks.getJob };
+  return { ...actual, claimJobAsPaid: mocks.claimJobAsPaid, expireJobIfPending: mocks.expireJobIfPending, getJob: mocks.getJob, updateJob: mocks.updateJob };
 });
 
-import { reconcilePendingPayment } from "./payment-reconciliation";
+import { enrichJobWithRazorpayPaymentDetails, reconcilePendingPayment } from "./payment-reconciliation";
 import type { PrintJobRecord } from "./store";
 
 function makeJob(overrides: Partial<PrintJobRecord> = {}): PrintJobRecord {
@@ -111,5 +114,47 @@ describe("reconcilePendingPayment", () => {
 
     expect(result.status).toBe("paid");
     expect(mocks.notifyPaymentConfirmed).not.toHaveBeenCalled();
+  });
+
+  // Requirement #9/#18 — the recheck-payments cron (and app/api/verify-payment,
+  // which shares this exact function) must never treat a staff job as
+  // unpaid or touch/expire it. A staff job is created directly as 'paid'
+  // (createStaffPrintJob) — it never passes through 'pending_payment' at
+  // all, which is the ONLY status this whole function ever acts on (see the
+  // very first line of reconcilePendingPayment) — so this is really a
+  // by-construction guarantee, not a special case; this test exists to make
+  // that guarantee explicit and traceable to the requirement, not just
+  // implied by the general "leaves a non-pending_payment job untouched"
+  // test above.
+  it("never touches a staff job — it's never pending_payment to begin with, so the cron/poll's gateway check and expiry path are both fully bypassed", async () => {
+    const staffJob = makeJob({ status: "paid", paymentMethod: "staff", isFree: true, totalPrice: 0, waivedAmount: 12, providerOrderId: "" });
+    const result = await reconcilePendingPayment(staffJob);
+    expect(result).toBe(staffJob);
+    expect(mocks.verifyOrder).not.toHaveBeenCalled();
+    expect(mocks.expireJobIfPending).not.toHaveBeenCalled();
+    expect(mocks.claimJobAsPaid).not.toHaveBeenCalled();
+  });
+});
+
+describe("enrichJobWithRazorpayPaymentDetails", () => {
+  it("never calls fetchRazorpayPaymentDetails for a staff job, even if provider/paymentId happen to be set", async () => {
+    // Deliberately sets provider/paymentId too, to exercise the exact gap a
+    // provider-only (or paymentId-presence-only) check would have — see
+    // lib/refund.ts's own analogous test for the same reasoning.
+    const staffJob = makeJob({ paymentMethod: "staff", provider: "razorpay", paymentId: "pay_should_never_be_used" });
+    const result = await enrichJobWithRazorpayPaymentDetails(staffJob);
+    expect(result).toBe(staffJob);
+    expect(mocks.fetchRazorpayPaymentDetails).not.toHaveBeenCalled();
+  });
+
+  it("still enriches a normal razorpay job with a payment reference", async () => {
+    const job = makeJob({ providerMeta: { paymentRef: "pay_1" } });
+    mocks.fetchRazorpayPaymentDetails.mockResolvedValue({ paymentId: "pay_1", upiTxnId: "123456789012", paidAmountRupees: 10 });
+    mocks.updateJob.mockResolvedValue({ ...job, paymentId: "pay_1", upiTxnId: "123456789012", paidAmount: 10 });
+
+    const result = await enrichJobWithRazorpayPaymentDetails(job);
+
+    expect(mocks.fetchRazorpayPaymentDetails).toHaveBeenCalledWith("pay_1");
+    expect(result.upiTxnId).toBe("123456789012");
   });
 });

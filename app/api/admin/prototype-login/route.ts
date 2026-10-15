@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { logAudit } from "@/lib/audit";
+import { getClientIp } from "@/lib/rate-limit";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
 
 export const runtime = "nodejs";
@@ -55,8 +57,21 @@ export async function POST(request: Request) {
     // instead of typed directly. Sets the same session cookie, so RLS/roles
     // apply exactly as they would for a normal login.
     const supabase = await createSupabaseServerClient();
-    const { error: signInError } = await supabase.auth.signInWithPassword(match);
-    if (signInError) return NextResponse.json({ error: signInError.message }, { status: 401 });
+    const { data, error: signInError } = await supabase.auth.signInWithPassword(match);
+    if (signInError || !data.user) return NextResponse.json({ error: signInError?.message ?? "Could not sign in." }, { status: 401 });
+
+    // Tagged "via: prototype_passcode" (not just "login_success") so an
+    // owner reviewing the audit log can tell the testing-phase shortcut was
+    // used, not just that a real sign-in happened.
+    const role = (data.user.app_metadata as { role?: string } | undefined)?.role ?? "none";
+    await logAudit({
+      action: "login_success",
+      actorUserId: data.user.id,
+      actorRole: role,
+      details: { via: "prototype_passcode" },
+      ip: getClientIp(request),
+      userAgent: request.headers.get("user-agent"),
+    });
 
     return NextResponse.json({ ok: true });
   } catch (error) {

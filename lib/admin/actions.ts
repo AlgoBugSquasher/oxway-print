@@ -88,3 +88,16 @@ export async function updatePricing(priceBw: number, priceColor: number): Promis
   const { error } = await supabase.rpc("update_pricing", { p_price_bw: priceBw, p_price_color: priceColor });
   if (error) throw new Error(error.message);
 }
+
+/**
+ * Records a new paper/toner baseline — "Set current paper level"/"Paper
+ * refilled" both call this with kind "paper", "Set cartridge page
+ * count"/"Toner replaced" both call it with kind "toner". The RPC itself
+ * writes the refill_events row and its audit entry in one transaction; see
+ * supabase/schema.sql §10d.
+ */
+export async function recordRefill(kioskId: string, kind: "paper" | "toner", quantity: number, note?: string): Promise<void> {
+  const supabase = createSupabaseBrowserClient();
+  const { error } = await supabase.rpc("record_refill", { p_kiosk_id: kioskId, p_kind: kind, p_quantity: quantity, p_note: note ?? null });
+  if (error) throw new Error(error.message);
+}

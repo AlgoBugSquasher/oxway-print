@@ -9,6 +9,14 @@ export interface CompletedPrintStats {
   pagesPrinted: number;
   amount: number;
   colorMode: boolean;
+  /**
+   * True for a free staff/owner print (job.isFree) — when set, this
+   * completed print bumps free_print_count/free_print_pages/
+   * free_print_waived_amount instead of total_revenue, and `amount` is
+   * read as the waived value for that counter, not real revenue. See the
+   * admin dashboard's "Free staff prints" summary.
+   */
+  isFree?: boolean;
 }
 
 export interface KioskCounters {
@@ -93,12 +101,18 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
   try {
     const supabase = supabaseAdmin();
 
-    await supabase.from("print_orders").insert({
-      pages_printed: stats.pagesPrinted,
-      amount: stats.amount,
-      color_mode: stats.colorMode,
-      status: "completed",
-    });
+    // print_orders is revenue history specifically — a free staff print
+    // never had any revenue to log here (see free_print_* below for where
+    // it IS tracked instead), so it's deliberately skipped rather than
+    // inserting a meaningless ₹0 "order."
+    if (!stats.isFree) {
+      await supabase.from("print_orders").insert({
+        pages_printed: stats.pagesPrinted,
+        amount: stats.amount,
+        color_mode: stats.colorMode,
+        status: "completed",
+      });
+    }
 
     const { data: kiosk, error } = await supabase
       .from("kiosk_status")
@@ -111,20 +125,31 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
       return null;
     }
 
+    // Paper/toner consumption is physical and real regardless of who paid
+    // for it, so tray/cartridge/total_lifetime_prints always increment —
+    // only the MONEY side (total_revenue vs. free_print_*) branches on
+    // isFree below.
     const trayPages = (kiosk.tray_pages || 0) + stats.pagesPrinted;
     const cartridgePages = (kiosk.cartridge_pages || 0) + stats.pagesPrinted;
-    const totalRevenue = Number(kiosk.total_revenue || 0) + Number(stats.amount);
     const totalLifetimePrints = (kiosk.total_lifetime_prints || 0) + stats.pagesPrinted;
     const trayMaxPages = kiosk.tray_max_pages || 150;
     const cartridgeMaxPages = kiosk.cartridge_max_pages || 1500;
+
+    const moneyColumns = stats.isFree
+      ? {
+          free_print_count: (kiosk.free_print_count || 0) + 1,
+          free_print_pages: (kiosk.free_print_pages || 0) + stats.pagesPrinted,
+          free_print_waived_amount: Number(kiosk.free_print_waived_amount || 0) + Number(stats.amount),
+        }
+      : { total_revenue: Number(kiosk.total_revenue || 0) + Number(stats.amount) };
 
     await supabase
       .from("kiosk_status")
       .update({
         tray_pages: trayPages,
         cartridge_pages: cartridgePages,
-        total_revenue: totalRevenue,
         total_lifetime_prints: totalLifetimePrints,
+        ...moneyColumns,
         updated_at: new Date().toISOString(),
       })
       .eq("id", kioskId);

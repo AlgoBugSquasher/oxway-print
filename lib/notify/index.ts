@@ -1,5 +1,6 @@
 import { getActiveNotifyProvider, OWNER_ALERT_PHONE } from "../config";
 import { shortRequestId } from "../request-id";
+import { formatTicketCode } from "../ticket-code";
 import { consoleProvider } from "./console";
 import { msg91Provider } from "./msg91";
 import type { NotifyProvider } from "./types";
@@ -37,7 +38,7 @@ export async function notifyPaymentConfirmed(job: { id: string; phoneNumber: str
  * same code against the kiosk screen, not the Request ID.
  */
 export async function notifyPrintCompleted(job: { id: string; phoneNumber: string; ticketNumber?: number }): Promise<void> {
-  const pickupCode = job.ticketNumber != null ? `#${String(job.ticketNumber).padStart(3, "0")}` : shortRequestId(job.id);
+  const pickupCode = job.ticketNumber != null ? formatTicketCode(job.ticketNumber) : shortRequestId(job.id);
   await activeProvider().send(
     job.phoneNumber,
     `OXWAY: Your print is ready! Show pickup code ${pickupCode} at the kiosk to collect it.`

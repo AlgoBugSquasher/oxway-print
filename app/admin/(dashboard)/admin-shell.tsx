@@ -3,18 +3,24 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
+import { ClipboardList, Gift, LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
 import BrandWordmark from "@/components/BrandWordmark";
-import { createSupabaseBrowserClient } from "@/lib/supabase";
+import { AdminRoleProvider } from "@/lib/admin/role-context";
+import { fetchJson } from "@/lib/fetch-json";
 import type { AdminRole } from "@/lib/admin/types";
 
 export default function AdminShell({ children, email, role }: { children: ReactNode; email: string; role: AdminRole }) {
   const pathname = usePathname();
   const router = useRouter();
 
+  // Server-side now (app/api/admin/sign-out) — not a direct
+  // supabase.auth.signOut() call from here — so it can be audited; see
+  // that route's own docstring.
   const handleSignOut = async () => {
-    const supabase = createSupabaseBrowserClient();
-    await supabase.auth.signOut();
+    await fetchJson("/api/admin/sign-out", { method: "POST" }).catch(() => {
+      // Best-effort — even if the audit write or the route itself fails,
+      // the admin still expects to land back on the login page.
+    });
     router.push("/admin/login");
     router.refresh();
   };
@@ -22,8 +28,16 @@ export default function AdminShell({ children, email, role }: { children: ReactN
   const navItems = [
     { href: "/admin", label: "Overview", icon: LayoutDashboard },
     { href: "/admin/jobs", label: "Jobs", icon: ListOrdered },
+    // Free printing — owner AND staff, same two roles app/api/staff-print's
+    // own server-side check allows (never gated to owner-only like Pricing
+    // below).
+    ...(role === "owner" || role === "staff" ? [{ href: "/admin/print", label: "Print", icon: Gift }] : []),
     // Pricing is revenue-adjacent — owner only, same as the rest of §4 in the write-permissions table.
     ...(role === "owner" ? [{ href: "/admin/pricing", label: "Pricing", icon: Tags }] : []),
+    // Audit log — owner only (the RLS policy backing it refuses staff/anon
+    // regardless, this just avoids showing a nav link to a page that would
+    // only ever render empty/403 for them).
+    ...(role === "owner" ? [{ href: "/admin/audit", label: "Audit log", icon: ClipboardList }] : []),
   ];
 
   return (
@@ -58,7 +72,9 @@ export default function AdminShell({ children, email, role }: { children: ReactN
           </button>
         </div>
       </header>
-      <main className="mx-auto max-w-6xl px-5 py-8 lg:px-8">{children}</main>
+      <main className="mx-auto max-w-6xl px-5 py-8 lg:px-8">
+        <AdminRoleProvider role={role}>{children}</AdminRoleProvider>
+      </main>
     </div>
   );
 }

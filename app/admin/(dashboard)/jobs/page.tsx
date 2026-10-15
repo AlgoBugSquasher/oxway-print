@@ -1,11 +1,14 @@
 "use client";
 
-import { type FormEvent, useCallback, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { Ban, IndianRupee, RefreshCw, RotateCcw, Search } from "lucide-react";
 import { cancelJob, forceReprintJob, markJobRefunded } from "@/lib/admin/actions";
+import { useAdminRole } from "@/lib/admin/role-context";
+import { fetchJson } from "@/lib/fetch-json";
 import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
-import type { AdminJobRow, AdminRole } from "@/lib/admin/types";
+import type { AdminJobRow } from "@/lib/admin/types";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
+import { formatTicketCode } from "@/lib/ticket-code";
 import LiveIndicator from "../live-indicator";
 import StatusBadge from "../status-badge";
 
@@ -21,8 +24,28 @@ interface JobFilters {
 }
 
 export default function AdminJobsPage() {
-  const [role, setRole] = useState<AdminRole>("none");
+  // From the server-rendered layout (see lib/admin/role-context.tsx) —
+  // never re-fetched here. A role-gated button is a UX nicety, not the real
+  // security boundary (every action below re-checks server-side), so there
+  // was never a reason for this page to pay for its own
+  // supabase.auth.getUser() network round trip on mount AND on every 5s
+  // auto-refresh tick just to decide which buttons to show.
+  const role = useAdminRole();
   const [jobs, setJobs] = useState<AdminJobRow[]>([]);
+  // Resolves a staff job's created_by_user_id to a readable email for the
+  // "Created by" column — print_jobs_admin_view can't join auth.users
+  // directly (no PostgREST access to that schema), so this is fetched once
+  // from a small dedicated route instead (see that route's own comment).
+  // Best-effort: a failure here just leaves "Created by" showing the raw id
+  // for staff jobs rather than breaking the whole jobs list.
+  const [staffEmailsById, setStaffEmailsById] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    fetchJson<{ users: { id: string; email: string }[] }>("/api/admin/staff-users")
+      .then((result) => setStaffEmailsById(new Map(result.users.map((u) => [u.id, u.email]))))
+      .catch(() => {
+        // Non-fatal — see this state's own comment above.
+      });
+  }, []);
   // The form's own draft values — typing here never touches the actual
   // query (see appliedFiltersRef below), so a background refresh re-running
   // the last *submitted* search can never clobber a half-typed one.
@@ -42,9 +65,6 @@ export default function AdminJobsPage() {
 
   const fetchData = useCallback(async () => {
     const supabase = createSupabaseBrowserClient();
-
-    const { data: { user } } = await supabase.auth.getUser();
-    setRole(((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none");
 
     const { search: appliedSearch, statusFilter: appliedStatusFilter, sinceDate: appliedSinceDate } = appliedFiltersRef.current;
     let query = supabase.from("print_jobs_admin_view").select("*").order("created_at", { ascending: false }).limit(100);
@@ -133,6 +153,7 @@ export default function AdminJobsPage() {
               <th className="px-4 py-3 font-bold">Phone</th>
               <th className="px-4 py-3 font-bold">Kiosk</th>
               <th className="px-4 py-3 font-bold">Price</th>
+              <th className="px-4 py-3 font-bold">Created by</th>
               <th className="px-4 py-3 font-bold">Created</th>
               <th className="px-4 py-3 font-bold">Actions</th>
             </tr>
@@ -140,15 +161,23 @@ export default function AdminJobsPage() {
           <tbody>
             {jobs.map((job) => (
               <tr key={job.id} className="border-b border-slate-50 last:border-0 align-top">
-                <td className="max-w-[180px] truncate px-4 py-3" title={job.id}>{job.file_name}</td>
-                <td className="px-4 py-3 font-bold text-blue-600">{job.ticket_number != null ? `#${String(job.ticket_number).padStart(3, "0")}` : "—"}</td>
+                <td className="max-w-[180px] truncate px-4 py-3" title={job.id}>
+                  {job.is_free && <span className="mr-1.5 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700">STAFF</span>}
+                  {job.file_name}
+                </td>
+                <td className="px-4 py-3 font-bold text-blue-600">{job.ticket_number != null ? formatTicketCode(job.ticket_number) : "—"}</td>
                 <td className="px-4 py-3"><StatusBadge status={job.status} /></td>
                 <td className="px-4 py-3 text-slate-500">{job.phone_number}</td>
                 <td className="px-4 py-3 text-slate-500">{job.kiosk_id}</td>
                 <td className="px-4 py-3">
-                  {job.total_price !== null ? `₹${Number(job.total_price).toFixed(2)}` : "—"}
+                  {/* A staff job's own total_price is always 0 — waived_amount (what it
+                     WOULD have cost) is the number actually worth showing here. */}
+                  {job.is_free
+                    ? <span className="text-emerald-700">FREE{job.waived_amount !== null && ` (₹${Number(job.waived_amount).toFixed(2)} waived)`}</span>
+                    : job.total_price !== null ? `₹${Number(job.total_price).toFixed(2)}` : "—"}
                   {job.refunded_at && <span className="ml-1.5 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">refunded</span>}
                 </td>
+                <td className="px-4 py-3 text-slate-500">{job.created_by_user_id ? (staffEmailsById.get(job.created_by_user_id) ?? job.created_by_user_id.slice(0, 8)) : "—"}</td>
                 <td className="px-4 py-3 text-slate-500">{new Date(job.created_at).toLocaleString("en-IN")}</td>
                 <td className="px-4 py-3">
                   <div className="flex flex-wrap gap-1.5">
@@ -173,7 +202,9 @@ export default function AdminJobsPage() {
                         onClick={() => runAction(job.id, () => cancelJob(job.id))}
                       />
                     )}
-                    {role === "owner" && REFUNDABLE_STATUSES.includes(job.status) && !job.refunded_at && (
+                    {/* A free staff job was never charged — nothing to refund, see
+                       lib/refund.ts's own staff_job guard, which this mirrors in the UI. */}
+                    {role === "owner" && !job.is_free && REFUNDABLE_STATUSES.includes(job.status) && !job.refunded_at && (
                       <ActionButton
                         icon={IndianRupee}
                         label="Refund"

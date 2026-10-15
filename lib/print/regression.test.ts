@@ -2,7 +2,7 @@ import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
 import { describe, expect, it } from "vitest";
 import { computeBillableSheets, computeOrderPrice } from "../pricing";
 import type { PrintJobRecord, PrintSettingsSnapshot } from "../store";
-import { appendBannerPage, resetInstaQrCacheForTests } from "./banner";
+import { prependBannerPage, resetQrMatrixCacheForTests } from "./banner";
 import { buildLpArgs } from "./cups";
 import { expandCopies, extractSelectedPages } from "./pdf";
 import { physicalSheetsForJob } from "./sheets";
@@ -10,7 +10,7 @@ import { physicalSheetsForJob } from "./sheets";
 // Part 2 regression suite: every existing print customization (page
 // selection, orientation, copies, color) exercised together through the
 // REAL processing functions — extractSelectedPages, expandCopies,
-// appendBannerPage, buildLpArgs, and the price/sheet-count math — so a
+// prependBannerPage, buildLpArgs, and the price/sheet-count math — so a
 // change to any one of them that breaks another is caught here, not in
 // production. One command runs this whole file along with the rest of the
 // suite: `npm test` (vitest run). This file alone: `npx vitest run
@@ -188,8 +188,8 @@ describe("full pipeline regression (selection, copies, color, lp args, price/she
 
   describe.each([1, 2, 3])("copies=%d", (copies) => {
     describe.each([false, true])("isColor=%s", (isColor) => {
-      it("produces the right content order, banner exactly once (last), correct lp args, and price/sheets matching what the customer was shown", async () => {
-        resetInstaQrCacheForTests();
+      it("produces the right content order, banner exactly once (first), correct lp args, and price/sheets matching what the customer was shown", async () => {
+        resetQrMatrixCacheForTests();
 
         const settings: PrintSettingsSnapshot = { copies, layout: "portrait", isColor, paperSize: "A4", pagesPerSheet: 1 };
         const selectedPages = [1, 3]; // non-contiguous selection, on purpose
@@ -199,14 +199,14 @@ describe("full pipeline regression (selection, copies, color, lp args, price/she
         expect(extracted.pageCount).toBe(2);
 
         const expanded = await expandCopies(extracted.bytes, settings.copies);
-        const withBanner = await appendBannerPage(expanded, makeTestJob(settings, selectedPages));
+        const withBanner = await prependBannerPage(expanded, makeTestJob(settings, selectedPages));
         const doc = await PDFDocument.load(withBanner);
         const pages = doc.getPages();
 
-        // copies * 2 content pages, then exactly one banner page, last.
+        // Exactly one banner page, first, then copies * 2 content pages.
         expect(pages.length).toBe(copies * 2 + 1);
-        pages.slice(0, -1).forEach((page) => expect(isLandscapeShaped(page)).toBe(false)); // portrait requested, every content page matches
-        const bannerPage = pages.at(-1)!;
+        pages.slice(1).forEach((page) => expect(isLandscapeShaped(page)).toBe(false)); // portrait requested, every content page matches
+        const bannerPage = pages[0];
         expect(isLandscapeShaped(bannerPage)).toBe(false); // banner follows the same portrait content orientation
         // Exactly one banner-sized page — never one per copy.
         const a4PortraitLikePages = pages.filter((page) => page.getHeight() > 800);
@@ -244,12 +244,12 @@ describe("full pipeline regression (selection, copies, color, lp args, price/she
   });
 
   it("landscape layout produces the matching lp args and an equally-landscape banner, independent of copies/color", async () => {
-    resetInstaQrCacheForTests();
+    resetQrMatrixCacheForTests();
     const settings: PrintSettingsSnapshot = { copies: 2, layout: "landscape", isColor: true, paperSize: "Letter", pagesPerSheet: 2 };
     const fixture = await buildAllPortraitFixture(2);
     const extracted = await extractSelectedPages(fixture, [1, 2], settings.layout);
     const expanded = await expandCopies(extracted.bytes, settings.copies);
-    const withBanner = await appendBannerPage(expanded, makeTestJob(settings, [1, 2]));
+    const withBanner = await prependBannerPage(expanded, makeTestJob(settings, [1, 2]));
     const doc = await PDFDocument.load(withBanner);
     const pages = doc.getPages();
 

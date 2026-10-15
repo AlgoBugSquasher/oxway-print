@@ -4,11 +4,14 @@
  * from the website. The website can be hosted anywhere; this script just
  * needs outbound access to Supabase and a local CUPS printer.
  *
- * Loop: poll Supabase for jobs the website has marked "paid" -> claim one
- * atomically (so a second agent instance, if you ever ran one, can't double
- * print it) -> download its print-ready PDF from Supabase Storage -> submit
- * to CUPS -> wait for it to leave the print queue -> mark "printed", notify
- * the customer, and log the completed print for the admin dashboard.
+ * Loop: atomically claim the oldest ready-to-print job across the whole
+ * kiosk queue — paid customer jobs and free staff prints share this one
+ * queue with no priority, ordered strictly by when each became "paid," not
+ * by who created it (see claimNextPaidJob's own docstring) — download its
+ * print-ready PDF from Supabase Storage, submit to CUPS, wait for it to
+ * leave the print queue, mark "printed", notify the customer, and log the
+ * completed print for the admin dashboard. Repeats until the queue is
+ * empty for this tick.
  *
  * Run with:  npx tsx print-agent/index.ts
  * (see package.json's "print-agent" script)
@@ -29,12 +32,13 @@ import { AGENT_API_SECRET, BASE_URL, KIOSK_HEARTBEAT_INTERVAL_MS, KIOSK_ID, PRIN
 import { failDanglingRunningCommand, finishKioskCommand } from "../lib/kiosk-commands";
 import { recordAgentBoot, recordCompletedPrint, touchKioskHeartbeat } from "../lib/kiosk-stats";
 import { enrichJobWithRazorpayPaymentDetails } from "../lib/payment-reconciliation";
-import { appendBannerPage } from "../lib/print/banner";
+import { prependBannerPage } from "../lib/print/banner";
 import { cancelPrintJob, getCupsJobQueueState, submitPrintJob } from "../lib/print/cups";
 import { expandCopies } from "../lib/print/pdf";
+import { computeMinimumReadyAtMs, decidePrintWatchOutcome, needsWarmup } from "../lib/print/ready-timing";
 import { physicalSheetsForJob } from "../lib/print/sheets";
 import { attemptRefund } from "../lib/refund";
-import { claimJobForPrinting, downloadJobPdf, listPaidJobs, updateJob, type PrintJobRecord } from "../lib/store";
+import { claimNextPaidJob, downloadJobPdf, updateJob, type PrintJobRecord } from "../lib/store";
 import { getCurrentCommit, flushPendingResult, processKioskCommand } from "./kiosk-update";
 import { readPendingCommandResult } from "./pending-command-result";
 import { clearUpdateMarker, readUpdateMarker } from "./update-marker";
@@ -46,6 +50,16 @@ const QUEUE_POLL_INTERVAL_MS = 1000;
 // A job stuck in the CUPS queue this long is treated as failed rather than
 // leaving the customer waiting forever — see failJob below.
 const QUEUE_POLL_TIMEOUT_MS = 2 * 60 * 1000;
+
+/**
+ * When the printer last actually finished a job, for needsWarmup's own
+ * "has it been idle a while" check (see lib/print/ready-timing.ts) — module
+ * state, not persisted, so it resets to null (and therefore always "needs
+ * warmup") on every agent restart. That's deliberately conservative: a
+ * restart tells us nothing about how long the printer was actually idle
+ * before it.
+ */
+let lastJobFinishedAtMs: number | null = null;
 
 /**
  * Pings the website's app/api/agent/notify whenever this job hits a
@@ -82,10 +96,14 @@ async function notifyAgentTerminalState(jobId: string): Promise<void> {
   }
 }
 
+/**
+ * Prints one job that claimNextPaidJob (pollLoop below) has ALREADY
+ * atomically claimed — its status is already 'printing' by the time this
+ * runs, so unlike the old version of this function, there's no claim to
+ * attempt (and no "someone else already got it" case to handle) here
+ * anymore; that race is fully resolved before processJob is ever called.
+ */
 async function processJob(job: PrintJobRecord): Promise<void> {
-  const claimed = await claimJobForPrinting(job.id);
-  if (!claimed) return; // Someone/something else already claimed it.
-
   const tempDir = await mkdtemp(path.join(tmpdir(), "oxway-print-"));
   const tempPdfPath = path.join(tempDir, `${job.id}.pdf`);
   // Declared outside the try block (not `const` inside it) so the catch
@@ -100,26 +118,39 @@ async function processJob(job: PrintJobRecord): Promise<void> {
     // Copies are baked directly into the PDF (copy 1's pages, then copy
     // 2's, etc.) rather than left to CUPS's own -n/collate handling — see
     // expandCopies' own docstring for why — so the single banner page
-    // appended next lands once at the very end of the whole job, not once
-    // per copy.
+    // prepended next lands once at the very front of the whole job, ahead
+    // of every copy, not once per copy.
     pdfBytes = await expandCopies(pdfBytes, job.settings.copies);
     if (job.includeBannerPage) {
       // The UPI transaction id is usually already saved by the time a job
       // reaches printing (see reconcilePendingPayment's own enrichment
       // call) — this is only a second, best-effort try for the case it
-      // genuinely wasn't settled at Razorpay yet back then.
-      if (job.provider === "razorpay" && !job.upiTxnId) {
+      // genuinely wasn't settled at Razorpay yet back then. Explicitly
+      // skipped for a staff job (payment_method === "staff") even though
+      // enrichJobWithRazorpayPaymentDetails would itself safely no-op for
+      // one anyway (no paymentId/providerMeta.paymentRef ever gets set) —
+      // never worth a real network round trip to Razorpay for a job that
+      // was never a Razorpay payment to begin with.
+      if (job.paymentMethod !== "staff" && job.provider === "razorpay" && !job.upiTxnId) {
         job = await enrichJobWithRazorpayPaymentDetails(job);
       }
-      pdfBytes = await appendBannerPage(pdfBytes, job);
+      pdfBytes = await prependBannerPage(pdfBytes, job);
     }
     await writeFile(tempPdfPath, pdfBytes);
 
     cupsJobId = await submitPrintJob(tempPdfPath, job.settings);
-    await updateJob(job.id, { cupsJobId });
+    const spooledAtMs = Date.now();
+    await updateJob(job.id, { cupsJobId, spooledAt: new Date(spooledAtMs).toISOString() });
     console.log(`[print-agent] Submitted to CUPS as ${cupsJobId}, watching queue...`);
 
-    await watchUntilPrinted(job, cupsJobId);
+    // claimed_at is stamped by claim_next_paid_job() itself (see that RPC),
+    // so it's already on `job` by the time processJob ever runs — falling
+    // back to "now" only guards against a job claimed before this column
+    // existed, which should never actually happen in practice.
+    const claimedAtMs = job.claimedAt ? new Date(job.claimedAt).getTime() : spooledAtMs;
+    const warmupNeeded = needsWarmup(claimedAtMs, lastJobFinishedAtMs);
+
+    await watchUntilPrinted(job, cupsJobId, { spooledAtMs, warmupNeeded });
   } catch (error) {
     await failJob(job, error instanceof Error ? error.message : "Unknown printing error.", cupsJobId);
   } finally {
@@ -148,10 +179,13 @@ async function failJob(job: PrintJobRecord, reason: string, cupsJobId?: string):
   await updateJob(job.id, { status: "print_failed", error: reason });
 
   // Automatic, not waiting on staff to notice and click the admin panel's
-  // refund button. Safe to call unconditionally: `job` here is the pre-claim
-  // record (never refunded yet), and attemptRefund's own already-refunded
-  // guard makes this a no-op rather than a double refund if it's ever
-  // somehow called twice for the same failure.
+  // refund button. Safe to call unconditionally: `job` here has never been
+  // refunded yet, and attemptRefund's own already-refunded guard makes this
+  // a no-op rather than a double refund if it's ever somehow called twice
+  // for the same failure. A free staff print (payment_method === "staff")
+  // never reaches Razorpay/Cashfree at all here — attemptRefund's own first
+  // check skips straight to the "staff_job" branch below — see that
+  // function's own comment for why.
   try {
     const result = await attemptRefund(job);
     if (result.ok) {
@@ -162,6 +196,8 @@ async function failJob(job: PrintJobRecord, reason: string, cupsJobId?: string):
       await notifyAgentTerminalState(job.id);
     } else if (result.reason === "no_captured_payment") {
       console.warn(`[print-agent] Could not auto-refund job ${job.id}: no captured payment reference.`);
+    } else if (result.reason === "staff_job") {
+      console.log(`[print-agent] Job ${job.id} was a free staff print — no refund needed.`);
     }
   } catch (refundError) {
     // A failed refund attempt must never crash the poll loop or mask the
@@ -171,34 +207,87 @@ async function failJob(job: PrintJobRecord, reason: string, cupsJobId?: string):
   }
 }
 
-async function watchUntilPrinted(job: PrintJobRecord, cupsJobId: string): Promise<void> {
-  const deadline = Date.now() + QUEUE_POLL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
+/**
+ * Watches a submitted CUPS job until it's genuinely done — "genuinely" per
+ * decidePrintWatchOutcome in lib/print/ready-timing.ts, which requires BOTH
+ * CUPS (+printer-idle, see getCupsJobQueueState) reporting the job
+ * completed AND the minimum-print-time floor to have elapsed, so "ready"
+ * can never fire before the printer could plausibly have actually finished.
+ * A CUPS error always wins immediately, floor or no floor — a paper jam
+ * doesn't get more plausible by waiting it out.
+ */
+async function watchUntilPrinted(
+  job: PrintJobRecord,
+  cupsJobId: string,
+  stageTiming: { spooledAtMs: number; warmupNeeded: boolean },
+): Promise<void> {
+  const physicalSheets = physicalSheetsForJob(job);
+  const minimumReadyAtMs = computeMinimumReadyAtMs(stageTiming.spooledAtMs, physicalSheets, stageTiming.warmupNeeded);
+  const deadlineMs = Date.now() + QUEUE_POLL_TIMEOUT_MS;
+  // Set once, the first tick CUPS+the printer report the job done — even if
+  // the floor hasn't elapsed yet, so the persisted timestamp reflects when
+  // the printer actually finished, not when the floor let "printed" fire.
+  let printerIdleAtMs: number | null = null;
+
+  for (;;) {
     await sleep(QUEUE_POLL_INTERVAL_MS);
-    const state = await getCupsJobQueueState(cupsJobId);
+    const cupsState = await getCupsJobQueueState(cupsJobId);
 
-    if (state === "completed") {
-      await updateJob(job.id, { status: "printed" });
-      console.log(`[print-agent] Job ${job.id} printed.`);
-
-      await notifyAgentTerminalState(job.id);
-
-      await recordCompletedPrint(job.kioskId, {
-        pagesPrinted: physicalSheetsForJob(job),
-        amount: job.totalPrice,
-        colorMode: job.settings.isColor,
-      });
-      return;
+    if (cupsState === "completed" && printerIdleAtMs === null) {
+      printerIdleAtMs = Date.now();
+      await updateJob(job.id, { printerIdleAt: new Date(printerIdleAtMs).toISOString() });
     }
 
-    if (state === "error") {
+    const outcome = decidePrintWatchOutcome({ cupsState, nowMs: Date.now(), minimumReadyAtMs, deadlineMs });
+
+    if (outcome.kind === "error") {
       await failJob(job, `CUPS reported job ${cupsJobId} as stopped/held/errored.`, cupsJobId);
       return;
     }
+
+    if (outcome.kind === "timeout") {
+      // Still "active" (or "completed" but the floor itself never cleared
+      // in time, which would mean the floor's own estimate is wildly off)
+      // after the full timeout — stuck rather than genuinely erroring, but
+      // the customer can't be left waiting forever either way.
+      await failJob(job, `Job ${cupsJobId} was still queued after ${QUEUE_POLL_TIMEOUT_MS / 1000}s — treating as stuck.`, cupsJobId);
+      return;
+    }
+
+    if (outcome.kind === "wait") continue;
+
+    // outcome.kind === "ready"
+    const readyAtMs = Date.now();
+    await updateJob(job.id, { status: "printed", readyAt: new Date(readyAtMs).toISOString() });
+    lastJobFinishedAtMs = readyAtMs;
+    console.log(
+      `[print-agent] Job ${job.id} printed. ` +
+        `claim->spool ${stageDurationSeconds(job.claimedAt, stageTiming.spooledAtMs)}s, ` +
+        `spool->printer-idle ${stageDurationSeconds(stageTiming.spooledAtMs, printerIdleAtMs)}s, ` +
+        `printer-idle->ready ${stageDurationSeconds(printerIdleAtMs, readyAtMs)}s.`,
+    );
+
+    await notifyAgentTerminalState(job.id);
+
+    await recordCompletedPrint(job.kioskId, {
+      pagesPrinted: physicalSheets,
+      // A free staff print's own totalPrice is always 0 (see
+      // createStaffPrintJob) — waivedAmount is what recordCompletedPrint
+      // actually accumulates into free_print_waived_amount for one.
+      amount: job.isFree ? (job.waivedAmount ?? 0) : job.totalPrice,
+      colorMode: job.settings.isColor,
+      isFree: job.isFree,
+    });
+    return;
   }
-  // Still "active" after the full timeout — stuck rather than genuinely
-  // erroring, but the customer can't be left waiting forever either way.
-  await failJob(job, `Job ${cupsJobId} was still queued after ${QUEUE_POLL_TIMEOUT_MS / 1000}s — treating as stuck.`, cupsJobId);
+}
+
+/** Formats one stage's duration for the log line in watchUntilPrinted — accepts either endpoint as an ISO string (claimedAt) or an already-resolved ms timestamp, and reports "?" rather than throwing if either end is missing (e.g. printerIdleAtMs can still be null at timeout/error, though this is only ever called on the success path). */
+function stageDurationSeconds(start: string | number | null | undefined, end: string | number | null | undefined): string {
+  if (start == null || end == null) return "?";
+  const startMs = typeof start === "string" ? new Date(start).getTime() : start;
+  const endMs = typeof end === "string" ? new Date(end).getTime() : end;
+  return ((endMs - startMs) / 1000).toFixed(1);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -234,8 +323,16 @@ async function pollLoop(): Promise<void> {
   let hasConfirmedBoot = false;
   for (;;) {
     try {
-      const paidJobs = await listPaidJobs(KIOSK_ID);
-      for (const job of paidJobs) {
+      // Drains the whole queue for this tick, one atomic claim at a time —
+      // claimNextPaidJob picks (and claims, in the same Postgres statement)
+      // whichever ready job has the oldest queue_time across BOTH paid
+      // customer jobs and free staff prints, so this loop processes them in
+      // one single, unbiased FIFO order rather than listing then claiming
+      // each individually (see that function's own docstring for why that
+      // distinction matters under concurrency).
+      for (;;) {
+        const job = await claimNextPaidJob(KIOSK_ID);
+        if (!job) break;
         await processJob(job);
       }
       // Only reached once the paid-job queue for this tick is fully

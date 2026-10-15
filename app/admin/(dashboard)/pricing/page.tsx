@@ -3,13 +3,19 @@
 import { type FormEvent, useCallback, useState } from "react";
 import { RefreshCw, Save, ShieldAlert } from "lucide-react";
 import { updatePricing } from "@/lib/admin/actions";
+import { useAdminRole } from "@/lib/admin/role-context";
 import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
-import type { AdminRole, PricingConfigRow } from "@/lib/admin/types";
+import type { PricingConfigRow } from "@/lib/admin/types";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import LiveIndicator from "../live-indicator";
 
 export default function AdminPricingPage() {
-  const [role, setRole] = useState<AdminRole | null>(null);
+  // From the server-rendered layout (see lib/admin/role-context.tsx) —
+  // never re-fetched here, same reasoning as jobs/page.tsx's own use of
+  // this. The actual owner-only enforcement is update_pricing's own
+  // current_app_role() check; this is only used to decide whether to show
+  // the form or the "owner-only" notice below.
+  const role = useAdminRole();
   const [priceBw, setPriceBw] = useState("");
   const [priceColor, setPriceColor] = useState("");
   const [updatedAt, setUpdatedAt] = useState("");
@@ -24,9 +30,6 @@ export default function AdminPricingPage() {
 
   const fetchData = useCallback(async () => {
     const supabase = createSupabaseBrowserClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    setRole(((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none");
-
     const { data, error: queryError } = await supabase.from("pricing_config").select("*").eq("id", "default").single();
     if (queryError) throw new Error(queryError.message);
     const row = data as PricingConfigRow;
@@ -68,7 +71,7 @@ export default function AdminPricingPage() {
     }
   };
 
-  if (!isLoading && role !== "owner") {
+  if (role !== "owner") {
     return (
       <div className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-5 text-amber-800">
         <ShieldAlert size={18} />

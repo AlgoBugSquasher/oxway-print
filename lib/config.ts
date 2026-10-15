@@ -89,6 +89,38 @@ export const CREATE_ORDER_RATE_LIMIT_WINDOW_SECONDS = 60;
 export const DUPLICATE_ORDER_WINDOW_SECONDS = 60;
 
 /**
+ * Free staff/owner prints (app/api/staff-print) — abuse limits, both
+ * enforced server-side (never trust the client). MAX_PAGES_PER_STAFF_JOB is
+ * a single request's own page count, checked directly against the real
+ * extracted page count (no race risk — it's one job's own data, not a
+ * shared counter). MAX_STAFF_DAILY_PAGES is a running total across however
+ * many jobs one staff user creates in a day, so it's enforced atomically
+ * inside the create_staff_print_job() Postgres function (see that
+ * migration) rather than read-then-written here — two concurrent staff
+ * prints must never both slip past the cap.
+ */
+export const MAX_PAGES_PER_STAFF_JOB = 100;
+export const MAX_STAFF_DAILY_PAGES = 500;
+
+/** Rate limit on /api/staff-print — keyed by the signed-in user's id (not IP, unlike create-order's anonymous customers), reusing the same atomic increment_rate_limit() RPC. Looser than the customer limit: a legitimate staff member printing several real documents in a minute is normal, not abuse. */
+export const STAFF_PRINT_RATE_LIMIT_MAX = 20;
+export const STAFF_PRINT_RATE_LIMIT_WINDOW_SECONDS = 60;
+
+/**
+ * Basic abuse protection on /api/admin/login (and the prototype passcode
+ * login, which shares the same IP key) — reuses the same atomic
+ * increment_rate_limit() RPC, keyed by BOTH the attempted email and the
+ * caller's IP independently, so this blunts both "one IP hammering many
+ * accounts" and "one account hammered from many IPs." This is deliberately
+ * loose, generic abuse mitigation, not the real per-account lockout with
+ * its own cooldown/messaging — that's a separate, larger feature; see
+ * ROADMAP-style account-hardening notes. A legitimate user mistyping their
+ * password a few times must never get rate-limited by this.
+ */
+export const LOGIN_RATE_LIMIT_MAX = 10;
+export const LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60;
+
+/**
  * Heartbeat monitoring (ROADMAP.md #8). Writes to kiosk_status.last_seen_at,
  * a dedicated column separate from updated_at (which also moves on every
  * print-counter update) — the print agent touches it on its own timer,

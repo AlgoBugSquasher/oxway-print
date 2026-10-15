@@ -3,6 +3,7 @@
 // role-gated request_kiosk_command() RPC instead, see lib/admin/actions.ts;
 // this file's service-role functions are the Pi-side half of that pipe,
 // same split as lib/store.ts's claim functions vs. the admin RPCs).
+import { logAudit } from "./audit";
 import { supabaseAdmin } from "./supabase-admin";
 
 export type KioskCommandName = "update" | "restart";
@@ -47,12 +48,35 @@ export async function claimPendingKioskCommand(kioskId: string): Promise<KioskCo
   return { id: row.id, kioskId: row.kiosk_id, command: row.command };
 }
 
+/**
+ * Marks a command done/failed AND logs its result — requirement #2's
+ * "Update kiosk and Restart agent (with result)": request_kiosk_command()
+ * (supabase/schema.sql §7) already logs the REQUEST half the instant an
+ * owner/staff member asks for one; this is the other half, logged from
+ * here (not that RPC) because the result is only ever known once the
+ * print agent itself finishes running the command, which can be minutes
+ * later and on a different machine entirely.
+ */
 export async function finishKioskCommand(commandId: string, status: "done" | "failed", result: string): Promise<void> {
-  const { error } = await supabaseAdmin()
+  const { data, error } = await supabaseAdmin()
     .from("kiosk_commands")
     .update({ status, result, finished_at: new Date().toISOString() })
-    .eq("id", commandId);
+    .eq("id", commandId)
+    .select("kiosk_id, command, requested_by")
+    .maybeSingle();
   if (error) throw new Error(`Could not finish kiosk command ${commandId}: ${error.message}`);
+
+  const row = data as { kiosk_id: string; command: KioskCommandName; requested_by: string | null } | null;
+  if (row) {
+    await logAudit({
+      action: "kiosk_command_finished",
+      actorUserId: row.requested_by,
+      kioskId: row.kiosk_id,
+      targetType: "kiosk",
+      targetId: row.kiosk_id,
+      details: { command: row.command, status, result },
+    });
+  }
 }
 
 /**

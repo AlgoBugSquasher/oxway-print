@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getClientIp } from "@/lib/rate-limit";
 import { attemptRefund } from "@/lib/refund";
 import { getJob } from "@/lib/store";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
@@ -37,13 +38,22 @@ export async function POST(request: Request) {
     // The actual money-movement (and its own already-refunded /
     // no-captured-payment guards) is shared with print-agent/index.ts's
     // automatic refund-on-print-failure (ROADMAP.md §10) — see lib/refund.ts.
-    const result = await attemptRefund(job);
+    // The actor (this signed-in owner) is passed through purely for the
+    // audit entry record_refund() writes — never for authorization, which
+    // the role check above already settled.
+    const result = await attemptRefund(job, {
+      userId: user.id,
+      role,
+      ip: getClientIp(request),
+      userAgent: request.headers.get("user-agent"),
+    });
     if (!result.ok) {
-      return jsonError(
-        result.reason === "already_refunded"
-          ? "This job was already refunded."
-          : "No captured payment reference on this job — nothing to refund."
-      );
+      const messages: Record<typeof result.reason, string> = {
+        already_refunded: "This job was already refunded.",
+        no_captured_payment: "No captured payment reference on this job — nothing to refund.",
+        staff_job: "This was a free staff print — nothing was charged, so there's nothing to refund.",
+      };
+      return jsonError(messages[result.reason]);
     }
 
     return NextResponse.json({ refundId: result.refundId });

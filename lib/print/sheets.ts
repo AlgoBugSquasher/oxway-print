@@ -3,9 +3,9 @@ import type { PrintJobRecord } from "../store";
 /**
  * Physical sheets a job actually consumes — content sheets once per copy,
  * plus the banner exactly once for the whole job (not once per copy — see
- * appendBannerPage in lib/print/banner.ts and expandCopies in
+ * prependBannerPage in lib/print/banner.ts and expandCopies in
  * lib/print/pdf.ts, which together put exactly one banner page at the very
- * end of the submitted PDF regardless of how many copies it contains).
+ * front of the submitted PDF regardless of how many copies it contains).
  * Shared by print-agent/index.ts (feeding the paper/toner counters) and
  * lib/eta.ts (ROADMAP.md #3), so both agree on what a job actually costs.
  */

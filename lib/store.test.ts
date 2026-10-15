@@ -2,13 +2,22 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { settingsMatch } from "./store";
 
 // Highest-risk logic per ROADMAP.md #14: the atomic UPDATE ... WHERE status = X
-// guards (claimJobAsPaid, expireJobIfPending, claimJobForPrinting, deleteJob)
-// are the entire mechanism preventing double-printing and duplicate
-// notifications (ROADMAP.md §11). A refactor that silently drops the status
-// check wouldn't fail typecheck or a happy-path manual test — it would only
-// show up as a real double-print under concurrent load. These tests assert
-// the actual query chain includes the guard, not just that the function
+// guards (claimJobAsPaid, expireJobIfPending, deleteJob) are the entire
+// mechanism preventing double-printing and duplicate notifications
+// (ROADMAP.md §11). A refactor that silently drops the status check
+// wouldn't fail typecheck or a happy-path manual test — it would only show
+// up as a real double-print under concurrent load. These tests assert the
+// actual query chain includes the guard, not just that the function
 // compiles and returns *a* value.
+//
+// claimNextPaidJob and createStaffPrintJob (the free-staff-print feature)
+// are both thin wrappers around Postgres RPCs that do their OWN atomic
+// claiming/locking (claim_next_paid_job's SELECT ... FOR UPDATE SKIP
+// LOCKED, create_staff_print_job's single-transaction idempotency/cap/
+// ticket/insert sequence — see supabase/migrations/2026-10-14_staff_print.sql)
+// — the real correctness guarantee lives in that SQL, not in this TypeScript
+// wrapper, so these tests only check the RPC is called with the right name
+// and arguments, the same scope assignTicketNumber's own tests below cover.
 
 /** Records every chained call so assertions can check exactly what query was built, then resolves like a real Supabase query when awaited. */
 function createMockQueryBuilder(result: { data: unknown; error: unknown }) {
@@ -110,20 +119,6 @@ describe("atomic status-guarded store functions", () => {
     expect(eqCalls).toContainEqual({ method: "eq", args: ["status", "pending_payment"] });
   });
 
-  it("claimJobForPrinting guards on status = 'paid' — the exact double-print guard from ROADMAP.md §11", async () => {
-    mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "printing" }, error: null });
-    const { claimJobForPrinting } = await import("./store");
-    await claimJobForPrinting("job-1");
-    const eqCalls = mockAdmin.current.__calls.filter((call) => call.method === "eq");
-    expect(eqCalls).toContainEqual({ method: "eq", args: ["status", "paid"] });
-  });
-
-  it("claimJobForPrinting returns null when another process already claimed it", async () => {
-    mockAdmin.current = createMockQueryBuilder({ data: null, error: null });
-    const { claimJobForPrinting } = await import("./store");
-    await expect(claimJobForPrinting("job-1")).resolves.toBeNull();
-  });
-
   it("deleteJob guards on the exact status it was told the job was in, not just the id", async () => {
     mockAdmin.current = createMockQueryBuilder({ data: [{ id: "job-1" }], error: null });
     const { deleteJob } = await import("./store");
@@ -172,6 +167,125 @@ describe("assignTicketNumber", () => {
     mockAdmin.rpcResult = { data: [], error: null };
     const { assignTicketNumber } = await import("./store");
     await expect(assignTicketNumber("oxway_01")).rejects.toThrow();
+  });
+});
+
+describe("claimNextPaidJob", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.rpcResult = null;
+    mockAdmin.rpcCalls = [];
+  });
+
+  it("calls claim_next_paid_job with the given kiosk id and maps the returned row", async () => {
+    mockAdmin.rpcResult = {
+      data: [{ id: "job-1", status: "printing", selected_pages: [1], settings: {}, total_price: 2, phone_number: "", notify_opt_in: false, include_banner_page: true, content_hash: "h", provider: "razorpay", provider_order_id: "o", provider_meta: null, pdf_storage_path: "job-1.pdf", kiosk_id: "oxway_01", created_at: "now", updated_at: "now", error: null, cups_job_id: null, refunded_at: null, ticket_number: 1, ticket_date: "2026-01-15", payment_id: null, upi_txn_id: null, paid_amount: null, payment_method: "razorpay", created_by_user_id: null, is_free: false, waived_amount: null, idempotency_key: null, queue_time: "now", file_name: "f.pdf" }],
+      error: null,
+    };
+    const { claimNextPaidJob } = await import("./store");
+
+    const result = await claimNextPaidJob("oxway_02");
+
+    expect(mockAdmin.rpcCalls).toEqual([{ name: "claim_next_paid_job", args: { p_kiosk_id: "oxway_02" } }]);
+    expect(result?.id).toBe("job-1");
+    expect(result?.status).toBe("printing");
+  });
+
+  it("returns null (not throw) when the queue is empty — the agent's own drain loop relies on this to know when to stop", async () => {
+    mockAdmin.rpcResult = { data: [], error: null };
+    const { claimNextPaidJob } = await import("./store");
+    await expect(claimNextPaidJob("oxway_01")).resolves.toBeNull();
+  });
+
+  it("throws rather than silently treating an RPC error as an empty queue", async () => {
+    mockAdmin.rpcResult = { data: null, error: { message: "connection reset" } };
+    const { claimNextPaidJob } = await import("./store");
+    await expect(claimNextPaidJob("oxway_01")).rejects.toThrow("connection reset");
+  });
+});
+
+describe("createStaffPrintJob", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.rpcResult = null;
+    mockAdmin.rpcCalls = [];
+  });
+
+  function makeRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "job-staff-1", status: "paid", file_name: "f.pdf", selected_pages: [1, 2], settings: {}, total_price: 0,
+      phone_number: "", notify_opt_in: false, include_banner_page: true, content_hash: "h",
+      provider: "razorpay", provider_order_id: "", provider_meta: null, pdf_storage_path: "job-staff-1.pdf",
+      kiosk_id: "oxway_01", created_at: "now", updated_at: "now", error: null, cups_job_id: null, refunded_at: null,
+      ticket_number: 5, ticket_date: "2026-01-15", payment_id: null, upi_txn_id: null, paid_amount: null,
+      payment_method: "staff", created_by_user_id: "user-1", is_free: true, waived_amount: 12, idempotency_key: "key-1",
+      queue_time: "now",
+      ...overrides,
+    };
+  }
+
+  const baseInput = {
+    jobId: "job-staff-1",
+    fileName: "f.pdf",
+    selectedPages: [1, 2],
+    settings: { copies: 1, layout: "portrait" as const, isColor: false, paperSize: "A4" as const, pagesPerSheet: 1 as const },
+    waivedAmount: 12,
+    contentHash: "h",
+    provider: "razorpay" as const,
+    pdfStoragePath: "job-staff-1.pdf",
+    kioskId: "oxway_01",
+    idempotencyKey: "key-1",
+    createdByUserId: "user-1",
+    dailyCap: 500,
+  };
+
+  it("calls create_staff_print_job with every field mapped to its p_-prefixed RPC argument", async () => {
+    mockAdmin.rpcResult = { data: [makeRow()], error: null };
+    const { createStaffPrintJob } = await import("./store");
+
+    const result = await createStaffPrintJob(baseInput);
+
+    expect(mockAdmin.rpcCalls).toEqual([{
+      name: "create_staff_print_job",
+      args: {
+        p_job_id: "job-staff-1",
+        p_file_name: "f.pdf",
+        p_selected_pages: [1, 2],
+        p_settings: baseInput.settings,
+        p_waived_amount: 12,
+        p_content_hash: "h",
+        p_provider: "razorpay",
+        p_pdf_storage_path: "job-staff-1.pdf",
+        p_kiosk_id: "oxway_01",
+        p_idempotency_key: "key-1",
+        p_created_by: "user-1",
+        p_daily_cap: 500,
+      },
+    }]);
+    expect(result.id).toBe("job-staff-1");
+    expect(result.paymentMethod).toBe("staff");
+    expect(result.isFree).toBe(true);
+    expect(result.waivedAmount).toBe(12);
+    expect(result.totalPrice).toBe(0);
+  });
+
+  it("passes a null idempotency key through unchanged when the caller sent none", async () => {
+    mockAdmin.rpcResult = { data: [makeRow({ idempotency_key: null })], error: null };
+    const { createStaffPrintJob } = await import("./store");
+    await createStaffPrintJob({ ...baseInput, idempotencyKey: null });
+    expect(mockAdmin.rpcCalls[0].args).toMatchObject({ p_idempotency_key: null });
+  });
+
+  it("throws (surfacing the daily-cap exception message) rather than silently returning nothing", async () => {
+    mockAdmin.rpcResult = { data: null, error: { message: "Daily staff print cap reached (520 of 500 pages used today)." } };
+    const { createStaffPrintJob } = await import("./store");
+    await expect(createStaffPrintJob(baseInput)).rejects.toThrow(/Daily staff print cap reached/);
+  });
+
+  it("throws rather than silently returning a half-built record when the RPC returns no row", async () => {
+    mockAdmin.rpcResult = { data: [], error: null };
+    const { createStaffPrintJob } = await import("./store");
+    await expect(createStaffPrintJob(baseInput)).rejects.toThrow();
   });
 });
 

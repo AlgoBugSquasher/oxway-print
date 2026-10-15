@@ -6,7 +6,6 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, KeyRound, LogIn, RefreshCw } from "lucide-react";
 import BrandWordmark from "@/components/BrandWordmark";
 import { fetchJson } from "@/lib/fetch-json";
-import { createSupabaseBrowserClient } from "@/lib/supabase";
 
 // ROADMAP.md §26 — prototype/testing-phase only. Deleting this whole flag
 // check (and the passcode block it gates further down) is the entire
@@ -26,14 +25,21 @@ export default function AdminLoginPage() {
     router.refresh();
   };
 
+  // Server-side now (app/api/admin/login) — not a direct
+  // supabase.auth.signInWithPassword() call from here — so the attempt can
+  // be audited and rate-limited; see that route's own docstring. It sets
+  // the same session cookie the old client-direct call did, so nothing
+  // else about how a signed-in admin's session works changed.
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     setError("");
     setIsLoading(true);
     try {
-      const supabase = createSupabaseBrowserClient();
-      const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
-      if (signInError) throw new Error(signInError.message);
+      await fetchJson("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
       goToAdmin();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not sign in.");

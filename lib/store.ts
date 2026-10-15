@@ -87,6 +87,44 @@ export interface PrintJobRecord {
   paymentId?: string;
   upiTxnId?: string;
   paidAmount?: number;
+  /**
+   * How this job actually got paid — 'staff' for a free print created by
+   * createStaffPrintJob below, 'razorpay'/'cashfree' mirroring `provider`
+   * for everything else. Undefined for jobs created before this column
+   * existed. This, not `provider`, is the real source of truth for "is this
+   * a staff job" — every refund/banner/Razorpay-enrichment call site checks
+   * it FIRST, since `provider` is still set to a real (but meaningless)
+   * value on a staff job too (see the migration's own comment on why).
+   */
+  paymentMethod?: "razorpay" | "cashfree" | "staff";
+  /** Which signed-in owner/staff user created this job — only ever set for a staff print (createStaffPrintJob). */
+  createdByUserId?: string;
+  /** True only for a staff print — total_price is 0 and waivedAmount below holds what it would have cost. */
+  isFree?: boolean;
+  /** The price this job WOULD have cost a paying customer, computed server-side from the real pricing rules (see app/api/staff-print/route.ts) — never from anything the client claims. Undefined for every non-staff job. */
+  waivedAmount?: number;
+  /** Client-supplied idempotency key for a staff-print submission — makes a double-click/retry resolve to the same job instead of creating a duplicate (enforced by a partial unique index, not just this app-level field). Undefined for non-staff jobs. */
+  idempotencyKey?: string;
+  /**
+   * Stamped automatically by a database trigger the instant this job's
+   * status first becomes 'paid' — what the print agent's queue is actually
+   * ordered by (see claimNextPaidJob below), not createdAt, so neither a
+   * customer job nor a staff job ever gets priority over the other. Not
+   * something application code ever sets directly.
+   */
+  queueTime?: string;
+  /**
+   * Per-job print-stage timestamps (see lib/print/ready-timing.ts), stamped
+   * as the job moves through the print agent — claimedAt by
+   * claim_next_paid_job() itself, the rest by the agent as it progresses.
+   * Diagnostic only: never exposed to the anon role, Realtime, or either
+   * customer-facing "is it ready" surface, which still only ever reads
+   * `status` (see that migration's own comment for why).
+   */
+  claimedAt?: string;
+  spooledAt?: string;
+  printerIdleAt?: string;
+  readyAt?: string;
 }
 
 const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled"];
@@ -119,6 +157,16 @@ interface PrintJobRow {
   payment_id: string | null;
   upi_txn_id: string | null;
   paid_amount: number | null;
+  payment_method: "razorpay" | "cashfree" | "staff" | null;
+  created_by_user_id: string | null;
+  is_free: boolean | null;
+  waived_amount: number | null;
+  idempotency_key: string | null;
+  queue_time: string | null;
+  claimed_at: string | null;
+  spooled_at: string | null;
+  printer_idle_at: string | null;
+  ready_at: string | null;
 }
 
 function fromRow(row: PrintJobRow): PrintJobRecord {
@@ -149,6 +197,16 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     paymentId: row.payment_id ?? undefined,
     upiTxnId: row.upi_txn_id ?? undefined,
     paidAmount: row.paid_amount ?? undefined,
+    paymentMethod: row.payment_method ?? undefined,
+    createdByUserId: row.created_by_user_id ?? undefined,
+    isFree: row.is_free ?? undefined,
+    waivedAmount: row.waived_amount ?? undefined,
+    idempotencyKey: row.idempotency_key ?? undefined,
+    queueTime: row.queue_time ?? undefined,
+    claimedAt: row.claimed_at ?? undefined,
+    spooledAt: row.spooled_at ?? undefined,
+    printerIdleAt: row.printer_idle_at ?? undefined,
+    readyAt: row.ready_at ?? undefined,
   };
 }
 
@@ -187,6 +245,9 @@ function toUpdateRow(patch: Partial<PrintJobRecord>): Partial<PrintJobRow> {
   if (patch.paymentId !== undefined) row.payment_id = patch.paymentId;
   if (patch.upiTxnId !== undefined) row.upi_txn_id = patch.upiTxnId;
   if (patch.paidAmount !== undefined) row.paid_amount = patch.paidAmount;
+  if (patch.spooledAt !== undefined) row.spooled_at = patch.spooledAt;
+  if (patch.printerIdleAt !== undefined) row.printer_idle_at = patch.printerIdleAt;
+  if (patch.readyAt !== undefined) row.ready_at = patch.readyAt;
   return row;
 }
 
@@ -234,9 +295,12 @@ export async function updateJob(jobId: string, patch: Partial<PrintJobRecord>): 
  * `pending_payment`. Two independent callers can race to confirm the same
  * job — the customer's own browser polling and the scheduled recheck (see
  * ROADMAP.md #9) — so this uses the same atomic UPDATE ... WHERE pattern as
- * claimJobForPrinting, rather than a read-then-write, to guarantee only one
- * of them ever wins and only that one sends the payment-confirmed
- * notification (see lib/payment-reconciliation.ts and ROADMAP.md §11).
+ * every other claim in this file, rather than a read-then-write, to
+ * guarantee only one of them ever wins and only that one sends the
+ * payment-confirmed notification (see lib/payment-reconciliation.ts and
+ * ROADMAP.md §11). A database trigger (see the staff-print migration)
+ * stamps `queue_time` automatically the instant this UPDATE takes a job's
+ * status to 'paid' — nothing below needs to set it itself.
  */
 export async function claimJobAsPaid(jobId: string, providerMeta: Record<string, string>): Promise<PrintJobRecord | null> {
   const { data, error } = await supabaseAdmin()
@@ -274,26 +338,9 @@ export async function listPendingPaymentJobs(): Promise<PrintJobRecord[]> {
 }
 
 /**
- * Atomically claims a job for printing: only succeeds if it's still `paid`.
- * Used by the print agent so two agent instances (or an agent + a stray
- * retry) can never both print the same job.
- */
-export async function claimJobForPrinting(jobId: string): Promise<PrintJobRecord | null> {
-  const { data, error } = await supabaseAdmin()
-    .from("print_jobs")
-    .update({ status: "printing", updated_at: new Date().toISOString() })
-    .eq("id", jobId)
-    .eq("status", "paid")
-    .select("*")
-    .maybeSingle();
-  if (error) throw new Error(`Could not claim job: ${error.message}`);
-  return data ? fromRow(data as PrintJobRow) : null;
-}
-
-/**
  * Atomically claims a job for WhatsApp notification: only succeeds if
  * notified_at is still null. Same atomic UPDATE ... WHERE pattern as
- * claimJobForPrinting/claimJobAsPaid above — app/api/agent/notify calls
+ * claimJobAsPaid above — app/api/agent/notify calls
  * this before ever sending anything, so a retried or duplicate call from
  * the print agent (it's allowed to call this endpoint more than once per
  * job, see that route's own comment) can never result in two WhatsApp
@@ -311,15 +358,86 @@ export async function claimJobForNotification(jobId: string): Promise<PrintJobRe
   return data ? fromRow(data as PrintJobRow) : null;
 }
 
-/** Scoped to a single kiosk — each Pi's print agent only ever sees its own jobs. */
-export async function listPaidJobs(kioskId: string): Promise<PrintJobRecord[]> {
-  const { data, error } = await supabaseAdmin()
-    .from("print_jobs")
-    .select("*")
-    .eq("status", "paid")
-    .eq("kiosk_id", kioskId);
-  if (error) throw new Error(`Could not list paid jobs: ${error.message}`);
-  return (data as PrintJobRow[]).map(fromRow);
+/**
+ * Atomically claims the single oldest ready-to-print job at a kiosk —
+ * "oldest" meaning the earliest `queue_time`, the single timestamp a
+ * database trigger stamps on EVERY job (staff or paying customer, whichever
+ * path got it to 'paid') the instant it first becomes 'paid', not
+ * `created_at` — so a job that sat in pending_payment for three minutes
+ * before paying never queue-jumps a staff print that was ready to print ten
+ * seconds ago, and neither job type is ever preferred over the other.
+ *
+ * Wraps claim_next_paid_job(), a single `SELECT ... FOR UPDATE SKIP LOCKED`
+ * + `UPDATE ... WHERE status = 'paid'` Postgres function — see that
+ * function's own comment in the staff-print migration for why this
+ * replaces the print agent's old "list every paid job, then claim each one
+ * individually" pattern: claiming is now part of the same atomic operation
+ * as picking which job is next, so two agent processes (or an agent
+ * restart briefly overlapping its own old process) can never both claim
+ * the same row, and the processing order is never left to depend on
+ * whatever order Postgres happened to return an unordered SELECT in.
+ *
+ * Call this in a loop (see print-agent/index.ts's pollLoop) until it
+ * returns null — that's "no more ready jobs at this kiosk right now."
+ */
+export async function claimNextPaidJob(kioskId: string): Promise<PrintJobRecord | null> {
+  const { data, error } = await supabaseAdmin().rpc("claim_next_paid_job", { p_kiosk_id: kioskId });
+  if (error) throw new Error(`Could not claim next paid job: ${error.message}`);
+  const rows = data as PrintJobRow[] | null;
+  return rows && rows.length > 0 ? fromRow(rows[0]) : null;
+}
+
+export interface CreateStaffPrintJobInput {
+  jobId: string;
+  fileName: string;
+  selectedPages: number[];
+  settings: PrintSettingsSnapshot;
+  /** The price this job WOULD have cost a paying customer — computed server-side (app/api/staff-print/route.ts) from the real pricing rules, never from anything the client claims. */
+  waivedAmount: number;
+  contentHash: string;
+  /** Which gateway is "active" right now (getActiveProvider()) — stamped onto this job's `provider` column for schema consistency even though it's never meaningful for a staff job (no gateway order exists); `paymentMethod` is the real source of truth, see PrintJobRecord's own comment. */
+  provider: "cashfree" | "razorpay";
+  pdfStoragePath: string;
+  kioskId: string;
+  /** Deduplicates a retried/double-clicked submission against the SAME earlier attempt — enforced by a partial unique index (idempotency_key), not just this app-level field. */
+  idempotencyKey: string | null;
+  createdByUserId: string;
+  dailyCap: number;
+}
+
+/**
+ * Creates a staff/owner print job and marks it paid in one atomic Postgres
+ * transaction (wraps create_staff_print_job()) — a job can never be left
+ * half-created the way two separate app-level calls (assign a ticket
+ * number, then insert a row) could leave one if the second step failed.
+ * Also handles idempotency (a retried/double-clicked submission with the
+ * same idempotencyKey resolves to the already-created job) and the atomic
+ * daily page-cap check/increment — see that function's own comment in the
+ * staff-print migration for exactly how.
+ *
+ * Throws on a genuine failure (including "over the daily cap," which the
+ * RPC raises as a Postgres exception) — the caller (app/api/staff-print)
+ * is responsible for turning that into a clear, customer-safe error message.
+ */
+export async function createStaffPrintJob(input: CreateStaffPrintJobInput): Promise<PrintJobRecord> {
+  const { data, error } = await supabaseAdmin().rpc("create_staff_print_job", {
+    p_job_id: input.jobId,
+    p_file_name: input.fileName,
+    p_selected_pages: input.selectedPages,
+    p_settings: input.settings,
+    p_waived_amount: input.waivedAmount,
+    p_content_hash: input.contentHash,
+    p_provider: input.provider,
+    p_pdf_storage_path: input.pdfStoragePath,
+    p_kiosk_id: input.kioskId,
+    p_idempotency_key: input.idempotencyKey,
+    p_created_by: input.createdByUserId,
+    p_daily_cap: input.dailyCap,
+  });
+  if (error) throw new Error(`Could not create staff print job: ${error.message}`);
+  const rows = data as PrintJobRow[] | null;
+  if (!rows || rows.length === 0) throw new Error("create_staff_print_job returned no row.");
+  return fromRow(rows[0]);
 }
 
 export function pdfStoragePathForJob(jobId: string): string {

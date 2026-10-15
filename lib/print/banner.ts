@@ -1,8 +1,8 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { PDFDocument, StandardFonts, rgb, type Color, type PDFFont, type PDFImage, type PDFPage } from "pdf-lib";
+import { PDFDocument, StandardFonts, rgb, type Color, type PDFFont, type PDFPage } from "pdf-lib";
 import { shortRequestId } from "../request-id";
 import type { PrintJobRecord } from "../store";
+import { formatTicketCode } from "../ticket-code";
+import { computeQrModuleRuns, generateQrMatrix, qrModuleSizePt, type QrMatrix } from "./qr";
 
 const A4_WIDTH = 595.28;
 const A4_HEIGHT = 841.89;
@@ -23,7 +23,18 @@ export const MM_TO_PT = 72 / 25.4;
  */
 export const BANNER_LAYOUT_CONFIG = {
   marginMm: 12,
-  qrImagePathSegments: ["public", "brand", "insta.png"],
+  /**
+   * The Instagram QR printed on every banner — generated ourselves (see
+   * lib/print/qr.ts) and drawn as pure black vector rectangles, never a
+   * raster image (see this file's own note on why: a gradient/anti-aliased
+   * image prints as light grey dots on a B&W laser that some phones can't
+   * scan). Confirm this URL with the business before changing it.
+   */
+  instagram: {
+    url: "https://www.instagram.com/oxway.geu/",
+    handle: "@oxway.geu",
+    errorCorrectionLevel: "M" as const,
+  },
   /** Gap between the two side-by-side columns in landscape mode. */
   sideBySideColumnGapMm: 10,
   /** Gap between the two-column content and the full-width OXWAY footer in side-by-side mode. */
@@ -60,12 +71,21 @@ export const BANNER_LAYOUT_CONFIG = {
       targetSizeMm: 35,
       /** Below this, a camera can no longer reliably decode the code, so the whole block is dropped instead of shrinking further. */
       minSizeMm: 25,
+      /** White modules on every side of the code itself, per the QR spec's own minimum — the code's own finder patterns need this much clear border to be found at all. */
+      quietZoneModules: 4,
+      /** Below this, a module is no longer reliably resolvable as a distinct black/white square once printed — the whole QR block is skipped rather than drawn illegibly small (see makeQrBlock). */
+      minModuleSizeMm: 0.4,
       gapAfterMm: { normalMm: 3, minMm: 2 },
     },
     qrCaption: {
       text: "Scan to follow us on Instagram",
       font: { normalPt: 10.5, minPt: 7 },
       color: rgb(0.2, 0.2, 0.2),
+      gapAfterMm: { normalMm: 2, minMm: 1 },
+    },
+    qrHandle: {
+      font: { normalPt: 10.5, minPt: 7 },
+      color: rgb(0.1, 0.1, 0.1),
       gapAfterMm: { normalMm: 8, minMm: 4 },
     },
     oxway: {
@@ -81,14 +101,28 @@ export const BANNER_LAYOUT_CONFIG = {
     rupeeFallback: "Rs. ",
     upiTxnPrefix: "UPI Txn ID: ",
     paymentIdPrefix: "Payment ID: ",
+    /** Printed instead of the normal payment lines for a free staff/owner print — see buildStaffPrintLineTexts. Split into prefix/suffix (not one template string) so the rupee amount sits between them, same pattern totalPaidPrefix uses. */
+    staffPrintPrefix: "STAFF PRINT (value ",
+    staffPrintSuffix: ", not charged)",
   },
   /** Order droppable blocks are removed in when nothing else makes the layout fit. Every other block (pickup label, ticket code, date/time, Request ID) is never dropped. */
-  dropOrder: ["oxway", "qrCaption", "qr", "paymentLines"] as const,
+  dropOrder: ["oxway", "qrHandle", "qrCaption", "qr", "paymentLines"] as const,
 } as const;
 
 const RUPEE_GLYPH = "₹";
 /** Float-rounding tolerance for the margin/overlap safety checks below. */
 const EPS = 0.01;
+/**
+ * The pickup ticket code's own absolute floor — below its normal `minPt`
+ * (BANNER_LAYOUT_CONFIG.blocks.ticketCode.font.minPt), fitTextWidth keeps
+ * shrinking it rather than ever truncating with "..." (see that function's
+ * own `allowTruncate` parameter): a truncated ticket code isn't a
+ * gracefully degraded label, it's a WRONG pickup code shown to the
+ * customer. This is the last-resort floor below which shrinking stops
+ * being tried — a size this small only happens on a page far smaller than
+ * any real paper size, and existing margin/overlap checks still catch it.
+ */
+const TICKET_CODE_ABSOLUTE_MIN_FONT_PT = 4;
 
 // ----------------------------------------------------------------------------
 // Low-level geometry
@@ -107,7 +141,8 @@ function rectsOverlap(a: Rect, b: Rect): boolean {
 
 type PlannedContent =
   | { kind: "text"; text: string; font: PDFFont; size: number; color: Color }
-  | { kind: "image"; image: PDFImage };
+  /** The QR's dark modules, already merged into per-row rectangles (see computeQrModuleRuns) and placed in absolute page coordinates — drawn as plain filled rectangles, never a raster image. */
+  | { kind: "qr"; rects: Rect[] };
 
 export interface PlannedElement {
   id: string;
@@ -119,7 +154,7 @@ export interface PlannedElement {
  * Thrown when a computed layout WAS produced but fails the overlap/margin
  * safety net — i.e. a real bug in the solver, not an expected "page too
  * small" outcome (see NoLayoutFitsError for that). Caught in
- * appendBannerPage, which falls back to the simple layout — except in
+ * prependBannerPage, which falls back to the simple layout — except in
  * tests, which let it propagate, so a real layout bug shows up as a
  * failing test rather than a quietly-degraded banner. Exported so tests can
  * identify this specific failure mode rather than any unrelated error.
@@ -167,26 +202,31 @@ function fontCanEncode(font: PDFFont, text: string): boolean {
  * Shrinks `text`'s font size (down to `minSize`) and, if it still doesn't
  * fit, truncates it with "..." — so a long value (a payment id, say) on a
  * narrow page always ends up within `maxWidth`, never spilling off the page.
+ *
+ * `allowTruncate: false` (the ticket code's own call sites — see
+ * TICKET_CODE_ABSOLUTE_MIN_FONT_PT) instead keeps shrinking PAST `minSize`,
+ * down to `TICKET_CODE_ABSOLUTE_MIN_FONT_PT`, rather than ever handing back
+ * a truncated/wrong value: showing the customer's actual pickup code too
+ * small to read comfortably is still far better than showing a different,
+ * wrong one.
  */
-function fitTextWidth(font: PDFFont, text: string, startSize: number, minSize: number, maxWidth: number): { text: string; size: number; width: number } {
+function fitTextWidth(font: PDFFont, text: string, startSize: number, minSize: number, maxWidth: number, allowTruncate = true): { text: string; size: number; width: number } {
+  const floor = allowTruncate ? minSize : Math.min(minSize, TICKET_CODE_ABSOLUTE_MIN_FONT_PT);
   let size = startSize;
   let width = safeWidthOfTextAtSize(font, text, size);
-  while (width > maxWidth && size > minSize) {
-    size = Math.max(size - 0.5, minSize);
+  while (width > maxWidth && size > floor) {
+    size = Math.max(size - 0.5, floor);
     width = safeWidthOfTextAtSize(font, text, size);
   }
 
-  let finalText = text;
-  if (width > maxWidth) {
-    let base = text;
-    while (base.length > 1 && safeWidthOfTextAtSize(font, `${base.trimEnd()}...`, size) > maxWidth) {
-      base = base.slice(0, -1);
-    }
-    finalText = `${base.trimEnd()}...`;
-    width = safeWidthOfTextAtSize(font, finalText, size);
-  }
+  if (!allowTruncate || width <= maxWidth) return { text, size, width };
 
-  return { text: finalText, size, width };
+  let base = text;
+  while (base.length > 1 && safeWidthOfTextAtSize(font, `${base.trimEnd()}...`, size) > maxWidth) {
+    base = base.slice(0, -1);
+  }
+  const finalText = `${base.trimEnd()}...`;
+  return { text: finalText, size, width: safeWidthOfTextAtSize(font, finalText, size) };
 }
 
 // ----------------------------------------------------------------------------
@@ -211,10 +251,11 @@ function makeTextBlock(
   columnLeft: number,
   columnWidth: number,
   fontsShrunk: boolean,
-  gapAfterPt: number
+  gapAfterPt: number,
+  allowTruncate = true
 ): MeasuredBlock {
   const startSize = fontsShrunk ? sizing.minPt : sizing.normalPt;
-  const fitted = fitTextWidth(font, text, startSize, sizing.minPt, columnWidth);
+  const fitted = fitTextWidth(font, text, startSize, sizing.minPt, columnWidth, allowTruncate);
   const height = font.heightAtSize(fitted.size);
   const x = columnLeft + (columnWidth - fitted.width) / 2;
   return {
@@ -227,14 +268,38 @@ function makeTextBlock(
   };
 }
 
-function makeQrImageBlock(qrImage: PDFImage, sizePt: number, columnLeft: number, columnWidth: number, gapAfterPt: number): MeasuredBlock {
+/**
+ * Builds the QR block for a `sizePt`-square code — or returns null if, at
+ * this size, a single module would be smaller than
+ * BANNER_LAYOUT_CONFIG.blocks.qr.minModuleSizeMm, per requirement #3's "if
+ * a QR of at least the minimum module size can't fit, skip it": printing
+ * modules that small is no longer something a camera can reliably tell
+ * apart, so the whole block (and its caption/handle, see the call sites
+ * below) is dropped rather than drawn illegibly.
+ */
+function makeQrBlock(matrix: QrMatrix, sizePt: number, columnLeft: number, columnWidth: number, gapAfterPt: number): MeasuredBlock | null {
+  const cfg = BANNER_LAYOUT_CONFIG.blocks.qr;
+  const moduleSizePt = qrModuleSizePt(matrix, sizePt, cfg.quietZoneModules);
+  if (moduleSizePt / MM_TO_PT < cfg.minModuleSizeMm) return null;
+
+  const runs = computeQrModuleRuns(matrix, cfg.quietZoneModules);
   const x = columnLeft + (columnWidth - sizePt) / 2;
+
   return {
     id: "qr",
     height: sizePt,
     gapAfterPt,
     build(topY: number): PlannedElement[] {
-      return [{ id: "qr", rect: { x, y: topY - sizePt, width: sizePt, height: sizePt }, content: { kind: "image", image: qrImage } }];
+      // `run.row`/`run.col` count down/right from the box's top-left corner
+      // (module units) — flipped here into PDF's bottom-up y axis, the one
+      // place this block deals with that conversion.
+      const rects: Rect[] = runs.map((run) => ({
+        x: x + run.col * moduleSizePt,
+        y: topY - (run.row + 1) * moduleSizePt,
+        width: run.columnSpan * moduleSizePt,
+        height: moduleSizePt,
+      }));
+      return [{ id: "qr", rect: { x, y: topY - sizePt, width: sizePt, height: sizePt }, content: { kind: "qr", rects } }];
     },
   };
 }
@@ -343,7 +408,7 @@ export interface BannerPlanContext {
   pageHeight: number;
   bold: PDFFont;
   regular: PDFFont;
-  qrImage: PDFImage | null;
+  qrMatrix: QrMatrix | null;
   pickupLabel: string;
   ticketCode: string;
   detailLine: string;
@@ -357,7 +422,7 @@ function buildCoreAndQrBlocks(ctx: BannerPlanContext, state: ShrinkState, droppe
   const blocks: MeasuredBlock[] = [];
 
   blocks.push(makeTextBlock("pickupLabel", ctx.pickupLabel, ctx.bold, cfg.pickupLabel.font, cfg.pickupLabel.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(cfg.pickupLabel.gapAfterMm, state.gapShrunk)));
-  blocks.push(makeTextBlock("ticketCode", ctx.ticketCode, ctx.bold, cfg.ticketCode.font, cfg.ticketCode.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(cfg.ticketCode.gapAfterMm, state.gapShrunk)));
+  blocks.push(makeTextBlock("ticketCode", ctx.ticketCode, ctx.bold, cfg.ticketCode.font, cfg.ticketCode.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(cfg.ticketCode.gapAfterMm, state.gapShrunk), false));
   blocks.push(makeTextBlock("detailLine", ctx.detailLine, ctx.regular, cfg.detailLine.font, cfg.detailLine.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(cfg.detailLine.gapAfterMm, state.gapShrunk)));
 
   const hasPaymentLines = !dropped.has("paymentLines") && ctx.paymentLineTexts.length > 0;
@@ -370,11 +435,21 @@ function buildCoreAndQrBlocks(ctx: BannerPlanContext, state: ShrinkState, droppe
     );
   }
 
-  if (ctx.qrImage && !dropped.has("qr")) {
+  if (ctx.qrMatrix && !dropped.has("qr")) {
     const qrSizePt = Math.min((state.qrShrunk ? cfg.qr.minSizeMm : cfg.qr.targetSizeMm) * MM_TO_PT, columnWidth);
-    blocks.push(makeQrImageBlock(ctx.qrImage, qrSizePt, columnLeft, columnWidth, gapPt(cfg.qr.gapAfterMm, state.gapShrunk)));
-    if (!dropped.has("qrCaption")) {
-      blocks.push(makeTextBlock("qrCaption", cfg.qrCaption.text, ctx.regular, cfg.qrCaption.font, cfg.qrCaption.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(cfg.qrCaption.gapAfterMm, state.gapShrunk)));
+    const hasCaption = !dropped.has("qrCaption");
+    const hasHandle = hasCaption && !dropped.has("qrHandle");
+    const qrBlock = makeQrBlock(ctx.qrMatrix, qrSizePt, columnLeft, columnWidth, hasCaption ? gapPt(cfg.qr.gapAfterMm, state.gapShrunk) : 0);
+    if (qrBlock) {
+      blocks.push(qrBlock);
+      if (hasCaption) {
+        blocks.push(
+          makeTextBlock("qrCaption", cfg.qrCaption.text, ctx.regular, cfg.qrCaption.font, cfg.qrCaption.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(hasHandle ? cfg.qrCaption.gapAfterMm : cfg.qrHandle.gapAfterMm, state.gapShrunk))
+        );
+        if (hasHandle) {
+          blocks.push(makeTextBlock("qrHandle", BANNER_LAYOUT_CONFIG.instagram.handle, ctx.regular, cfg.qrHandle.font, cfg.qrHandle.color, columnLeft, columnWidth, state.fontsShrunk, gapPt(cfg.qrHandle.gapAfterMm, state.gapShrunk)));
+        }
+      }
     }
   }
 
@@ -421,7 +496,7 @@ function planSideBySide(ctx: BannerPlanContext): PlannedElement[] | null {
   const leftBuildFn = (state: ShrinkState, dropped: Set<string>) => {
     const blocks: MeasuredBlock[] = [];
     blocks.push(makeTextBlock("pickupLabel", ctx.pickupLabel, ctx.bold, cfg.pickupLabel.font, cfg.pickupLabel.color, leftLeft, leftWidth, state.fontsShrunk, gapPt(cfg.pickupLabel.gapAfterMm, state.gapShrunk)));
-    blocks.push(makeTextBlock("ticketCode", ctx.ticketCode, ctx.bold, cfg.ticketCode.font, cfg.ticketCode.color, leftLeft, leftWidth, state.fontsShrunk, gapPt(cfg.ticketCode.gapAfterMm, state.gapShrunk)));
+    blocks.push(makeTextBlock("ticketCode", ctx.ticketCode, ctx.bold, cfg.ticketCode.font, cfg.ticketCode.color, leftLeft, leftWidth, state.fontsShrunk, gapPt(cfg.ticketCode.gapAfterMm, state.gapShrunk), false));
     blocks.push(makeTextBlock("detailLine", ctx.detailLine, ctx.regular, cfg.detailLine.font, cfg.detailLine.color, leftLeft, leftWidth, state.fontsShrunk, gapPt(cfg.detailLine.gapAfterMm, state.gapShrunk)));
     const hasPaymentLines = !dropped.has("paymentLines") && ctx.paymentLineTexts.length > 0;
     blocks.push(makeTextBlock("requestIdLine", ctx.requestIdLine, ctx.regular, cfg.requestIdLine.font, cfg.requestIdLine.color, leftLeft, leftWidth, state.fontsShrunk, hasPaymentLines ? gapPt(cfg.paymentLines.gapAfterMm, state.gapShrunk) : 0));
@@ -434,16 +509,25 @@ function planSideBySide(ctx: BannerPlanContext): PlannedElement[] | null {
   if (!leftBlocks) return null;
 
   const rightBuildFn = (state: ShrinkState, dropped: Set<string>) => {
-    if (!ctx.qrImage || dropped.has("qr")) return [];
-    const blocks: MeasuredBlock[] = [];
+    if (!ctx.qrMatrix || dropped.has("qr")) return [];
     const qrSizePt = Math.min((state.qrShrunk ? cfg.qr.minSizeMm : cfg.qr.targetSizeMm) * MM_TO_PT, rightWidth);
-    blocks.push(makeQrImageBlock(ctx.qrImage, qrSizePt, rightLeft, rightWidth, gapPt(cfg.qr.gapAfterMm, state.gapShrunk)));
-    if (!dropped.has("qrCaption")) {
-      blocks.push(makeTextBlock("qrCaption", cfg.qrCaption.text, ctx.regular, cfg.qrCaption.font, cfg.qrCaption.color, rightLeft, rightWidth, state.fontsShrunk, 0));
+    const hasCaption = !dropped.has("qrCaption");
+    const hasHandle = hasCaption && !dropped.has("qrHandle");
+    const qrBlock = makeQrBlock(ctx.qrMatrix, qrSizePt, rightLeft, rightWidth, hasCaption ? gapPt(cfg.qr.gapAfterMm, state.gapShrunk) : 0);
+    if (!qrBlock) return [];
+
+    const blocks: MeasuredBlock[] = [qrBlock];
+    if (hasCaption) {
+      blocks.push(
+        makeTextBlock("qrCaption", cfg.qrCaption.text, ctx.regular, cfg.qrCaption.font, cfg.qrCaption.color, rightLeft, rightWidth, state.fontsShrunk, hasHandle ? gapPt(cfg.qrCaption.gapAfterMm, state.gapShrunk) : 0)
+      );
+      if (hasHandle) {
+        blocks.push(makeTextBlock("qrHandle", BANNER_LAYOUT_CONFIG.instagram.handle, ctx.regular, cfg.qrHandle.font, cfg.qrHandle.color, rightLeft, rightWidth, state.fontsShrunk, 0));
+      }
     }
     return blocks;
   };
-  const rightBlocks = solveBlocks(rightBuildFn, availableColumnHeightPt, ["qrCaption", "qr"]);
+  const rightBlocks = solveBlocks(rightBuildFn, availableColumnHeightPt, ["qrHandle", "qrCaption", "qr"]);
   if (!rightBlocks) return null;
 
   const topStartY = ctx.pageHeight - marginPt;
@@ -471,7 +555,7 @@ function planBannerLayout(ctx: BannerPlanContext): PlannedElement[] | null {
  * Computes the full banner layout for `ctx` and checks it against the
  * overlap/margin safety net, throwing BannerSafetyNetViolation if either
  * step fails — exported (alongside buildBannerPlanContext below) so tests
- * can exercise the exact same computation appendBannerPage uses, across
+ * can exercise the exact same computation prependBannerPage uses, across
  * many page sizes and job data combinations, without re-deriving pdf-lib
  * operators from a rendered page.
  */
@@ -498,12 +582,12 @@ function buildSimpleFallbackElements(bold: PDFFont, regular: PDFFont, pageWidth:
   const marginPt = BANNER_LAYOUT_CONFIG.marginMm * MM_TO_PT;
   const columnWidth = Math.max(pageWidth - 2 * marginPt, 1);
 
-  const pickupCode = job.ticketNumber != null ? `#${String(job.ticketNumber).padStart(3, "0")}` : shortRequestId(job.id);
+  const pickupCode = job.ticketNumber != null ? formatTicketCode(job.ticketNumber) : shortRequestId(job.id);
   const timestamp = new Date(job.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
   const requestIdLine = `${BANNER_LAYOUT_CONFIG.labels.requestIdPrefix}${shortRequestId(job.id)}`;
 
   const blocks = [
-    makeTextBlock("ticketCode", pickupCode, bold, cfg.ticketCode.font, cfg.ticketCode.color, marginPt, columnWidth, true, cfg.ticketCode.gapAfterMm.minMm * MM_TO_PT),
+    makeTextBlock("ticketCode", pickupCode, bold, cfg.ticketCode.font, cfg.ticketCode.color, marginPt, columnWidth, true, cfg.ticketCode.gapAfterMm.minMm * MM_TO_PT, false),
     makeTextBlock("detailLine", timestamp, regular, cfg.detailLine.font, cfg.detailLine.color, marginPt, columnWidth, true, cfg.detailLine.gapAfterMm.minMm * MM_TO_PT),
     makeTextBlock("requestIdLine", requestIdLine, regular, cfg.requestIdLine.font, cfg.requestIdLine.color, marginPt, columnWidth, true, 0),
   ];
@@ -514,6 +598,8 @@ function buildSimpleFallbackElements(bold: PDFFont, regular: PDFFont, pageWidth:
   return placeBlocks(blocks, topStartY);
 }
 
+const QR_MODULE_COLOR = rgb(0, 0, 0);
+
 function commitElements(page: PDFPage, elements: PlannedElement[]): void {
   for (const el of elements) {
     if (el.content.kind === "text") {
@@ -522,7 +608,12 @@ function commitElements(page: PDFPage, elements: PlannedElement[]): void {
       const descent = el.rect.height - ascent;
       page.drawText(text, { x: el.rect.x, y: el.rect.y + descent, size, font, color });
     } else {
-      page.drawImage(el.content.image, { x: el.rect.x, y: el.rect.y, width: el.rect.width, height: el.rect.height });
+      // Pure black vector fills, one per merged run of dark modules — no
+      // image, no scaling, no anti-aliasing, so nothing softens the edges
+      // into the light grey a printed gradient/anti-aliased image would.
+      for (const rect of el.content.rects) {
+        page.drawRectangle({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, color: QR_MODULE_COLOR });
+      }
     }
   }
 }
@@ -536,6 +627,11 @@ function formatRupees(amount: number): string {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
 }
 
+/** The ₹ glyph if `font` can actually encode it, else the "Rs. " fallback — shared by buildPaymentLineTexts and buildStaffPrintLineTexts so both degrade the same way on a font that's missing the glyph. */
+function rupeeSymbolFor(font: PDFFont): string {
+  return fontCanEncode(font, RUPEE_GLYPH) ? RUPEE_GLYPH : BANNER_LAYOUT_CONFIG.labels.rupeeFallback;
+}
+
 /**
  * Builds the 0-2 payment lines printed directly under the Request ID line.
  * "Total paid" uses the gateway-confirmed amount if it's been fetched yet
@@ -545,14 +641,17 @@ function formatRupees(amount: number): string {
  * back to the Razorpay payment id if that's missing, and is skipped
  * entirely if both are — never prints "undefined"/"null", and never prints
  * a UPI id, card details or phone number.
+ *
+ * Only ever called for a paid (non-staff) job — see buildBannerPlanContext,
+ * which picks buildStaffPrintLineTexts below instead whenever
+ * job.paymentMethod === "staff".
  */
 export function buildPaymentLineTexts(job: Pick<PrintJobRecord, "paidAmount" | "totalPrice" | "upiTxnId" | "paymentId">, font: PDFFont): string[] {
   const lines: string[] = [];
 
   const amount = job.paidAmount ?? job.totalPrice;
   if (typeof amount === "number" && Number.isFinite(amount)) {
-    const symbol = fontCanEncode(font, RUPEE_GLYPH) ? RUPEE_GLYPH : BANNER_LAYOUT_CONFIG.labels.rupeeFallback;
-    lines.push(`${BANNER_LAYOUT_CONFIG.labels.totalPaidPrefix}${symbol}${formatRupees(amount)}`);
+    lines.push(`${BANNER_LAYOUT_CONFIG.labels.totalPaidPrefix}${rupeeSymbolFor(font)}${formatRupees(amount)}`);
   }
 
   const txnId = job.upiTxnId || job.paymentId;
@@ -564,50 +663,64 @@ export function buildPaymentLineTexts(job: Pick<PrintJobRecord, "paidAmount" | "
   return lines;
 }
 
+/**
+ * The single line printed in place of the normal payment lines for a free
+ * staff/owner print (ROADMAP-style staff-print feature) — "STAFF PRINT
+ * (value ₹X, not charged)", where X is waivedAmount: the price this job
+ * WOULD have cost a paying customer, computed server-side from the real
+ * pricing rules (see app/api/staff-print/route.ts), never from anything the
+ * client claims. Follows the same robustness rule every other banner line
+ * does: if the data it needs is missing (waivedAmount undefined — shouldn't
+ * happen in practice, since app/api/staff-print always computes and stores
+ * it, but this function makes no assumption that it will), the line is
+ * skipped entirely rather than printing "undefined"/"null"/a blank amount.
+ * No payment lines (UPI id, payment id) are ever shown for a staff print —
+ * there is no payment to show.
+ */
+export function buildStaffPrintLineTexts(job: Pick<PrintJobRecord, "waivedAmount">, font: PDFFont): string[] {
+  if (typeof job.waivedAmount !== "number" || !Number.isFinite(job.waivedAmount)) return [];
+  const { staffPrintPrefix, staffPrintSuffix } = BANNER_LAYOUT_CONFIG.labels;
+  return [`${staffPrintPrefix}${rupeeSymbolFor(font)}${formatRupees(job.waivedAmount)}${staffPrintSuffix}`];
+}
+
 // ----------------------------------------------------------------------------
-// Instagram QR image loading
+// Instagram QR generation
 // ----------------------------------------------------------------------------
 
 /**
- * Reads public/brand/insta.png once and caches the bytes for the life of
- * this process. Only ever called from appendBannerPage below, which in
- * turn is only ever called from print-agent/index.ts — the website/Vercel
- * never generates the banner at all, so this is a plain Node filesystem
- * read, not something that needs to work inside a Vercel/edge runtime.
- * process.cwd() is the repo root here (see pi/oxway-print-agent.service's
- * own WorkingDirectory), the same way the rest of the print agent already
- * resolves repo-relative paths.
- *
- * Never throws: returns null (and logs once) if the file is missing or
- * unreadable, so a broken/absent image degrades to "banner prints without
- * the QR," never "the print job fails."
+ * Generates the Instagram QR's module grid once and caches it for the life
+ * of this process — generation is a pure, synchronous computation from a
+ * fixed URL (see BANNER_LAYOUT_CONFIG.instagram), so unlike the old
+ * insta.png read there's no I/O to fail here in normal operation; the
+ * try/catch exists purely so a future bug in the `qrcode` library itself
+ * degrades to "banner prints without the QR," never "the print job fails,"
+ * same robustness rule every other optional banner element follows.
  */
-let cachedInstaQrBytes: Uint8Array | null | undefined;
-async function loadInstaQrBytes(): Promise<Uint8Array | null> {
-  if (cachedInstaQrBytes !== undefined) return cachedInstaQrBytes;
+let cachedQrMatrix: QrMatrix | null | undefined;
+function getInstagramQrMatrix(): QrMatrix | null {
+  if (cachedQrMatrix !== undefined) return cachedQrMatrix;
   try {
-    const filePath = path.join(process.cwd(), ...BANNER_LAYOUT_CONFIG.qrImagePathSegments);
-    cachedInstaQrBytes = await readFile(filePath);
+    cachedQrMatrix = generateQrMatrix(BANNER_LAYOUT_CONFIG.instagram.url, BANNER_LAYOUT_CONFIG.instagram.errorCorrectionLevel);
   } catch (error) {
-    console.warn("Could not read the Instagram QR image — printing the banner without it:", error);
-    cachedInstaQrBytes = null;
+    console.warn("Could not generate the Instagram QR code — printing the banner without it:", error);
+    cachedQrMatrix = null;
   }
-  return cachedInstaQrBytes;
+  return cachedQrMatrix;
 }
 
-/** Only used by tests, which need to force a fresh (or deliberately failing) read instead of whatever this process already cached. */
-export function resetInstaQrCacheForTests(): void {
-  cachedInstaQrBytes = undefined;
+/** Only used by tests, which need to force a fresh (or deliberately failing) generation instead of whatever this process already cached. */
+export function resetQrMatrixCacheForTests(): void {
+  cachedQrMatrix = undefined;
 }
 
 /**
  * Builds the BannerPlanContext for a job — the ticket code, date/time
- * line, Request ID line and payment lines, exactly as appendBannerPage
+ * line, Request ID line and payment lines, exactly as prependBannerPage
  * prints them. Exported so tests can build a real, representative context
  * for computeBannerPlan without duplicating this string-building logic.
  */
-export function buildBannerPlanContext(bold: PDFFont, regular: PDFFont, qrImage: PDFImage | null, pageWidth: number, pageHeight: number, job: PrintJobRecord): BannerPlanContext {
-  const pickupCode = job.ticketNumber != null ? `#${String(job.ticketNumber).padStart(3, "0")}` : shortRequestId(job.id);
+export function buildBannerPlanContext(bold: PDFFont, regular: PDFFont, qrMatrix: QrMatrix | null, pageWidth: number, pageHeight: number, job: PrintJobRecord): BannerPlanContext {
+  const pickupCode = job.ticketNumber != null ? formatTicketCode(job.ticketNumber) : shortRequestId(job.id);
   const requestId = shortRequestId(job.id);
   const timestamp = new Date(job.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
   // Phone number collection (ROADMAP.md §1) is disabled in this build, so
@@ -622,12 +735,15 @@ export function buildBannerPlanContext(bold: PDFFont, regular: PDFFont, qrImage:
     pageHeight,
     bold,
     regular,
-    qrImage,
+    qrMatrix,
     pickupLabel: BANNER_LAYOUT_CONFIG.blocks.pickupLabel.text,
     ticketCode: pickupCode,
     detailLine,
     requestIdLine: `${BANNER_LAYOUT_CONFIG.labels.requestIdPrefix}${requestId}`,
-    paymentLineTexts: buildPaymentLineTexts(job, regular),
+    // A staff print shows "STAFF PRINT (value ₹X, not charged)" instead of
+    // the normal "Total paid"/"UPI Txn ID" lines — never both, there is no
+    // real payment to show for one.
+    paymentLineTexts: job.paymentMethod === "staff" ? buildStaffPrintLineTexts(job, regular) : buildPaymentLineTexts(job, regular),
     oxwayText: BANNER_LAYOUT_CONFIG.blocks.oxway.text,
   };
 }
@@ -637,21 +753,19 @@ export function buildBannerPlanContext(bold: PDFFont, regular: PDFFont, qrImage:
 // ----------------------------------------------------------------------------
 
 /**
- * Builds a single pickup-ID cover page and appends it to the END of the
- * print-ready PDF — always on, see ROADMAP.md #5. Returns one PDF (the
- * original content first, in its original 1..N order, banner last),
- * submitted to CUPS as a single job (see submitPrintJob in
- * lib/print/cups.ts).
+ * Builds a single pickup-ID cover page and prepends it to the FRONT of the
+ * print-ready PDF — always on, see ROADMAP.md #5. Returns one PDF (banner
+ * first, then the original content in its original 1..N order), submitted
+ * to CUPS as a single job (see submitPrintJob in lib/print/cups.ts).
  *
- * Banner LAST, not first: this printer outputs face-down, so whatever
- * prints last ends up on top of the finished stack — the banner needs to
- * be the thing the customer actually sees when they pick up their print,
- * not buried under the content. `contentPdfBytes` is expected to already
- * be each copy's own content, back to back (see expandCopies in
- * lib/print/pdf.ts, called from print-agent/index.ts before this function
- * runs) — appending the banner here, once, after that, is what makes it
- * print exactly once for the whole job regardless of how many copies were
- * ordered, never once per copy.
+ * Banner FIRST, not last: whatever prints first ends up on top of the
+ * finished stack on this printer — the banner needs to be the thing the
+ * customer actually sees when they pick up their print, not buried under
+ * the content. `contentPdfBytes` is expected to already be each copy's own
+ * content, back to back (see expandCopies in lib/print/pdf.ts, called from
+ * print-agent/index.ts before this function runs) — prepending the banner
+ * here, once, in front of that, is what makes it print exactly once for the
+ * whole job regardless of how many copies were ordered, never once per copy.
  *
  * Everything on the banner — the ordered list of blocks, their sizes, gaps,
  * floors and drop priorities — is computed from the page's own real width
@@ -665,17 +779,16 @@ export function buildBannerPlanContext(bold: PDFFont, regular: PDFFont, qrImage:
  * silently patched over, so a real layout bug shows up as a failing test
  * rather than a quietly-degraded banner.
  */
-export async function appendBannerPage(contentPdfBytes: Uint8Array, job: PrintJobRecord): Promise<Uint8Array> {
+export async function prependBannerPage(contentPdfBytes: Uint8Array, job: PrintJobRecord): Promise<Uint8Array> {
   const output = await PDFDocument.create();
   const bold = await output.embedFont(StandardFonts.HelveticaBold);
   const regular = await output.embedFont(StandardFonts.Helvetica);
 
-  // Copied (and added to the page tree immediately below) before the
-  // banner page itself so the banner can match the content's actual
-  // orientation.
+  // Loaded (but not yet copied into the output document) up front purely to
+  // read the content's own orientation, so the banner can match it before
+  // the banner page itself is created.
   const content = await PDFDocument.load(contentPdfBytes);
-  const contentPages = await output.copyPages(content, content.getPageIndices());
-  contentPages.forEach((page) => output.addPage(page));
+  const contentPageIndices = content.getPageIndices();
 
   // A landscape print job with the banner enabled would otherwise mix a
   // portrait cover sheet in with landscape content pages inside the same
@@ -684,7 +797,9 @@ export async function appendBannerPage(contentPdfBytes: Uint8Array, job: PrintJo
   // sitting sideways-relative-to-everything-else in an otherwise-landscape
   // stack. Match extractSelectedPages' own notion of orientation (width vs
   // height of the already-processed content) rather than re-deriving it.
-  const [firstContentPage] = contentPages;
+  // Read directly off the source document — no need to copy it into
+  // `output` just to measure it.
+  const firstContentPage = content.getPage(contentPageIndices[0]);
   const isContentLandscape = firstContentPage.getWidth() > firstContentPage.getHeight();
   const bannerWidth = isContentLandscape ? A4_HEIGHT : A4_WIDTH;
   const bannerHeight = isContentLandscape ? A4_WIDTH : A4_HEIGHT;
@@ -693,15 +808,7 @@ export async function appendBannerPage(contentPdfBytes: Uint8Array, job: PrintJo
 
   let finalElements: PlannedElement[];
   try {
-    let qrImage: PDFImage | null = null;
-    try {
-      const instaQrBytes = await loadInstaQrBytes();
-      if (instaQrBytes) qrImage = await output.embedPng(instaQrBytes);
-    } catch (error) {
-      console.warn("Could not embed the Instagram QR image — continuing without it:", error);
-    }
-
-    const ctx = buildBannerPlanContext(bold, regular, qrImage, bannerWidth, bannerHeight, job);
+    const ctx = buildBannerPlanContext(bold, regular, getInstagramQrMatrix(), bannerWidth, bannerHeight, job);
     finalElements = computeBannerPlan(ctx);
   } catch (error) {
     // The one case this must NOT be swallowed: a genuine safety-net
@@ -713,6 +820,13 @@ export async function appendBannerPage(contentPdfBytes: Uint8Array, job: PrintJo
   }
 
   commitElements(banner, finalElements);
+
+  // Content pages are appended AFTER the banner, in their original order —
+  // copied again (rather than reusing firstContentPage above) so the whole
+  // document is built from one straightforward copyPages(content, all
+  // indices) call, with no special-cased first page.
+  const contentPages = await output.copyPages(content, contentPageIndices);
+  contentPages.forEach((page) => output.addPage(page));
 
   return output.save();
 }

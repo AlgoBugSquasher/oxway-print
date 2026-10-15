@@ -34,6 +34,14 @@ export interface AdminJobRow {
   ticket_date: string | null;
   /** ROADMAP.md §24/§25 — reserved, unused this build. Always null; see the column's own comment in supabase/schema.sql. */
   collected_at: string | null;
+  /** 'staff' for a free print created via app/api/staff-print; 'razorpay'/'cashfree' (mirroring `provider`) for everything else. Null for jobs created before this column existed. */
+  payment_method: "razorpay" | "cashfree" | "staff" | null;
+  /** Which owner/staff account created this job — only ever set for a staff print. Resolve to an email via /api/admin/staff-users (print_jobs_admin_view can't join auth.users directly). */
+  created_by_user_id: string | null;
+  /** True only for a staff print. */
+  is_free: boolean | null;
+  /** The price this job WOULD have cost a paying customer — set only for a staff print, computed server-side from the real pricing rules. */
+  waived_amount: number | null;
 }
 
 /** Row shape returned by kiosk_status_admin_view. `total_revenue` is `null` for staff. */
@@ -53,6 +61,10 @@ export interface AdminKioskRow {
   agent_updated_at: string | null;
   /** Owner-only admin toggle — whether the WhatsApp opt-in is even offered at this kiosk. Defaults false. */
   allow_whatsapp: boolean;
+  /** Running totals for free staff/owner prints (ROADMAP-style staff-print feature) — incremented at print completion, same timing as total_revenue. Not masked for staff the way total_revenue is. */
+  free_print_count: number;
+  free_print_pages: number;
+  free_print_waived_amount: number;
 }
 
 export type AdminKioskCommandName = "update" | "restart";
@@ -77,4 +89,64 @@ export interface PricingConfigRow {
   price_color: number;
   updated_at: string;
   updated_by: string | null;
+}
+
+export type OverviewPeriod = "today" | "week" | "month" | "year";
+
+/**
+ * One row from get_kiosk_period_breakdown — one bucket (hour/day/month,
+ * depending on the period) of totals. Money fields are `null` for staff,
+ * same masking convention as AdminKioskRow.total_revenue.
+ */
+export interface PeriodBreakdownRow {
+  bucket_start: string;
+  revenue: number | null;
+  refund_amount: number | null;
+  refund_count: number | null;
+  pages_printed: number;
+  prints_completed: number;
+  free_print_count: number;
+  free_print_pages: number;
+  free_print_waived_amount: number | null;
+}
+
+/** Row shape returned by get_kiosk_supply_status — raw inputs only; lib/admin/supply-estimate.ts turns these into a remaining/percent/status a card can render. */
+export interface SupplyStatusRow {
+  cartridge_max_pages: number;
+  has_paper_baseline: boolean;
+  paper_quantity: number | null;
+  paper_consumed_since: number | null;
+  paper_refilled_at: string | null;
+  paper_refilled_by: string | null;
+  has_toner_baseline: boolean;
+  toner_starting_pages: number | null;
+  toner_consumed_since: number | null;
+  toner_refilled_at: string | null;
+  toner_refilled_by: string | null;
+}
+
+/** Row shape of refill_events — one "Paper refilled"/"Toner replaced" history entry. */
+export interface RefillEventRow {
+  id: string;
+  kiosk_id: string;
+  kind: "paper" | "toner";
+  quantity: number;
+  at: string;
+  by_user_id: string | null;
+  note: string | null;
+}
+
+/** Row shape of audit_log — owner-only (RLS), see supabase/schema.sql §11. `details` is deliberately untyped jsonb — each action's own shape is interpreted by lib/admin/audit-descriptions.ts, never assumed here. */
+export interface AuditLogRow {
+  id: number;
+  at: string;
+  actor_user_id: string | null;
+  actor_role: string | null;
+  kiosk_id: string | null;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  details: Record<string, unknown> | null;
+  ip: string | null;
+  user_agent: string | null;
 }

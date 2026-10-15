@@ -19,7 +19,7 @@ export function buildLpArgs(filePath: string, settings: PrintSettingsSnapshot): 
   // baked directly into the submitted PDF itself before it ever reaches
   // this function — see expandCopies in lib/print/pdf.ts, called from
   // print-agent/index.ts — specifically so the mandatory banner page
-  // (lib/print/banner.ts's appendBannerPage) can be appended once, after
+  // (lib/print/banner.ts's prependBannerPage) can be added once, in front of
   // every copy of the actual content, rather than printing once per copy
   // the way letting CUPS's own -n flag replicate the whole submitted file
   // would. This also sidesteps relying on this printer's own collate

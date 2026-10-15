@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
+import { logDuration, withTiming } from "@/lib/server-timing";
 import type { AdminRole } from "@/lib/admin/types";
 import AdminShell from "./admin-shell";
 
@@ -25,11 +26,20 @@ export const dynamic = "force-dynamic";
 
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
   const supabase = await createSupabaseServerClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  const role = ((user?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none";
+  // getClaims(), not getUser() — proxy.ts has already gated this whole
+  // route group on a valid session; this call is purely for display
+  // (email/role in the header, which nav items to show), never a security
+  // boundary itself, so there's no reason to pay for a second network round
+  // trip to the Auth server on top of proxy.ts's own check. See that file's
+  // own comment for why this is still real, verified-signature data, not a
+  // bare decode.
+  const { result: { data }, tookMs } = await withTiming(() => supabase.auth.getClaims());
+  const claims = data?.claims;
+  const role = ((claims?.app_metadata as { role?: AdminRole } | undefined)?.role) ?? "none";
+  logDuration("layout.getClaims", tookMs, { role });
 
   return (
-    <AdminShell email={user?.email ?? ""} role={role}>
+    <AdminShell email={claims?.email ?? ""} role={role}>
       {children}
     </AdminShell>
   );

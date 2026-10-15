@@ -1,15 +1,12 @@
 "use client";
 
-import { type ChangeEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { load as loadCashfree } from "@cashfreepayments/cashfree-js";
 import confetti from "canvas-confetti";
 import {
   Check,
-  CheckCircle2,
   ChevronDown,
-  ChevronUp,
-  Circle,
   Copy,
   FileText,
   FileUp,
@@ -30,6 +27,16 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import BrandWatermark from "@/components/BrandWatermark";
 import BrandWordmark from "@/components/BrandWordmark";
 import LivePrintPreview from "@/components/LivePrintPreview";
+import {
+  FileBasketItemCard,
+  itemActivePages,
+  Segmented,
+  SettingRow,
+  type Layout,
+  type PageMode,
+  type PaperSize,
+  type PrintSettings,
+} from "@/components/print-basket-ui";
 import { fetchJson } from "@/lib/fetch-json";
 import {
   MAX_COMBINED_FILE_SIZE_BYTES,
@@ -37,17 +44,13 @@ import {
   MAX_FILE_SIZE_BYTES,
   MAX_TOTAL_PAGES_PER_BASKET,
   useFileBasket,
-  type FileBasketItem,
 } from "@/lib/hooks/useFileBasket";
 import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
 import type { CreateOrderOutput } from "@/lib/payment";
 import { mergeSelectedPdfPages } from "@/lib/pdf-merge";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
+import { formatTicketCode } from "@/lib/ticket-code";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
-
-type PageMode = "all" | "odd" | "even" | "custom";
-type PaperSize = "A4" | "Letter" | "Legal";
-type Layout = "portrait" | "landscape";
 
 /** Mirrors lib/store.ts JobStatus, plus a local "idle" state before any order exists. */
 type OrderStatus =
@@ -60,16 +63,6 @@ type OrderStatus =
   | "payment_failed"
   | "expired"
   | "cancelled";
-
-type PrintSettings = {
-  copies: number;
-  layout: Layout;
-  isColor: boolean;
-  pageMode: PageMode;
-  customRange: string;
-  paperSize: PaperSize;
-  pagesPerSheet: 1 | 2 | 4;
-};
 
 // Once a job reaches one of these, nothing about it changes again — no point
 // still polling or staying subscribed to Realtime for it.
@@ -115,26 +108,6 @@ function notifyPrintReady() {
 // behind an explicit checkbox rather than always collected — same 10-digit
 // Indian mobile pattern §1 already validated against.
 const PHONE_PATTERN = /^[6-9]\d{9}$/;
-
-function parsePageRange(value: string, totalPages: number) {
-  const pages = new Set<number>();
-  for (const token of value.split(",")) {
-    const [startText, endText] = token.trim().split("-").map((part) => part.trim());
-    const start = Number(startText);
-    const end = endText ? Number(endText) : start;
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) continue;
-    for (let page = start; page <= Math.min(end, totalPages); page += 1) pages.add(page);
-  }
-  return [...pages].sort((a, b) => a - b);
-}
-
-/** Applies the global pageMode/customRange filter to one basket item's own selectedPages — each file is filtered independently (there's no merged document yet to number pages across, see handleStartPayment's own note on that). */
-function itemActivePages(item: FileBasketItem, pageMode: PageMode, customRange: string): number[] {
-  if (pageMode === "all") return item.selectedPages;
-  if (pageMode === "odd") return item.selectedPages.filter((page) => page % 2 === 1);
-  if (pageMode === "even") return item.selectedPages.filter((page) => page % 2 === 0);
-  return parsePageRange(customRange, item.totalPages).filter((page) => item.selectedPages.includes(page));
-}
 
 export default function PdfPageSelector() {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -585,7 +558,16 @@ export default function PdfPageSelector() {
       <div className="mx-auto max-w-6xl px-5 pt-6 lg:px-8">
         <div className={`flex flex-col items-center rounded-[2rem] border-2 border-blue-600 px-6 py-8 text-center shadow-xl shadow-blue-600/10 ${isDark ? "bg-blue-600/15" : "bg-blue-50"}`}>
           <p className="text-xs font-black uppercase tracking-[0.35em] text-blue-600">Your pickup code</p>
-          <p className="mt-2 text-[5.5rem] font-black leading-none tracking-tight text-blue-600 sm:text-[8rem]">#{String(ticketNumber).padStart(3, "0")}</p>
+          {/* Fixed sizing (text-[5.5rem]/text-[8rem]) was hand-tuned for the
+             usual 3-digit code ("#042") and never shrinks for a longer one —
+             on a narrow phone screen, a 4-5 digit code ("#1000"/"#10000") at
+             that same size would run wider than the viewport. A smaller
+             fixed size once the code itself is longer keeps this readable
+             without ever overflowing, on any digit count this kiosk will
+             realistically ever reach. */}
+          <p className={`mt-2 font-black leading-none tracking-tight text-blue-600 ${String(ticketNumber).length >= 4 ? "text-[4rem] sm:text-[6rem]" : "text-[5.5rem] sm:text-[8rem]"}`}>
+            {formatTicketCode(ticketNumber)}
+          </p>
         </div>
       </div>
     )}
@@ -690,7 +672,9 @@ export default function PdfPageSelector() {
          price throughout, rather than duplicating the same number twice
          on screen at two very different sizes. */}
       <div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>
-      {orderStatus === "idle" && <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>}
+      {orderStatus === "idle" && <div className="flex items-center gap-2">
+        <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>
+      </div>}
       {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
       {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
       {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
@@ -718,109 +702,5 @@ export default function PdfPageSelector() {
        a preview on every keystroke isn't worth the cost; out of scope for
        now. */}
     {isPreviewOpen && <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/50 p-5"><div className="max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-5"><LivePrintPreview settings={settings} activePages={activePagesPerItem[0] ?? []} thumbnails={primaryItem?.thumbnails ?? []} imagePreviewUrl={primaryItem?.previewUrl} fileType={primaryItem?.file.type} isOpen onClose={() => setIsPreviewOpen(false)} /></div></div>}
-  </div>;
-}
-
-function SettingRow({ label, icon, children }: { label: string; icon: ReactNode; children: ReactNode }) {
-  return <div className="flex items-center justify-between gap-4"><span className="flex items-center gap-2 text-sm font-bold text-slate-500">{icon}{label}</span>{children}</div>;
-}
-
-function Segmented({ value, options, labels = options, disabledOptions = [], onChange }: { value: string; options: string[]; labels?: string[]; disabledOptions?: string[]; onChange: (value: string) => void }) {
-  return <div className="flex rounded-xl border border-slate-200 p-1 dark:border-white/10">{options.map((option, index) => {
-    const isDisabled = disabledOptions.includes(option);
-    return <button
-      key={option}
-      disabled={isDisabled}
-      onClick={() => onChange(option)}
-      className={`rounded-lg px-2.5 py-2 text-[11px] font-bold transition ${isDisabled ? "cursor-not-allowed text-slate-300 dark:text-slate-600" : value === option ? "bg-blue-600 text-white" : "text-slate-500"}`}
-    >
-      {labels[index]}
-    </button>;
-  })}</div>;
-}
-
-/**
- * One row in the file basket — name/size/page-count, its own page-selection
- * grid (reusing the same visual language the single-file flow always had),
- * and the per-file controls (reorder, remove). All disabled together via
- * `canEdit` once a payment is in progress or has succeeded (see
- * PdfPageSelector's own `canEditBasket`) — reordering or removing a file an
- * order already references would leave that order pointing at something
- * that's no longer what the customer sees on screen.
- */
-function FileBasketItemCard({
-  item,
-  index,
-  itemCount,
-  isDark,
-  muted,
-  panel,
-  canEdit,
-  activePages,
-  onRemove,
-  onMoveUp,
-  onMoveDown,
-  onTogglePage,
-  onSelectAll,
-  onClearPages,
-}: {
-  item: FileBasketItem;
-  index: number;
-  itemCount: number;
-  isDark: boolean;
-  muted: string;
-  panel: string;
-  canEdit: boolean;
-  activePages: number[];
-  onRemove: () => void;
-  onMoveUp: () => void;
-  onMoveDown: () => void;
-  onTogglePage: (pageNumber: number) => void;
-  onSelectAll: () => void;
-  onClearPages: () => void;
-}) {
-  const controlButtonClass = "grid size-11 shrink-0 place-items-center rounded-xl transition focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-30";
-
-  return <div className={`rounded-2xl border p-4 ${panel}`}>
-    <div className="flex items-center gap-3">
-      <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-red-500/10 text-red-500"><FileText size={21} /></div>
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-bold">{item.file.name}</p>
-        <p className={`mt-1 text-xs ${muted}`}>
-          {(item.file.size / (1024 * 1024)).toFixed(2)} MB
-          {item.status === "ready" && ` · ${item.totalPages} ${item.totalPages === 1 ? "page" : "pages"}`}
-          {item.status === "converting" && " · Preparing..."}
-        </p>
-      </div>
-      <div className="flex shrink-0 items-center gap-1">
-        <button type="button" onClick={onMoveUp} disabled={!canEdit || index === 0} aria-label={`Move ${item.file.name} up`} className={`${controlButtonClass} text-blue-500 focus-visible:ring-blue-500 ${isDark ? "hover:enabled:bg-blue-500/10" : "hover:enabled:bg-blue-50"}`}><ChevronUp size={18} /></button>
-        <button type="button" onClick={onMoveDown} disabled={!canEdit || index === itemCount - 1} aria-label={`Move ${item.file.name} down`} className={`${controlButtonClass} text-blue-500 focus-visible:ring-blue-500 ${isDark ? "hover:enabled:bg-blue-500/10" : "hover:enabled:bg-blue-50"}`}><ChevronDown size={18} /></button>
-        <button type="button" onClick={onRemove} disabled={!canEdit} aria-label={`Remove ${item.file.name}`} className={`${controlButtonClass} text-red-500 focus-visible:ring-red-500 ${isDark ? "hover:enabled:bg-red-500/10" : "hover:enabled:bg-red-50"}`}><X size={18} /></button>
-      </div>
-    </div>
-
-    {item.status === "error" && <div className="mt-3 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-500">{item.error}</div>}
-
-    {item.status === "converting" && <div className={`mt-3 flex items-center gap-2 text-xs ${muted}`}><RefreshCw className="animate-spin text-blue-500" size={14} /> Converting to a printable PDF...</div>}
-
-    {item.status === "ready" && <div className="mt-4">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <p className={`text-xs ${muted}`}>{activePages.length} active pages · tap a page to include or exclude</p>
-        <div className="flex shrink-0 gap-2">
-          <button type="button" onClick={onSelectAll} className="text-xs font-bold text-blue-500">All</button>
-          <button type="button" onClick={onClearPages} className={`text-xs font-bold ${muted}`}>Clear</button>
-        </div>
-      </div>
-      <div className={`grid max-h-80 grid-cols-3 gap-2 overflow-y-auto rounded-2xl border p-2 sm:grid-cols-4 ${isDark ? "border-white/10 bg-white/[0.03]" : "border-slate-200 bg-slate-100/70"}`}>
-        {item.thumbnails.map((thumbnail) => {
-          const selected = item.selectedPages.includes(thumbnail.pageNumber);
-          return <button key={thumbnail.pageNumber} type="button" onClick={() => onTogglePage(thumbnail.pageNumber)} className={`relative overflow-hidden rounded-xl border-2 bg-white p-1 text-left transition hover:-translate-y-0.5 ${selected ? "border-blue-500 shadow-lg shadow-blue-500/10" : "border-transparent opacity-45 grayscale"}`}>
-            <img src={thumbnail.dataUrl} alt={`Page ${thumbnail.pageNumber}`} className="aspect-[1/1.35] w-full object-contain" />
-            <span className="absolute left-2 top-2 rounded-md bg-white/90 px-1.5 py-1 text-[10px] font-black text-slate-600">{thumbnail.pageNumber}</span>
-            <span className="absolute right-2 top-2 text-blue-600">{selected ? <CheckCircle2 size={16} fill="white" /> : <Circle size={16} />}</span>
-          </button>;
-        })}
-      </div>
-    </div>}
   </div>;
 }
