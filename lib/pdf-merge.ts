@@ -1,4 +1,8 @@
 import { PDFDocument } from "pdf-lib";
+import { reportClientError } from "./client-log";
+
+/** Marks the two deliberate, already-customer-readable throws below (names the bad file, or says nothing was selected) — anything else (a pdf-lib internal failure, a browser quirk) is NOT one of these and gets replaced with a generic friendly message instead of leaking a raw library error onto the screen. */
+class MergeInputError extends Error {}
 
 export interface MergeSourceFile {
   /** Used only to name the file in an error message if its bytes can't be read — never printed, never sent anywhere. */
@@ -39,8 +43,26 @@ export interface MergedPdf {
  * never silently drops a file or produces a merged PDF missing pages
  * without saying why. Also throws if the combined selection has no pages
  * at all (every file empty, or an empty file list).
+ *
+ * Wrapped (not thrown directly from the body below) so that anything
+ * pdf-lib itself throws internally — a bundling/version hiccup, a
+ * malformed PDF neither of the two checks above catches, anything — never
+ * reaches the customer as a raw library error string. The two deliberate
+ * MergeInputErrors below are already written in plain language and pass
+ * through unchanged; everything else is logged with the real error (see
+ * reportClientError) and replaced with one generic message.
  */
 export async function mergeSelectedPdfPages(files: MergeSourceFile[]): Promise<MergedPdf> {
+  try {
+    return await mergeSelectedPdfPagesUnsafe(files);
+  } catch (error) {
+    if (error instanceof MergeInputError) throw error;
+    reportClientError("pdf-merge-failed", error, { fileCount: files.length });
+    throw new Error("We couldn't process this file, please try again.");
+  }
+}
+
+async function mergeSelectedPdfPagesUnsafe(files: MergeSourceFile[]): Promise<MergedPdf> {
   const output = await PDFDocument.create();
 
   for (const file of files) {
@@ -50,7 +72,7 @@ export async function mergeSelectedPdfPages(files: MergeSourceFile[]): Promise<M
     try {
       source = await PDFDocument.load(file.pdfBytes);
     } catch (loadError) {
-      throw new Error(`"${file.fileName}" could not be read while combining your files — try removing and re-adding it.`, { cause: loadError });
+      throw new MergeInputError(`"${file.fileName}" could not be read while combining your files — try removing and re-adding it.`, { cause: loadError });
     }
 
     const sortedPages = [...file.selectedPages].sort((a, b) => a - b);
@@ -64,7 +86,7 @@ export async function mergeSelectedPdfPages(files: MergeSourceFile[]): Promise<M
   }
 
   if (output.getPageCount() === 0) {
-    throw new Error("No pages selected across any file.");
+    throw new MergeInputError("No pages selected across any file.");
   }
 
   return { bytes: await output.save(), pageCount: output.getPageCount() };

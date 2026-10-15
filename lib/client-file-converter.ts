@@ -1,4 +1,5 @@
 import { PDFDocument } from "pdf-lib";
+import { reportClientError } from "./client-log";
 
 // Not imported from lib/store.ts's PrintSettingsSnapshot on purpose — this
 // file is bundled into the browser (see PdfPageSelector.tsx's import of it),
@@ -79,12 +80,22 @@ async function imageToPdf(file: File, layout: Layout) {
   const jpegBytes = await new Promise<ArrayBuffer>((resolve, reject) => {
     canvas.toBlob((blob: Blob | null) => blob ? blob.arrayBuffer().then(resolve).catch(reject) : reject(new Error("Could not encode the camera image.")), "image/jpeg", 0.92);
   });
-  const pdfDocument = await PDFDocument.create();
-  const embeddedImage = await pdfDocument.embedJpg(jpegBytes);
-  const page = pdfDocument.addPage([pageWidth, pageHeight]);
-  page.drawImage(embeddedImage, { x: (pageWidth - width) / 2, y: (pageHeight - height) / 2, width, height });
-  if ("close" in image && typeof image.close === "function") image.close();
-  return pdfDocument.save();
+  // pdf-lib's own calls (create/embedJpg/addPage/save), wrapped — a bundling
+  // or library-internal failure here must never surface as a raw string
+  // like "PDFHeader_1.default.forVersion is not a function" to the
+  // customer; see lib/pdf-merge.ts's identical reasoning for its own
+  // pdf-lib calls.
+  try {
+    const pdfDocument = await PDFDocument.create();
+    const embeddedImage = await pdfDocument.embedJpg(jpegBytes);
+    const page = pdfDocument.addPage([pageWidth, pageHeight]);
+    page.drawImage(embeddedImage, { x: (pageWidth - width) / 2, y: (pageHeight - height) / 2, width, height });
+    if ("close" in image && typeof image.close === "function") image.close();
+    return await pdfDocument.save();
+  } catch (pdfLibError) {
+    reportClientError("image-to-pdf-failed", pdfLibError, { fileType: file.type });
+    throw new Error("We couldn't process this file, please try again.");
+  }
 }
 
 function readFileAsArrayBuffer(file: File) {

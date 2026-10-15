@@ -1,6 +1,7 @@
 import { PDFDocument, StandardFonts } from "pdf-lib";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mergeSelectedPdfPages } from "./pdf-merge";
+import * as clientLog from "./client-log";
 
 /** Pages with distinct heights so order/selection can be checked by geometry alone. */
 async function buildPdf(heights: number[]): Promise<Uint8Array> {
@@ -119,5 +120,36 @@ describe("mergeSelectedPdfPages", () => {
     const file = await buildPdf([401, 402]);
     const merged = await mergeSelectedPdfPages([{ fileName: "doc.pdf", pdfBytes: file, selectedPages: [1, 99] }]);
     expect(merged.pageCount).toBe(1);
+  });
+
+  describe("an unexpected pdf-lib internal failure (e.g. a bundling/version regression)", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("never surfaces the raw library error to the caller, and reports it server-side instead", async () => {
+      // Simulates the exact production bug this guards against: something
+      // deep inside the merge throws a raw, internal, non-customer-facing
+      // error (there, "PDFHeader_1.default.forVersion is not a function",
+      // from a pdf-lib bundling regression) that ISN'T one of the two
+      // deliberate, already-friendly MergeInputErrors above. A
+      // selectedPages getter that throws is a simple, reliable way to
+      // inject exactly that shape of failure without reaching into
+      // pdf-lib's own internals.
+      const rawLibraryError = new TypeError("PDFHeader_1.default.forVersion is not a function");
+      const reportSpy = vi.spyOn(clientLog, "reportClientError").mockImplementation(() => {});
+      const file = await buildPdf([401]);
+      const trapFile = {
+        fileName: "doc.pdf",
+        pdfBytes: file,
+        get selectedPages(): number[] {
+          throw rawLibraryError;
+        },
+      };
+
+      await expect(mergeSelectedPdfPages([trapFile])).rejects.toThrow("We couldn't process this file, please try again.");
+
+      expect(reportSpy).toHaveBeenCalledWith("pdf-merge-failed", rawLibraryError, expect.anything());
+    });
   });
 });
