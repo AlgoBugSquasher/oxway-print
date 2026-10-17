@@ -28,4 +28,13 @@ export interface VerifyResult {
 
 export interface RefundResult {
   refundId: string;
+  /**
+   * True when this call discovered the money had ALREADY moved at the
+   * gateway (a previous attempt whose own DB write failed, retried later)
+   * rather than this call being the one that actually moved it — see
+   * lib/payment/razorpay.ts / lib/payment/cashfree.ts's own pre-refund
+   * checks. lib/refund.ts treats this exactly like a fresh success (the
+   * money is refunded either way) but records it in the audit trail.
+   */
+  alreadyRefunded?: boolean;
 }

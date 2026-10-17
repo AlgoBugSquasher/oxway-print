@@ -19,7 +19,7 @@ import { formatTicketCode } from "@/lib/ticket-code";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
 
 /** Mirrors lib/store.ts JobStatus, plus a local "idle" state before any job exists — same shape the customer page tracks, just without the payment-specific states (pending_payment/payment_failed/expired never happen here, a staff job is created already-paid). */
-type JobStatus = "idle" | "submitting" | "paid" | "printing" | "printed" | "print_failed" | "cancelled";
+type JobStatus = "idle" | "submitting" | "paid" | "printing" | "print_blocked" | "printed" | "print_failed" | "cancelled";
 const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "cancelled"];
 
 /** Which kiosk this print goes to — ?k=<kiosk-id> for a multi-kiosk setup, same convention the customer page and kiosk-display screen already use. Defaults to the single kiosk this build ships with. */
@@ -51,6 +51,8 @@ export default function AdminPrintPage() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [ticketNumber, setTicketNumber] = useState<number | null>(null);
   const [waivedAmount, setWaivedAmount] = useState<number | null>(null);
+  /** This SPECIFIC submitted job's own blocked reason, once status is print_blocked — distinct from the kiosk-wide printBlockedReason below (that one's for the banner shown before anything's even submitted yet). */
+  const [jobBlockedReason, setJobBlockedReason] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
@@ -59,17 +61,26 @@ export default function AdminPrintPage() {
   const [isKioskUpdating, setIsKioskUpdating] = useState(false);
   const [allowColor, setAllowColor] = useState(true);
   const [allowBw, setAllowBw] = useState(true);
+  // Informational only here, deliberately NOT disabling "Print free" —
+  // unlike the paying-customer page, staff may legitimately want to
+  // submit anyway (e.g. while physically standing at the kiosk fixing the
+  // exact problem this is reporting). It'll simply sit print_blocked,
+  // same as any other job, until the printer's ready.
+  const [printBlocked, setPrintBlocked] = useState(false);
+  const [printBlockedReason, setPrintBlockedReason] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await fetchJson<{ isOnline: boolean; allowColor: boolean; allowBw: boolean; isUpdating: boolean }>(`/api/kiosk-status/${kioskId}`);
+        const data = await fetchJson<{ isOnline: boolean; allowColor: boolean; allowBw: boolean; isUpdating: boolean; printBlocked: boolean; printBlockedReason: string | null }>(`/api/kiosk-status/${kioskId}`);
         if (cancelled) return;
         setIsKioskOnline(data.isOnline);
         setAllowColor(data.allowColor);
         setAllowBw(data.allowBw);
         setIsKioskUpdating(data.isUpdating);
+        setPrintBlocked(data.printBlocked);
+        setPrintBlockedReason(data.printBlockedReason);
       } catch {
         // Best-effort — a failed check just skips this tick.
       }
@@ -171,10 +182,11 @@ export default function AdminPrintPage() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await fetchJson<{ status: JobStatus; error?: string; refundedAt?: string | null }>(`/api/verify-payment?jobId=${jobId}`);
+        const data = await fetchJson<{ status: JobStatus; error?: string; refundedAt?: string | null; blockedReason?: string | null }>(`/api/verify-payment?jobId=${jobId}`);
         if (cancelled) return;
         setStatus(data.status);
         if (data.status === "print_failed" && data.error) setError(data.error);
+        setJobBlockedReason(data.blockedReason ?? null);
       } catch {
         // Best-effort — keeps polling on the next tick regardless.
       }
@@ -193,6 +205,7 @@ export default function AdminPrintPage() {
     setTicketNumber(null);
     setWaivedAmount(null);
     setError("");
+    setJobBlockedReason(null);
     idempotencyKeyRef.current = null;
   };
 
@@ -215,6 +228,9 @@ export default function AdminPrintPage() {
 
       {!isKioskOnline && <div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-700"><p>This kiosk isn&apos;t reachable right now — it may be powered off or offline. Printing will resume once it&apos;s back online.</p></div>}
       {isKioskUpdating && <div className="flex items-start gap-3 rounded-2xl border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm font-medium text-blue-700"><p>This kiosk is being updated right now. Try again in a minute.</p></div>}
+      {/* Informational only — unlike the customer page, nothing here is
+         disabled by this; see the state's own comment above for why. */}
+      {printBlocked && <div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-700"><p>This kiosk needs attention before it can print again{printBlockedReason ? ` (${printBlockedReason})` : ""} — a submitted job will wait and resume automatically.</p></div>}
 
       {status === "idle" && (
         <div className="grid gap-6 lg:grid-cols-[1fr_300px]">
@@ -360,6 +376,7 @@ export default function AdminPrintPage() {
           {status === "submitting" && <p className="flex items-center gap-2 text-sm font-bold text-blue-600"><RefreshCw className="animate-spin" size={16} /> Submitting...</p>}
           {status === "paid" && <p className="flex items-center gap-2 text-sm font-bold text-blue-600"><RefreshCw className="animate-spin" size={16} /> Queued, starting print...</p>}
           {status === "printing" && <p className="flex items-center gap-2 text-sm font-bold text-blue-600"><Printer size={16} /> Printing...</p>}
+          {status === "print_blocked" && <p className="flex items-center gap-2 text-sm font-bold text-amber-600"><Printer size={16} /> Paused — resuming automatically{jobBlockedReason ? ` (${jobBlockedReason})` : ""}.</p>}
           {status === "printed" && <p className="flex items-center gap-2 text-sm font-bold text-emerald-600"><Check size={16} /> Printed — collect it from the kiosk.</p>}
           {status === "print_failed" && <p className="text-sm font-bold text-red-600">{error || "Print failed."}</p>}
           {TERMINAL_STATUSES.includes(status) && (

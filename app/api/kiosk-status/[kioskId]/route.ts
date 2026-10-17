@@ -1,6 +1,6 @@
 import { jsonNoStore } from "@/lib/api-response";
 import { ONLINE_THRESHOLD_SECONDS } from "@/lib/config";
-import { getKioskColorModes, getKioskLastSeenAt, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
+import { getKioskColorModes, getKioskLastSeenAt, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
 import { getPricingConfig } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -25,6 +25,13 @@ export const dynamic = "force-dynamic";
  * truth server-side; the customer-facing "Estimated total" used to be a
  * hardcoded constant that never reflected an admin's price change at all,
  * only the amount actually charged did, which is exactly backwards.
+ * printBlocked/printBlockedReason (requirement: "do not let new customers
+ * pay while the machine cannot print") mirror isUpdating's own role — a
+ * UI block here, re-enforced for real in app/api/create-order and
+ * app/api/staff-print, which both independently re-check
+ * getKioskPrintBlockedState rather than trusting this response alone.
+ * Clears on its own the moment the print agent clears it — no admin
+ * action needed either way.
  * Narrow, unauthenticated-safe read — same reasoning as
  * app/api/kiosk-display/[kioskId]/route.ts: service-role key server-side,
  * returns only what a customer needs, nothing from kiosk_status that's
@@ -33,12 +40,13 @@ export const dynamic = "force-dynamic";
 export async function GET(_request: Request, { params }: { params: Promise<{ kioskId: string }> }) {
   try {
     const { kioskId } = await params;
-    const [lastSeenAt, colorModes, updateState, whatsappAvailability, pricing] = await Promise.all([
+    const [lastSeenAt, colorModes, updateState, whatsappAvailability, pricing, printBlockedState] = await Promise.all([
       getKioskLastSeenAt(kioskId),
       getKioskColorModes(kioskId),
       getKioskUpdateState(kioskId),
       getKioskWhatsappAvailability(kioskId),
       getPricingConfig(),
+      getKioskPrintBlockedState(kioskId),
     ]);
     const isOnline = lastSeenAt !== null && Date.now() - new Date(lastSeenAt).getTime() < ONLINE_THRESHOLD_SECONDS * 1000;
 
@@ -51,6 +59,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
       allowWhatsapp: whatsappAvailability.allowWhatsapp,
       priceBw: pricing.priceBw,
       priceColor: pricing.priceColor,
+      printBlocked: printBlockedState.printBlocked,
+      printBlockedReason: printBlockedState.printBlockedReason,
     });
   } catch (error) {
     console.error("kiosk-status error:", error);

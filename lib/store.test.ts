@@ -22,7 +22,7 @@ import { settingsMatch } from "./store";
 /** Records every chained call so assertions can check exactly what query was built, then resolves like a real Supabase query when awaited. */
 function createMockQueryBuilder(result: { data: unknown; error: unknown }) {
   const calls: { method: string; args: unknown[] }[] = [];
-  const CHAIN_METHODS = ["from", "select", "update", "delete", "insert", "eq", "neq", "in", "lt", "lte", "gt", "gte", "order", "limit", "single", "maybeSingle"];
+  const CHAIN_METHODS = ["from", "select", "update", "delete", "insert", "eq", "neq", "in", "lt", "lte", "gt", "gte", "or", "order", "limit", "single", "maybeSingle"];
   const builder: Record<string, unknown> = { __calls: calls };
   for (const method of CHAIN_METHODS) {
     builder[method] = (...args: unknown[]) => {
@@ -36,6 +36,13 @@ function createMockQueryBuilder(result: { data: unknown; error: unknown }) {
 
 const mockAdmin = vi.hoisted(() => ({
   current: null as ReturnType<typeof createMockQueryBuilder> | null,
+  // Only used by tests that issue more than one DIFFERENT .from() query in
+  // the same call (e.g. listJobsEligibleForCleanup's Promise.all of two
+  // separate queries) — each .from() call shifts the next builder off this
+  // queue instead of all resolving to the single shared `current` above.
+  // Empty (the default) for every other test, which keeps using `current`
+  // exactly as before.
+  fromQueue: [] as ReturnType<typeof createMockQueryBuilder>[],
   // Separate from `current` (the .from() query builder) since assignTicketNumber
   // goes through .rpc(), a different call shape entirely.
   rpcResult: null as { data: unknown; error: unknown } | null,
@@ -49,7 +56,7 @@ const mockAdmin = vi.hoisted(() => ({
 
 vi.mock("./supabase-admin", () => ({
   supabaseAdmin: () => ({
-    from: () => mockAdmin.current,
+    from: () => (mockAdmin.fromQueue.length > 0 ? mockAdmin.fromQueue.shift() : mockAdmin.current),
     storage: {
       from: () => ({
         // deleteJob/deleteStorageObject remove the Storage object after a
@@ -132,6 +139,39 @@ describe("atomic status-guarded store functions", () => {
     mockAdmin.current = createMockQueryBuilder({ data: [], error: null });
     const { deleteJob } = await import("./store");
     await expect(deleteJob({ id: "job-1", status: "printed", pdfStoragePath: "job-1.pdf" })).resolves.toBe(false);
+  });
+
+  // "a job that printed after being marked failed" — the exact scenario
+  // this guard exists to make impossible: failPrintingJob must only ever
+  // move a job OUT of 'printing'/'print_blocked', never overwrite a job
+  // that's already reached 'printed' (or any other terminal state) by the
+  // time this write actually runs.
+  describe("failPrintingJob", () => {
+    it("guards on status IN ('printing', 'print_blocked'), not a bare id match", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "print_failed" }, error: null });
+      const { failPrintingJob } = await import("./store");
+      await failPrintingJob("job-1", "stuck");
+      const inCalls = mockAdmin.current.__calls.filter((call) => call.method === "in");
+      expect(inCalls).toContainEqual({ method: "in", args: ["status", ["printing", "print_blocked"]] });
+    });
+
+    it("clears blocked_reason back to null in the same write", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "print_failed" }, error: null });
+      const { failPrintingJob } = await import("./store");
+      await failPrintingJob("job-1", "stuck");
+      const updateCalls = mockAdmin.current.__calls.filter((call) => call.method === "update");
+      expect(updateCalls[0]?.args[0]).toMatchObject({ status: "print_failed", error: "stuck", blocked_reason: null });
+    });
+
+    it("never changes a job to print_failed if it already reached 'printed' — the guard matches zero rows and this returns null rather than throwing or retrying", async () => {
+      // Empty result = the WHERE (id AND status IN (...)) matched nothing
+      // — exactly what happens when the SAME physically-buffered job
+      // already finished printing (and the DB already reflects 'printed')
+      // by the moment this write runs.
+      mockAdmin.current = createMockQueryBuilder({ data: null, error: null });
+      const { failPrintingJob } = await import("./store");
+      await expect(failPrintingJob("job-1", "stuck")).resolves.toBeNull();
+    });
   });
 });
 
@@ -321,5 +361,46 @@ describe("listStaleTempUploads", () => {
     mockAdmin.storageListResult = { data: null, error: { message: "network error" } };
     const { listStaleTempUploads } = await import("./store");
     await expect(listStaleTempUploads(60 * 60 * 1000)).rejects.toThrow("network error");
+  });
+});
+
+describe("listJobsEligibleForCleanup", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.current = null;
+    mockAdmin.fromQueue = [];
+  });
+
+  // The refund approval workflow (task requirement: a pending/processing/
+  // failed refund must never be cleaned up out from under the Refunds
+  // admin page) means the terminal-jobs query now carries an extra
+  // `.or(...)` filter on top of its existing `.in()`/`.lt()` — this
+  // asserts that filter is actually present in the real query chain, not
+  // just that the function compiles and returns *a* value (same reasoning
+  // this file's own top comment already gives for the atomic-claim tests).
+  it("includes an or() filter excluding unresolved refund_status from the terminal-jobs query", async () => {
+    const terminalBuilder = createMockQueryBuilder({ data: [], error: null });
+    const abandonedBuilder = createMockQueryBuilder({ data: [], error: null });
+    mockAdmin.fromQueue = [terminalBuilder, abandonedBuilder];
+
+    const { listJobsEligibleForCleanup } = await import("./store");
+    await listJobsEligibleForCleanup();
+
+    const orCalls = terminalBuilder.__calls.filter((call) => call.method === "or");
+    expect(orCalls).toEqual([{ method: "or", args: ["refund_status.is.null,refund_status.eq.refunded"] }]);
+    // The abandoned (pending_payment) query is unrelated to refunds — never needs this filter.
+    expect(abandonedBuilder.__calls.some((call) => call.method === "or")).toBe(false);
+  });
+
+  it("still returns the rows both queries resolve with, combined", async () => {
+    mockAdmin.fromQueue = [
+      createMockQueryBuilder({ data: [{ id: "terminal-1", status: "print_failed", selected_pages: [1], settings: {}, total_price: 1, phone_number: "", notify_opt_in: false, include_banner_page: true, content_hash: "h", provider: "razorpay", provider_order_id: "o", provider_meta: null, pdf_storage_path: "p", kiosk_id: "oxway_01", created_at: "now", updated_at: "now", error: null, cups_job_id: null, refunded_at: null, refund_status: "refunded", refund_requested_at: null, refunded_by: null, refund_provider_id: null, refund_error: null, ticket_number: 1, ticket_date: "2026-01-15", payment_id: null, upi_txn_id: null, paid_amount: null, payment_method: "razorpay", created_by_user_id: null, is_free: false, waived_amount: null, idempotency_key: null, queue_time: null, file_name: "f.pdf" }], error: null }),
+      createMockQueryBuilder({ data: [{ id: "abandoned-1", status: "pending_payment", selected_pages: [1], settings: {}, total_price: 1, phone_number: "", notify_opt_in: false, include_banner_page: true, content_hash: "h", provider: "razorpay", provider_order_id: "o", provider_meta: null, pdf_storage_path: "p", kiosk_id: "oxway_01", created_at: "now", updated_at: "now", error: null, cups_job_id: null, refunded_at: null, refund_status: null, refund_requested_at: null, refunded_by: null, refund_provider_id: null, refund_error: null, ticket_number: null, ticket_date: null, payment_id: null, upi_txn_id: null, paid_amount: null, payment_method: null, created_by_user_id: null, is_free: false, waived_amount: null, idempotency_key: null, queue_time: null, file_name: "f2.pdf" }], error: null }),
+    ];
+
+    const { listJobsEligibleForCleanup } = await import("./store");
+    const jobs = await listJobsEligibleForCleanup();
+
+    expect(jobs.map((job) => job.id).sort()).toEqual(["abandoned-1", "terminal-1"]);
   });
 });

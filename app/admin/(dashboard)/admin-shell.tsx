@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ClipboardList, Gift, LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
+import { ClipboardList, Gift, IndianRupee, LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
 import BrandWordmark from "@/components/BrandWordmark";
 import { AdminRoleProvider } from "@/lib/admin/role-context";
 import { fetchJson } from "@/lib/fetch-json";
@@ -32,6 +32,11 @@ export default function AdminShell({ children, email, role }: { children: ReactN
     // own server-side check allows (never gated to owner-only like Pricing
     // below).
     ...(role === "owner" || role === "staff" ? [{ href: "/admin/print", label: "Print", icon: Gift }] : []),
+    // Owner-only — approving a refund is real money movement, and
+    // print_jobs_admin_view already masks every refund_* column to null
+    // for staff, so this page would only ever render an empty/useless
+    // queue for them anyway even if they found the URL directly.
+    ...(role === "owner" ? [{ href: "/admin/refunds", label: "Refunds", icon: IndianRupee }] : []),
     // Pricing is revenue-adjacent — owner only, same as the rest of §4 in the write-permissions table.
     ...(role === "owner" ? [{ href: "/admin/pricing", label: "Pricing", icon: Tags }] : []),
     // Audit log — owner only (the RLS policy backing it refuses staff/anon

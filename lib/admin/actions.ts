@@ -1,5 +1,6 @@
 import { fetchJson } from "../fetch-json";
 import { createSupabaseBrowserClient } from "../supabase";
+import type { RefundRouteResultItem } from "./types";
 
 /**
  * Thin, typed wrappers around the SECURITY DEFINER RPCs from
@@ -9,17 +10,22 @@ import { createSupabaseBrowserClient } from "../supabase";
  */
 
 /**
- * ROADMAP.md #10 — actually issues the gateway refund, not just a DB flag.
- * Goes through app/api/admin/refund (a plain route, not an RPC) since it
- * needs RAZORPAY_KEY_SECRET server-side, which must never reach RLS-gated
- * browser code — that route independently re-verifies owner access itself.
+ * Actually issues the gateway refund(s), not just a DB flag — one call for
+ * both a single "Refund" click (jobIds.length === 1) and a bulk "Refund
+ * selected" click. Goes through app/api/admin/refund (a plain route, not
+ * an RPC) since it needs RAZORPAY_KEY_SECRET server-side, which must never
+ * reach RLS-gated browser code — that route independently re-verifies
+ * owner access itself. Returns one result per job (never throws for an
+ * individual job's own failure) so the caller can show per-job success/
+ * failure and let the owner retry only the ones that failed.
  */
-export async function markJobRefunded(jobId: string): Promise<void> {
-  await fetchJson("/api/admin/refund", {
+export async function requestRefunds(jobIds: string[]): Promise<RefundRouteResultItem[]> {
+  const { results } = await fetchJson<{ results: RefundRouteResultItem[] }>("/api/admin/refund", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jobId }),
+    body: JSON.stringify({ jobIds }),
   });
+  return results;
 }
 
 export async function forceReprintJob(jobId: string): Promise<void> {

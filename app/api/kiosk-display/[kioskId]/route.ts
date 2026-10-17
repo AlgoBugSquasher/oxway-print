@@ -29,19 +29,23 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
     const { kioskId } = await params;
     const supabase = supabaseAdmin();
 
+    // print_blocked included alongside printing — the job is still the
+    // one physically at the printer, just waiting on it (out of paper,
+    // etc.); the screen shows a different message for it below, but it's
+    // still "current," not simply absent.
     const { data: printingRows, error: printingError } = await supabase
       .from("print_jobs")
       .select("ticket_number, status, updated_at")
       .eq("kiosk_id", kioskId)
-      .eq("status", "printing")
+      .in("status", ["printing", "print_blocked"])
       .order("updated_at", { ascending: false })
       .limit(1);
     if (printingError) throw new Error(`Could not load current job: ${printingError.message}`);
 
-    let current: { ticketNumber: number; status: "printing" | "printed" } | null = null;
+    let current: { ticketNumber: number; status: "printing" | "print_blocked" | "printed" } | null = null;
     const printingRow = (printingRows as KioskDisplayJobRow[])[0];
     if (printingRow?.ticket_number != null) {
-      current = { ticketNumber: printingRow.ticket_number, status: "printing" };
+      current = { ticketNumber: printingRow.ticket_number, status: printingRow.status as "printing" | "print_blocked" };
     } else {
       // Nothing actively printing — check whether the most recent finish is
       // still within the settle window, so the screen doesn't flip straight

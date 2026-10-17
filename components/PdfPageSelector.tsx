@@ -5,6 +5,7 @@ import Link from "next/link";
 import { load as loadCashfree } from "@cashfreepayments/cashfree-js";
 import confetti from "canvas-confetti";
 import {
+  AlertTriangle,
   Check,
   ChevronDown,
   Copy,
@@ -58,6 +59,7 @@ type OrderStatus =
   | "pending_payment"
   | "paid"
   | "printing"
+  | "print_blocked"
   | "printed"
   | "print_failed"
   | "payment_failed"
@@ -143,11 +145,12 @@ export default function PdfPageSelector() {
   // status poll below once payment's confirmed (never shown before that —
   // see the ticketNumber comment in app/api/verify-payment/route.ts).
   const [ticketNumber, setTicketNumber] = useState<number | null>(null);
-  // Set only once an auto-refund for this job genuinely succeeded (see
-  // lib/refund.ts) — distinguishes "print_failed, refunded" from the much
-  // worse "print_failed, and the refund itself failed too" for the
-  // print_failed messaging further down.
-  const [refundedAt, setRefundedAt] = useState<string | null>(null);
+  // Distinguishes "print_failed, refunded" from "print_failed, still under
+  // review" for the print_failed messaging further down. Refunds are no
+  // longer automatic: most print_failed jobs sit with refundStatus
+  // "pending" for a while before an owner approves one from the admin
+  // Refunds page.
+  const [refundStatus, setRefundStatus] = useState<string | null>(null);
   const [error, setError] = useState("");
   // 0-100 while the raw file itself is uploading directly to Supabase
   // Storage (see handleStartPayment) — null the rest of the time,
@@ -182,6 +185,17 @@ export default function PdfPageSelector() {
   // server-side in app/api/create-order/route.ts, same pattern as the
   // color-mode gate just above.
   const [isKioskUpdating, setIsKioskUpdating] = useState(false);
+  // Requirement: do not let a new customer pay while the machine cannot
+  // print. Mirrors isKioskUpdating's own role exactly — a UI block here,
+  // re-enforced for real server-side in app/api/create-order, which
+  // independently re-checks the same signal rather than trusting this.
+  // Clears on its own once the print agent reports the printer ready
+  // again — no admin action needed either way. The raw reason text
+  // (printBlockedReason, in the API response) is deliberately never shown
+  // here — a customer-facing message should stay in plain language, not
+  // a raw CUPS string; that detail is admin/staff-facing only (see
+  // kiosk-card.tsx and the admin print page).
+  const [printBlocked, setPrintBlocked] = useState(false);
   // Owner-only admin toggle — defaults false (matching allow_whatsapp's own
   // schema default) rather than true like allowColor/allowBw above, so the
   // opt-in section never flashes on screen for a kiosk where it's actually
@@ -202,7 +216,7 @@ export default function PdfPageSelector() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await fetchJson<{ isOnline: boolean; allowColor: boolean; allowBw: boolean; isUpdating: boolean; allowWhatsapp: boolean; priceBw: number; priceColor: number }>(`/api/kiosk-status/${kioskId}`);
+        const data = await fetchJson<{ isOnline: boolean; allowColor: boolean; allowBw: boolean; isUpdating: boolean; allowWhatsapp: boolean; priceBw: number; priceColor: number; printBlocked: boolean; printBlockedReason: string | null }>(`/api/kiosk-status/${kioskId}`);
         if (cancelled) return;
         setIsKioskOnline(data.isOnline);
         setAllowColor(data.allowColor);
@@ -211,6 +225,7 @@ export default function PdfPageSelector() {
         setAllowWhatsapp(data.allowWhatsapp);
         setPriceBw(data.priceBw);
         setPriceColor(data.priceColor);
+        setPrintBlocked(data.printBlocked);
       } catch {
         // Best-effort — a failed check just skips this tick rather than flipping the banner on.
       }
@@ -321,6 +336,7 @@ export default function PdfPageSelector() {
     if (notReadyItem) return setError(`"${notReadyItem.file.name}" isn't ready — remove it or fix the error on its card before paying.`);
     if (totalActivePages === 0) return setError("Select at least one page before paying.");
     if (isKioskUpdating) return setError("This kiosk is being updated right now — please try again in a minute.");
+    if (printBlocked) return setError("This kiosk can't print right now (it needs attention) — please try again shortly.");
     // Phone is only required when the customer opted into WhatsApp updates.
     if (notifyOptIn && !isPhoneValid) {
       setPhoneTouched(true);
@@ -432,15 +448,22 @@ export default function PdfPageSelector() {
   // "what a status change means for the UI" (confetti, error text, the
   // print-ready notification) lives in exactly one place regardless of which
   // path delivered it.
-  const applyStatusUpdate = (forJobId: string, next: { status: OrderStatus; error?: string | null; ticketNumber?: number | null; refundedAt?: string | null }) => {
+  const applyStatusUpdate = (forJobId: string, next: { status: OrderStatus; error?: string | null; ticketNumber?: number | null; refundStatus?: string | null }) => {
     if (next.ticketNumber !== undefined) setTicketNumber(next.ticketNumber ?? null);
-    if (next.refundedAt !== undefined) setRefundedAt(next.refundedAt ?? null);
+    if (next.refundStatus !== undefined) setRefundStatus(next.refundStatus ?? null);
     setOrderStatus((current) => {
       if (next.status === current) return current;
       if (next.status === "paid" || next.status === "printed") {
         confetti({ particleCount: next.status === "printed" ? 100 : 80, spread: 75, origin: { y: 0.7 } });
       }
-      if (next.status === "print_failed" || next.status === "payment_failed") {
+      // print_failed gets its own dedicated banner below (refund under
+      // review / refunded) instead of the generic `error` state — showing
+      // this job's raw internal failure reason (e.g. a CUPS error) to the
+      // customer alongside "we're reviewing a refund" would undercut that
+      // message, not clarify anything for them. payment_failed (the
+      // payment itself never went through) is unrelated to a refund and
+      // keeps the generic message.
+      if (next.status === "payment_failed") {
         setError(next.error || "Something went wrong. Please see kiosk staff.");
       }
       if (next.status === "printed" && notifiedPrintedForJobRef.current !== forJobId) {
@@ -450,6 +473,17 @@ export default function PdfPageSelector() {
       return next.status;
     });
   };
+
+  // print_failed is listed in TERMINAL_ORDER_STATUSES (nothing about the
+  // PRINT itself will ever change again), but a refund now resolves well
+  // after that — minutes to hours later, whenever an owner approves it —
+  // not synchronously in the same moment the way the old auto-refund did.
+  // Both effects below stay running through print_failed specifically
+  // while refundStatus hasn't reached "refunded" yet, so a customer who
+  // leaves this tab open actually finds out once a refund is approved,
+  // instead of the page freezing forever on "under review" the instant
+  // print_failed is first observed.
+  const isWaitingOnRefundResolution = orderStatus === "print_failed" && refundStatus !== "refunded";
 
   // Polls the server for real payment/print status. While pending_payment,
   // this is what actually triggers the server-side gateway reconciliation
@@ -469,26 +503,28 @@ export default function PdfPageSelector() {
   // either way.
   useEffect(() => {
     if (!jobId) return;
-    if (TERMINAL_ORDER_STATUSES.includes(orderStatus)) return;
+    if (TERMINAL_ORDER_STATUSES.includes(orderStatus) && !isWaitingOnRefundResolution) return;
 
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await fetchJson<{ jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number; refundedAt?: string | null }>(`/api/verify-payment?jobId=${jobId}`);
+        const data = await fetchJson<{ jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number; refundStatus?: string | null }>(`/api/verify-payment?jobId=${jobId}`);
         if (cancelled) return;
         setEtaMinutes(data.etaMinutes ?? null);
-        applyStatusUpdate(jobId, { status: data.status, error: data.error, ticketNumber: data.ticketNumber, refundedAt: data.refundedAt });
+        applyStatusUpdate(jobId, { status: data.status, error: data.error, ticketNumber: data.ticketNumber, refundStatus: data.refundStatus });
       } catch (pollError) {
         console.error("Status poll error:", pollError);
       }
     };
-    const interval = setInterval(poll, orderStatus === "pending_payment" ? 3000 : 10000);
+    // A refund being reviewed is in no hurry — this slower cadence avoids
+    // polling every 10s for however long a tab is left open waiting on one.
+    const interval = setInterval(poll, orderStatus === "pending_payment" ? 3000 : isWaitingOnRefundResolution ? 30000 : 10000);
 
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [jobId, orderStatus]);
+  }, [jobId, orderStatus, isWaitingOnRefundResolution]);
 
   // Instant print-ready signal (ROADMAP.md-style CUPS-spool -> Realtime
   // wiring): the print agent updates the job's row the moment CUPS confirms
@@ -502,7 +538,7 @@ export default function PdfPageSelector() {
   // an accelerator, never a single point of failure for status updates.
   useEffect(() => {
     if (!jobId) return;
-    if (TERMINAL_ORDER_STATUSES.includes(orderStatus)) return;
+    if (TERMINAL_ORDER_STATUSES.includes(orderStatus) && !isWaitingOnRefundResolution) return;
 
     let channel: RealtimeChannel | null = null;
     try {
@@ -513,8 +549,8 @@ export default function PdfPageSelector() {
           "postgres_changes",
           { event: "UPDATE", schema: "public", table: "print_jobs", filter: `id=eq.${jobId}` },
           (payload) => {
-            const row = payload.new as { status: OrderStatus; error: string | null; ticket_number: number | null; refunded_at: string | null };
-            applyStatusUpdate(jobId, { status: row.status, error: row.error, ticketNumber: row.ticket_number, refundedAt: row.refunded_at });
+            const row = payload.new as { status: OrderStatus; error: string | null; ticket_number: number | null; refund_status: string | null };
+            applyStatusUpdate(jobId, { status: row.status, error: row.error, ticketNumber: row.ticket_number, refundStatus: row.refund_status });
           }
         )
         .subscribe();
@@ -526,14 +562,14 @@ export default function PdfPageSelector() {
     return () => {
       if (channel) void channel.unsubscribe();
     };
-  }, [jobId, orderStatus]);
+  }, [jobId, orderStatus, isWaitingOnRefundResolution]);
 
   const resetOrder = () => {
     setOrderStatus("idle");
     setJobId(null);
     setEtaMinutes(null);
     setTicketNumber(null);
-    setRefundedAt(null);
+    setRefundStatus(null);
     setError("");
   };
 
@@ -549,6 +585,11 @@ export default function PdfPageSelector() {
       : <span className="flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-500"><span className="size-1.5 rounded-full bg-amber-500" />Offline</span>}<Link href="/admin" className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${isDark ? "border-white/10 text-slate-300 hover:border-white/20 hover:bg-white/10" : "border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"}`}>Admin</Link><button aria-label="Toggle color theme" onClick={() => setIsDark((value) => !value)} className={`grid size-10 place-items-center rounded-xl border ${panel}`}>{isDark ? <Sun size={17} /> : <Moon size={17} />}</button></div></div></header>
     {!isKioskOnline && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600"><WifiOff size={18} className="mt-0.5 shrink-0" /><p>This kiosk isn&apos;t reachable right now — it may be powered off or have no network connection. Printing will resume once it&apos;s back online.</p></div></div>}
     {isKioskUpdating && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm font-medium text-blue-600"><RefreshCw size={18} className="mt-0.5 shrink-0" /><p>This kiosk is being updated right now. New orders will resume automatically in a minute or two.</p></div></div>}
+    {/* Requirement: block new checkout with a clear temporary-unavailable
+       message while the printer can't print, clearing on its own once the
+       print agent reports it's ready again — never a technical reason
+       string (printBlockedReason stays internal/admin-facing only). */}
+    {!isKioskUpdating && printBlocked && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-700"><AlertTriangle size={18} className="mt-0.5 shrink-0" /><p>This kiosk is temporarily unavailable — it needs attention before it can print again. New orders will resume automatically once it&apos;s ready; there&apos;s no need to try again manually.</p></div></div>}
     {/* The entire replacement for what an SMS would have told the customer
        (ROADMAP.md §22) — deliberately the single biggest, highest-contrast
        thing on this whole screen once it exists, not just a slightly bigger
@@ -632,6 +673,17 @@ export default function PdfPageSelector() {
       </div>}
 
       {error && <div className="mt-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
+      {/* Requirement: a clear message that the print didn't complete and a
+         refund is under review, with a non-exact timeline — never a raw
+         internal failure reason (CUPS error, etc.), which the pre-refund-
+         workflow version of this page used to show here via the generic
+         `error` state above. Switches to the short "Refunded" confirmation
+         once refundStatus actually reaches "refunded" — the poll/Realtime
+         effects above keep running specifically so that transition is seen
+         live if this tab is still open when an owner approves it. */}
+      {orderStatus === "print_failed" && (refundStatus === "refunded"
+        ? <div className="mt-4 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-600">Your refund has been approved and sent to your original payment method.</div>
+        : <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-700">We&apos;re sorry — this print didn&apos;t complete. We&apos;re reviewing a refund for this order; once approved, it will reach your original payment method in about 5–7 business days.</div>)}
     </section><aside className="lg:pt-[86px]"><div className={`rounded-[2rem] border p-5 shadow-xl shadow-slate-900/5 ${panel}`}><div className="mb-5 flex items-center justify-between"><div><p className={`text-xs font-bold uppercase tracking-[0.2em] ${muted}`}>Print order</p><p className="mt-1 text-lg font-black">Configure output</p></div><Settings2 className="text-blue-500" size={19} /></div><div className={`mb-4 rounded-2xl p-4 ${isDark ? "bg-blue-500/10" : "bg-blue-50"}`}><div className="flex items-center justify-between"><span className={`text-xs font-semibold ${muted}`}>Estimated total</span><span className="text-2xl font-black text-blue-600">₹{totalPrice}</span></div><div className={`mt-2 text-xs ${muted}`}>{basket.items.length} {basket.items.length === 1 ? "file" : "files"} · {billableSheets} billable sheets · {totalActivePages} of {totalPages} pages · {settings.copies} {settings.copies === 1 ? "copy" : "copies"}</div></div>
       {allowWhatsapp && (
         <div className={`mb-4 rounded-xl border p-3 ${isDark ? "border-white/10" : "border-slate-200"}`}>
@@ -673,23 +725,30 @@ export default function PdfPageSelector() {
          on screen at two very different sizes. */}
       <div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>
       {orderStatus === "idle" && <div className="flex items-center gap-2">
-        <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>
+        <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating || printBlocked} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>
       </div>}
       {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
       {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
       {orderStatus === "printing" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><Printer size={17} /> Printing your document{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
+      {/* This specific job hit a recoverable printer problem (out of
+         paper, etc.) — never failed, just paused. The kiosk-wide banner
+         above already explains the situation in plain language; this
+         pill just needs to say "still in progress, not stuck." Resumes
+         automatically — no action for the customer to take. */}
+      {orderStatus === "print_blocked" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500/10 px-5 py-3.5 text-sm font-black text-amber-600"><AlertTriangle size={17} /> Print paused — resuming shortly</div>}
       {orderStatus === "printed" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500/10 px-5 py-3.5 text-sm font-black text-emerald-500"><Check size={17} /> Your print is ready — please collect it</div>}
       {orderStatus === "expired" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Payment expired — try again</button>}
       {orderStatus === "payment_failed" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — try again</button>}
-      {/* print_failed always triggers an auto-refund attempt (lib/refund.ts)
-         — "try again" is misleading here regardless (the failure was
-         physical, not something resubmitting fixes), and a bare "Failed"
-         silently hides whether the customer actually got their money back.
-         refundedAt (only set once the refund genuinely succeeded at the
-         gateway) is what tells these two apart. */}
-      {orderStatus === "print_failed" && (refundedAt
-        ? <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-3.5 text-sm font-black text-white"><Check size={17} /> Refunded — see kiosk staff to try again</button>
-        : <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — see kiosk staff for a refund</button>)}
+      {/* "try again" is misleading here regardless (the failure was
+         physical, not something resubmitting fixes). Refunds are no longer
+         automatic/instant (see lib/refund.ts) — refundStatus reaching
+         "refunded" (not just refundedAt being set at all) is what actually
+         tells these two states apart now; the longer explanation (and the
+         5-7 business day timeline) lives in the banner above, this pill
+         just needs to be short. */}
+      {orderStatus === "print_failed" && (refundStatus === "refunded"
+        ? <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-3.5 text-sm font-black text-white"><Check size={17} /> Refunded — start a new print</button>
+        : <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Refund under review</button>)}
       {orderStatus === "cancelled" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-slate-500 px-5 py-3.5 text-sm font-black text-white">Cancelled — see kiosk staff</button>}
     </div></div>}
     {isSettingsOpen && <div className="fixed inset-0 z-40 flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsSettingsOpen(false); }}><div className={`w-full max-w-lg rounded-t-[2rem] p-6 shadow-2xl sm:rounded-[2rem] ${isDark ? "bg-[#171d24]" : "bg-white"}`}><div className="mb-6 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Print settings</p><h2 className="mt-1 text-xl font-black">Tune your document</h2></div><button onClick={() => setIsSettingsOpen(false)} className={`grid size-9 place-items-center rounded-xl ${isDark ? "bg-white/10" : "bg-slate-100"}`}><X size={17} /></button></div><div className="space-y-5"><SettingRow label="Copies" icon={<Copy size={16} />}><div className={`flex items-center gap-1 rounded-xl border p-1 ${isDark ? "border-white/10" : "border-slate-200"}`}><button onClick={() => updateSettings("copies", Math.max(1, settings.copies - 1))} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Minus size={15} /></button><span className="w-8 text-center text-sm font-black">{settings.copies}</span><button onClick={() => updateSettings("copies", settings.copies + 1)} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Plus size={15} /></button></div></SettingRow><SettingRow label="Layout" icon={<LayoutGrid size={16} />}><Segmented value={settings.layout} options={["portrait", "landscape"]} onChange={(value) => updateSettings("layout", value as Layout)} /></SettingRow><SettingRow label="Color mode" icon={<Palette size={16} />}><Segmented value={settings.isColor ? "color" : "bw"} options={["bw", "color"]} labels={[`B&W · ₹${priceBw}`, `Color · ₹${priceColor}`]} disabledOptions={[...(!allowBw ? ["bw"] : []), ...(!allowColor ? ["color"] : [])]} onChange={(value) => updateSettings("isColor", value === "color")} /></SettingRow><div><p className={`mb-2 text-sm font-bold ${muted}`}>Pages</p><div className="grid grid-cols-4 gap-2">{(["all", "odd", "even", "custom"] as PageMode[]).map((mode) => <button key={mode} onClick={() => updateSettings("pageMode", mode)} className={`rounded-xl border px-2 py-2.5 text-xs font-bold capitalize ${settings.pageMode === mode ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}>{mode}</button>)}</div>{settings.pageMode === "custom" && <input value={settings.customRange} onChange={(event) => updateSettings("customRange", event.target.value)} placeholder="Example: 1-5, 8" className={`mt-2 w-full rounded-xl border px-3 py-2.5 text-sm outline-none focus:border-blue-500 ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`} />}</div><SettingRow label="Paper size" icon={<FileText size={16} />}><select value={settings.paperSize} onChange={(event) => updateSettings("paperSize", event.target.value as PaperSize)} className={`rounded-xl border px-3 py-2 text-xs font-bold outline-none ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`}>{(["A4", "Letter", "Legal"] as PaperSize[]).map((size) => <option key={size}>{size}</option>)}</select></SettingRow><SettingRow label="Pages per sheet" icon={<LayoutGrid size={16} />}><Segmented value={String(settings.pagesPerSheet)} options={["1", "2", "4"]} labels={["1", "2 in 1", "4 in 1"]} onChange={(value) => updateSettings("pagesPerSheet", Number(value) as 1 | 2 | 4)} /></SettingRow></div><button onClick={() => setIsSettingsOpen(false)} className="mt-7 w-full rounded-xl bg-blue-600 py-3.5 text-sm font-black text-white">Apply settings</button></div></div>}

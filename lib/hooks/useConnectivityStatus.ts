@@ -23,11 +23,16 @@ export interface ConnectivityStatus {
   level: ConnectivityLevel;
   /** True while a remote "Update kiosk" command is pending/running for this kiosk — see app/api/kiosk-status/[kioskId]. */
   isUpdating: boolean;
+  /** True while the print agent has flagged a recoverable printer problem (out of paper, door open, low toner, offline) — see app/api/kiosk-status/[kioskId]. Clears on its own once the printer's ready again. */
+  printBlocked: boolean;
+  printBlockedReason: string | null;
 }
 
 interface KioskStatusResponse {
   isOnline: boolean;
   isUpdating: boolean;
+  printBlocked: boolean;
+  printBlockedReason: string | null;
 }
 
 interface PollOutcome {
@@ -103,6 +108,8 @@ function computeLevel(outcome: PollOutcome | null, isBrowserOnline: boolean): Co
 export function useConnectivityStatus(kioskId: string): ConnectivityStatus {
   const [lastOutcome, setLastOutcome] = useState<PollOutcome | null>(null);
   const [isUpdating, setIsUpdating] = useState(false);
+  const [printBlocked, setPrintBlocked] = useState(false);
+  const [printBlockedReason, setPrintBlockedReason] = useState<string | null>(null);
   const [isBrowserOnline, setIsBrowserOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
 
   useEffect(() => {
@@ -113,6 +120,8 @@ export function useConnectivityStatus(kioskId: string): ConnectivityStatus {
       if (cancelled) return;
       if (succeeded && data) {
         setIsUpdating(data.isUpdating);
+        setPrintBlocked(data.printBlocked);
+        setPrintBlockedReason(data.printBlockedReason);
         setLastOutcome({ at: Date.now(), succeeded: true, heartbeatFresh: data.isOnline, slow: tookMs > SLOW_RESPONSE_MS });
       } else {
         setLastOutcome({ at: Date.now(), succeeded: false, heartbeatFresh: false, slow: false });
@@ -141,5 +150,5 @@ export function useConnectivityStatus(kioskId: string): ConnectivityStatus {
     };
   }, [kioskId]);
 
-  return { level: computeLevel(lastOutcome, isBrowserOnline), isUpdating };
+  return { level: computeLevel(lastOutcome, isBrowserOnline), isUpdating, printBlocked, printBlockedReason };
 }

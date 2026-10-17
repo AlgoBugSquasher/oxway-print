@@ -1,8 +1,8 @@
 "use client";
 
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Ban, IndianRupee, RefreshCw, RotateCcw, Search } from "lucide-react";
-import { cancelJob, forceReprintJob, markJobRefunded } from "@/lib/admin/actions";
+import { Ban, RefreshCw, RotateCcw, Search } from "lucide-react";
+import { cancelJob, forceReprintJob } from "@/lib/admin/actions";
 import { useAdminRole } from "@/lib/admin/role-context";
 import { fetchJson } from "@/lib/fetch-json";
 import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
@@ -12,10 +12,22 @@ import { formatTicketCode } from "@/lib/ticket-code";
 import LiveIndicator from "../live-indicator";
 import StatusBadge from "../status-badge";
 
-const STATUS_OPTIONS = ["", "pending_payment", "paid", "printing", "printed", "print_failed", "payment_failed", "expired", "cancelled"];
+const STATUS_OPTIONS = ["", "pending_payment", "paid", "printing", "print_blocked", "printed", "print_failed", "payment_failed", "expired", "cancelled"];
 const REPRINTABLE_STATUSES = ["print_failed", "printed"];
-const CANCELLABLE_STATUSES = ["pending_payment", "paid", "printing"];
-const REFUNDABLE_STATUSES = ["print_failed", "payment_failed"];
+// print_blocked included — still "in the active queue, not yet
+// resolved," same reasoning cancel_job's own SQL guard was extended for
+// (supabase/schema.sql) — an owner/staff member can give up on a job
+// that's been waiting a while rather than it being a dead end until the
+// print agent's own retry-time-limit expires on its own.
+const CANCELLABLE_STATUSES = ["pending_payment", "paid", "printing", "print_blocked"];
+
+/** Small, non-interactive label for a job's refund_status — refunding itself only ever happens from the dedicated /admin/refunds queue now (owner-only, with its own review/approval step), never a direct click from this list. */
+const REFUND_STATUS_LABELS: Record<string, { text: string; className: string }> = {
+  pending: { text: "refund pending", className: "bg-amber-100 text-amber-700" },
+  processing: { text: "refund processing", className: "bg-blue-100 text-blue-700" },
+  refunded: { text: "refunded", className: "bg-slate-100 text-slate-500" },
+  failed: { text: "refund failed", className: "bg-red-100 text-red-600" },
+};
 
 interface JobFilters {
   search: string;
@@ -166,7 +178,11 @@ export default function AdminJobsPage() {
                   {job.file_name}
                 </td>
                 <td className="px-4 py-3 font-bold text-blue-600">{job.ticket_number != null ? formatTicketCode(job.ticket_number) : "—"}</td>
-                <td className="px-4 py-3"><StatusBadge status={job.status} /></td>
+                <td className="px-4 py-3">
+                  <StatusBadge status={job.status} />
+                  {/* Requirement: "Show the blocked reason ... on the job." */}
+                  {job.status === "print_blocked" && job.blocked_reason && <p className="mt-1 text-[11px] text-orange-600">{job.blocked_reason}</p>}
+                </td>
                 <td className="px-4 py-3 text-slate-500">{job.phone_number}</td>
                 <td className="px-4 py-3 text-slate-500">{job.kiosk_id}</td>
                 <td className="px-4 py-3">
@@ -175,18 +191,26 @@ export default function AdminJobsPage() {
                   {job.is_free
                     ? <span className="text-emerald-700">FREE{job.waived_amount !== null && ` (₹${Number(job.waived_amount).toFixed(2)} waived)`}</span>
                     : job.total_price !== null ? `₹${Number(job.total_price).toFixed(2)}` : "—"}
-                  {job.refunded_at && <span className="ml-1.5 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">refunded</span>}
+                  {/* refund_status (owner-masked — null for staff) drives this now,
+                     not the old binary refunded_at badge — see the Refunds admin page
+                     (owner-only) for the actual approve/retry action. */}
+                  {job.refund_status && REFUND_STATUS_LABELS[job.refund_status] && (
+                    <span className={`ml-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-bold ${REFUND_STATUS_LABELS[job.refund_status].className}`}>
+                      {REFUND_STATUS_LABELS[job.refund_status].text}
+                    </span>
+                  )}
                 </td>
                 <td className="px-4 py-3 text-slate-500">{job.created_by_user_id ? (staffEmailsById.get(job.created_by_user_id) ?? job.created_by_user_id.slice(0, 8)) : "—"}</td>
                 <td className="px-4 py-3 text-slate-500">{new Date(job.created_at).toLocaleString("en-IN")}</td>
                 <td className="px-4 py-3">
                   <div className="flex flex-wrap gap-1.5">
-                    {/* !job.refunded_at guards against a real money bug (ROADMAP.md #10):
-                       print-agent auto-refunds the instant a job hits print_failed, so
-                       reprinting an already-refunded job would give the customer both
-                       their money back and a free print. Backed by the same check in
-                       force_reprint_job itself — this is a UX nicety, not the boundary. */}
-                    {(role === "owner" || role === "staff") && REPRINTABLE_STATUSES.includes(job.status) && !job.refunded_at && (
+                    {/* !job.refunded_at guards against a real money bug: reprinting an
+                       already-refunded job would give the customer both their money
+                       back and a free print. refund_status !== "processing" additionally
+                       hints that a refund is actively in flight right now. Both are
+                       backed by the same two checks in force_reprint_job itself — this
+                       is a UX nicety, not the boundary. */}
+                    {(role === "owner" || role === "staff") && REPRINTABLE_STATUSES.includes(job.status) && !job.refunded_at && job.refund_status !== "processing" && (
                       <ActionButton
                         icon={RotateCcw}
                         label="Reprint"
@@ -200,24 +224,6 @@ export default function AdminJobsPage() {
                         label="Cancel"
                         pending={pendingJobId === job.id}
                         onClick={() => runAction(job.id, () => cancelJob(job.id))}
-                      />
-                    )}
-                    {/* A free staff job was never charged — nothing to refund, see
-                       lib/refund.ts's own staff_job guard, which this mirrors in the UI. */}
-                    {role === "owner" && !job.is_free && REFUNDABLE_STATUSES.includes(job.status) && !job.refunded_at && (
-                      <ActionButton
-                        icon={IndianRupee}
-                        label="Refund"
-                        pending={pendingJobId === job.id}
-                        onClick={() => {
-                          // This now actually moves money (ROADMAP.md #10) —
-                          // a confirm() before it fires is a cheap safety net
-                          // against a stray click, not the real security
-                          // boundary (that's the server-side owner check).
-                          if (window.confirm(`Refund ₹${job.total_price?.toFixed(2) ?? "?"} for "${job.file_name}"? This charges back through ${job.provider} immediately and can't be undone from here.`)) {
-                            runAction(job.id, () => markJobRefunded(job.id));
-                          }
-                        }}
                       />
                     )}
                   </div>

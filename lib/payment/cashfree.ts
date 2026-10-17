@@ -94,28 +94,63 @@ export async function verifyCashfreeOrder(providerOrderId: string): Promise<Veri
 }
 
 /**
- * ROADMAP.md #10 — real money movement. UNTESTED: Cashfree isn't live yet
- * (no account/KYC per PAYMENT_PROVIDER=razorpay), so this has never been run
- * against a real Cashfree order. Written for symmetry with
- * refundRazorpayPayment and against Cashfree's documented API shape, not
- * verified. Cashfree refunds by order_id (unlike Razorpay, which refunds by
- * payment id) — needs its own unique refund_id per attempt as an
- * idempotency key, which Cashfree requires and we don't otherwise track.
+ * Real money movement. UNTESTED: Cashfree isn't live yet (no account/KYC
+ * per PAYMENT_PROVIDER=razorpay), so this has never been run against a
+ * real Cashfree order. Written for symmetry with refundRazorpayPayment and
+ * against Cashfree's documented API shape, not verified. Cashfree refunds
+ * by order_id (unlike Razorpay, which refunds by payment id) — needs its
+ * own unique refund_id per attempt as an idempotency key, which Cashfree
+ * requires and we don't otherwise track. `refund_speed: "STANDARD"` is
+ * explicit, not left to Cashfree's own default — same "always normal
+ * speed, never instant" requirement refundRazorpayPayment's own
+ * `speed: "normal"` satisfies.
+ *
+ * Pre-checks this order's existing refunds before attempting a new one:
+ * if a previous SUCCESS refund already covers the full amount (a previous
+ * attempt whose own DB write failed, retried later — see
+ * refundRazorpayPayment's identical reasoning), this returns success with
+ * `alreadyRefunded: true` instead of calling the refund endpoint again.
  */
 export async function refundCashfreeOrder(providerOrderId: string, amountRupees: number): Promise<RefundResult> {
+  const existing = await findSuccessfulCashfreeRefund(providerOrderId, amountRupees);
+  if (existing) return { refundId: existing, alreadyRefunded: true };
+
   const response = await fetch(`${CASHFREE_BASE}/orders/${providerOrderId}/refunds`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
       refund_amount: Number(amountRupees),
       refund_id: crypto.randomUUID(),
+      refund_speed: "STANDARD",
     }),
   });
   const data = await response.json();
   if (!response.ok) {
+    const message = String(data?.message ?? "");
+    if (/refund/i.test(message) && /(already|exceed)/i.test(message)) {
+      const alreadyRefunded = await findSuccessfulCashfreeRefund(providerOrderId, amountRupees);
+      if (alreadyRefunded) return { refundId: alreadyRefunded, alreadyRefunded: true };
+    }
     throw new Error(data?.message || "Cashfree refund failed.");
   }
   return { refundId: String(data.refund_id) };
+}
+
+/** Returns the first SUCCESS refund's id once this order's successful refunds already sum to the full amount, or null if nothing covers it yet. Best-effort — a failed lookup here just means the caller falls through to attempting a real refund, same as everywhere else this pattern is used. */
+async function findSuccessfulCashfreeRefund(providerOrderId: string, amountRupees: number): Promise<string | null> {
+  try {
+    const response = await fetch(`${CASHFREE_BASE}/orders/${providerOrderId}/refunds`, { headers: authHeaders() });
+    if (!response.ok) return null;
+    const refunds = await response.json();
+    if (!Array.isArray(refunds)) return null;
+    const successful = refunds.filter((r: { refund_status?: string }) => r.refund_status === "SUCCESS");
+    const total = successful.reduce((sum: number, r: { refund_amount?: number }) => sum + Number(r.refund_amount ?? 0), 0);
+    if (total <= 0 || total < amountRupees) return null;
+    const first = successful[0] as { cf_refund_id?: number | string; refund_id?: string } | undefined;
+    return first ? String(first.cf_refund_id ?? first.refund_id ?? providerOrderId) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

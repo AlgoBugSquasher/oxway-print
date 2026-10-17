@@ -197,6 +197,66 @@ export async function getKioskWhatsappAvailability(kioskId: string): Promise<Kio
   return { allowWhatsapp: row?.allow_whatsapp ?? false };
 }
 
+export interface KioskPrintBlockedState {
+  printBlocked: boolean;
+  printBlockedReason: string | null;
+}
+
+/**
+ * Used by both the customer-facing /api/kiosk-status (to block starting a
+ * new order and show the "temporarily unavailable" banner — requirement:
+ * "Do not let new customers pay while the machine cannot print") and
+ * /api/create-order (to actually reject one server-side — the UI check
+ * alone isn't trustworthy, same reasoning getKioskColorModes/
+ * getKioskUpdateState already establish for their own checks). Fails OPEN
+ * (not blocked) on a missing/misconfigured row, same convention
+ * getKioskColorModes uses — a row that can't be found should never itself
+ * be the reason printing becomes unavailable.
+ */
+export async function getKioskPrintBlockedState(kioskId: string): Promise<KioskPrintBlockedState> {
+  const { data, error } = await supabaseAdmin().from("kiosk_status").select("print_blocked_reason").eq("id", kioskId).maybeSingle();
+  if (error) throw new Error(`Could not read kiosk print-blocked state: ${error.message}`);
+  const row = data as { print_blocked_reason: string | null } | null;
+  const reason = row?.print_blocked_reason ?? null;
+  return { printBlocked: reason !== null, printBlockedReason: reason };
+}
+
+/**
+ * Written by the print agent itself (print-agent/index.ts) the instant it
+ * detects a RECOVERABLE printer problem (out of paper, door open, low
+ * toner, offline — see lib/print/cups.ts) — never by the website. Clears
+ * on its own (clearKioskPrintBlocked below) the moment the printer's ready
+ * again, with no admin action needed either way. Best-effort, same
+ * reasoning every other write in this file uses: a failed write here just
+ * means the website's own "temporarily unavailable" banner is a beat
+ * behind reality, never a reason to crash the print agent's own loop over
+ * something this secondary.
+ */
+export async function setKioskPrintBlocked(kioskId: string, reason: string): Promise<void> {
+  try {
+    const { error } = await supabaseAdmin()
+      .from("kiosk_status")
+      .update({ print_blocked_reason: reason, print_blocked_at: new Date().toISOString() })
+      .eq("id", kioskId);
+    if (error) console.error("Failed to record kiosk print-blocked state:", error.message);
+  } catch (error) {
+    console.error("Failed to record kiosk print-blocked state:", error);
+  }
+}
+
+/** Clears print_blocked_reason back to null — called the moment the SAME blocked job either resumes printing on its own or is finally given up on (both leave the kiosk itself no longer blocked; a NEW job starting fresh also clears this via the same pre-flight check). */
+export async function clearKioskPrintBlocked(kioskId: string): Promise<void> {
+  try {
+    const { error } = await supabaseAdmin()
+      .from("kiosk_status")
+      .update({ print_blocked_reason: null, print_blocked_at: null })
+      .eq("id", kioskId);
+    if (error) console.error("Failed to clear kiosk print-blocked state:", error.message);
+  } catch (error) {
+    console.error("Failed to clear kiosk print-blocked state:", error);
+  }
+}
+
 export interface KioskUpdateState {
   isUpdating: boolean;
 }

@@ -288,6 +288,11 @@ export default function KioskCard({
   const tonerNeedsAttention = tonerEstimate.status === "low" || tonerEstimate.status === "needs_refill_update";
   const anyNeedsRefillUpdate = paperEstimate.status === "needs_refill_update" || tonerEstimate.status === "needs_refill_update";
   const lowSupply = paperNeedsAttention || tonerNeedsAttention;
+  // Written only by the print agent itself the instant it detects a
+  // recoverable printer problem (out of paper, door open, low toner,
+  // offline) — see lib/kiosk-stats.ts's setKioskPrintBlocked. Requirement:
+  // "Show the blocked reason on the admin page for the machine."
+  const printBlocked = kiosk.print_blocked_reason !== null;
 
   const now = useSyncExternalStore(subscribeToClock, getClockSnapshot, getServerClockSnapshot);
   const minutesSinceLastSeen = (now - new Date(kiosk.updated_at).getTime()) / 60_000;
@@ -319,10 +324,15 @@ export default function KioskCard({
   };
 
   return (
-    <div className={`rounded-2xl border p-5 ${isSilent ? "border-amber-300 bg-amber-50" : lowSupply ? "border-red-300 bg-red-50" : "border-slate-200 bg-white"}`}>
+    <div className={`rounded-2xl border p-5 ${printBlocked ? "border-orange-400 bg-orange-50" : isSilent ? "border-amber-300 bg-amber-50" : lowSupply ? "border-red-300 bg-red-50" : "border-slate-200 bg-white"}`}>
       <div className="mb-3 flex items-center justify-between">
         <p className="font-black">{kiosk.id}</p>
         <div className="flex flex-wrap items-center justify-end gap-2">
+          {printBlocked && (
+            <span className="flex items-center gap-1 rounded-full bg-orange-500/10 px-2 py-1 text-[10px] font-bold text-orange-700">
+              <AlertTriangle size={11} /> Blocked: {kiosk.print_blocked_reason}
+            </span>
+          )}
           {isSilent && <span className="flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-1 text-[10px] font-bold text-amber-700"><WifiOff size={11} /> Silent {Math.round(minutesSinceLastSeen)}m</span>}
           {lowSupply && (
             <span className="flex items-center gap-1 rounded-full bg-red-500/10 px-2 py-1 text-[10px] font-bold text-red-600">
@@ -334,6 +344,12 @@ export default function KioskCard({
           </button>
         </div>
       </div>
+
+      {printBlocked && (
+        <p className="mb-3 flex items-center gap-1.5 text-xs font-medium text-orange-700">
+          New customer orders are paused{kiosk.print_blocked_at ? ` since ${new Date(kiosk.print_blocked_at).toLocaleTimeString("en-IN")}` : ""} — will resume automatically once resolved.
+        </p>
+      )}
 
       {!isEditing ? (
         <div className="space-y-2 text-xs">

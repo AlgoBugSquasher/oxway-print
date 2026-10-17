@@ -18,6 +18,20 @@ export const READY_TIMING_CONFIG = {
   warmupSeconds: 10,
   /** How long the printer must have been idle before this job for warmupSeconds to apply. */
   warmupIdleThresholdSeconds: 120,
+  /**
+   * How long a RECOVERABLE printer problem (out of paper, door open, low
+   * toner, offline — see lib/print/cups.ts's classification) is tolerated
+   * before a job is finally marked print_failed. Deliberately generous and
+   * separate from the normal "stuck" deadline (print-agent/index.ts's
+   * QUEUE_POLL_TIMEOUT_MS, a couple of minutes) — that one assumes
+   * something is genuinely wedged; this one assumes a person needs to
+   * notice the kiosk and physically go fix it, which can reasonably take a
+   * while on an unattended machine. 30 minutes: long enough for "nobody's
+   * standing next to it right now," short enough that a job that's
+   * genuinely never coming back still resolves (and its refund queues up)
+   * within the same business day.
+   */
+  blockedRetryLimitSeconds: 30 * 60,
 } as const;
 
 /**
@@ -47,33 +61,76 @@ export function computeMinimumReadyAtMs(spooledAtMs: number, physicalSheets: num
   return spooledAtMs + (printSeconds + READY_TIMING_CONFIG.graceSeconds + warmup) * 1000;
 }
 
-export type CupsWatchState = "active" | "completed" | "error";
+/**
+ * What CUPS (+the printer) reported this tick — see lib/print/cups.ts's
+ * getCupsJobQueueState for exactly how each is detected. "blocked" is new:
+ * a RECOVERABLE problem (out of paper, door open, low toner, offline) that
+ * must never fail the job outright — see decidePrintWatchOutcome below.
+ * "error" stays reserved for something no amount of waiting fixes (a jam,
+ * an explicit cancel/abort, or anything CUPS has already moved to its
+ * terminal completed-job history, however it got there).
+ */
+export type CupsWatchState =
+  | { kind: "active" }
+  | { kind: "completed" }
+  | { kind: "blocked"; reason: string }
+  | { kind: "error"; reason: string };
 
 export type PrintWatchOutcome =
-  | { kind: "error" }
+  | { kind: "error"; reason: string }
+  | { kind: "blocked"; reason: string }
   | { kind: "wait" }
   | { kind: "ready" }
-  | { kind: "timeout" };
+  | { kind: "timeout" }
+  /** The SAME recoverable problem (or a run of them) has now lasted past READY_TIMING_CONFIG.blockedRetryLimitSeconds — time to finally give up and fail the job. */
+  | { kind: "blocked_timeout"; reason: string };
 
 /**
- * One tick's worth of decision logic for print-agent/index.ts's
- * watchUntilPrinted — pulled out as a pure function so the floor/warm-up/
- * error-priority rules can be tested directly, without a test harness for
- * the agent's actual polling loop. An "error" from CUPS always wins
- * immediately, even if the floor hasn't elapsed yet — a paper jam doesn't
- * get more plausible by waiting for it. Otherwise, "ready" requires BOTH
- * cupsState === "completed" AND the elapsed-time floor to have passed;
- * anything else (including "completed" too early) is "wait" until the
- * overall deadline, which is reported as "timeout".
+ * One tick's worth of decision logic for print-agent/index.ts's print loop
+ * — pulled out as a pure function so the floor/warm-up/blocked-vs-error
+ * priority rules can be tested directly, without a test harness for the
+ * agent's actual polling loop.
+ *
+ * An "error" from CUPS always wins immediately, even if the floor hasn't
+ * elapsed yet — a paper jam doesn't get more plausible by waiting for it.
+ * A "blocked" state never fails the job by itself — it's reported back so
+ * the caller can mark the job print_blocked (and, critically, never
+ * cancels the live CUPS job — see print-agent/index.ts's own comment on
+ * why that's exactly what lets the SAME job finish on its own once the
+ * printer's ready again) — UNLESS blockedSinceMs shows the SAME blocked
+ * spell has already run for blockedLimitMs or more, in which case this
+ * finally reports "blocked_timeout" so the caller can give up.
+ *
+ * blockedElapsedMs (total time already spent blocked earlier in THIS
+ * job's life, accumulated by the caller across however many separate
+ * blocked spells there were) is added on top of deadlineMs before
+ * comparing against it — time spent legitimately waiting on paper must
+ * never count against the ordinary "stuck" timeout, or a job blocked for
+ * 10 minutes would immediately "time out" the instant it resumed, even
+ * though it was never actually stuck in the sense that deadline exists to
+ * catch.
  */
 export function decidePrintWatchOutcome(input: {
   cupsState: CupsWatchState;
   nowMs: number;
   minimumReadyAtMs: number;
   deadlineMs: number;
+  /** Total ms already spent blocked earlier in this job's life (0 if it's never been blocked before). */
+  blockedElapsedMs: number;
+  /** When the CURRENT blocked spell started, or null if cupsState isn't "blocked" right now. */
+  blockedSinceMs: number | null;
+  blockedLimitMs: number;
 }): PrintWatchOutcome {
-  if (input.cupsState === "error") return { kind: "error" };
-  if (input.cupsState === "completed" && input.nowMs >= input.minimumReadyAtMs) return { kind: "ready" };
-  if (input.nowMs >= input.deadlineMs) return { kind: "timeout" };
+  if (input.cupsState.kind === "error") return { kind: "error", reason: input.cupsState.reason };
+
+  if (input.cupsState.kind === "blocked") {
+    const blockedForMs = input.blockedSinceMs !== null ? input.nowMs - input.blockedSinceMs : 0;
+    if (blockedForMs >= input.blockedLimitMs) return { kind: "blocked_timeout", reason: input.cupsState.reason };
+    return { kind: "blocked", reason: input.cupsState.reason };
+  }
+
+  if (input.cupsState.kind === "completed" && input.nowMs >= input.minimumReadyAtMs) return { kind: "ready" };
+  const effectiveDeadlineMs = input.deadlineMs + input.blockedElapsedMs;
+  if (input.nowMs >= effectiveDeadlineMs) return { kind: "timeout" };
   return { kind: "wait" };
 }

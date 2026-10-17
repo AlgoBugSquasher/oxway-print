@@ -57,8 +57,38 @@ create table print_jobs (
   cups_job_id text,
   error text,
 
-  -- set by the owner-only "mark refunded" admin action.
+  -- Human-readable reason while status = 'print_blocked' (e.g.
+  -- "media-empty") — see lib/print/cups.ts's classification and
+  -- print-agent/index.ts's print loop. Independent of `error` above,
+  -- which stays reserved for a genuine, FINAL print_failed reason — a
+  -- blocked job hasn't failed, it's still live and expected to resume.
+  blocked_reason text,
+
+  -- set once a refund genuinely completes at the payment gateway — see
+  -- refund_status below for the fuller lifecycle this is now one part of.
   refunded_at timestamptz,
+
+  -- Refund approval workflow (v2.5) — a job that fails after being paid no
+  -- longer refunds itself automatically (see print-agent/index.ts); it
+  -- lands here as 'pending' instead (set by the
+  -- set_print_job_refund_pending trigger in §7 below) and an owner reviews
+  -- it from the admin "Refunds" page. null means "never needed a refund"
+  -- (still live, or a free staff print — see that trigger's own comment
+  -- for why payment_method, not provider, decides that). 'processing'
+  -- exists specifically so a double click or two open tabs can never both
+  -- reach the payment gateway for the same job (see
+  -- claim_refund_for_processing). refund_requested_at is stamped once, the
+  -- instant this first becomes 'pending', and never touched again by a
+  -- later retry. refunded_by/refund_provider_id are only ever set once
+  -- refund_status reaches 'refunded'. refund_error holds the most recent
+  -- attempt's own failure message if refund_status is 'failed'. All five
+  -- owner-masked in print_jobs_admin_view the same way total_price already
+  -- is — staff cannot see any of this.
+  refund_status text check (refund_status in ('pending', 'processing', 'refunded', 'failed')),
+  refund_requested_at timestamptz,
+  refunded_by uuid references auth.users(id),
+  refund_provider_id text,
+  refund_error text,
 
   -- new for v2.5 (§21) — the short pickup code, e.g. "#042". Assigned once,
   -- atomically, at job creation via next_ticket_number() below. ticket_date
@@ -145,6 +175,12 @@ create unique index print_jobs_idempotency_key_idx
 -- (§6e below) — status/kiosk_id first (its WHERE clause), queue_time second
 -- (its ORDER BY), matching that query's own shape exactly.
 create index print_jobs_queue_claim_idx on print_jobs (status, kiosk_id, queue_time);
+
+-- Backs the Refunds admin page's own query (print_jobs_admin_view filtered
+-- to refund_status = 'pending') — partial since almost every row will have
+-- a null refund_status forever (every job that never failed, or never had
+-- money move at all).
+create index print_jobs_refund_status_idx on print_jobs (refund_status) where refund_status is not null;
 
 -- Guards against two jobs on the same kiosk/day ever getting the same
 -- ticket number. NULLs (jobs that fail before ticket assignment, if that
@@ -237,7 +273,17 @@ create table kiosk_status (
   -- because a kiosk that has never booted the updated agent code has
   -- nothing to report yet.
   agent_commit text,
-  agent_updated_at timestamptz
+  agent_updated_at timestamptz,
+
+  -- Kiosk-wide "can't print right now" signal — written only by the print
+  -- agent (never the website) the instant it detects a RECOVERABLE
+  -- printer problem (out of paper, door open, low toner, offline), and
+  -- cleared the moment it's ready again. null means not blocked, the
+  -- normal state. The website reads this (via /api/kiosk-status) to block
+  -- new checkout and show a "temporarily unavailable" banner — requirement:
+  -- never let a new customer pay while the machine can't actually print.
+  print_blocked_reason text,
+  print_blocked_at timestamptz
 );
 
 insert into kiosk_status (id) values ('oxway_01');
@@ -471,6 +517,43 @@ create trigger print_jobs_set_queue_time
   for each row execute function public.set_print_job_queue_time();
 
 -- ============================================================================
+-- 6f. set_print_job_refund_pending() trigger — stamps refund_status
+--     atomically the instant a paid job becomes print_failed
+-- ============================================================================
+--
+-- Structural, same reasoning set_print_job_queue_time above already
+-- established. Fires only on the one real transition that ever matters: a
+-- job that was NOT already print_failed becomes print_failed.
+-- `coalesce(new.payment_method, '') <> 'staff'` is the SAME check
+-- lib/refund.ts's own attemptRefund already used before this feature
+-- existed (payment_method, not provider — a staff job's `provider` column
+-- still holds a real-looking gateway name even though no gateway order
+-- ever existed for one) — a free staff print must never get a
+-- refund_status at all, since there was never any money to refund.
+-- `new.refund_status is null` makes this a no-op if refund_status somehow
+-- already has a value — specifically what lets a reprint-then-fail-again
+-- cycle re-enter 'pending' cleanly (force_reprint_job resets it to null
+-- first on a successful reprint — see §7 below).
+create or replace function public.set_print_job_refund_pending()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'UPDATE'
+     and new.status = 'print_failed'
+     and old.status is distinct from 'print_failed'
+     and coalesce(new.payment_method, '') <> 'staff'
+     and new.refund_status is null then
+    new.refund_status := 'pending';
+    new.refund_requested_at := now();
+  end if;
+  return new;
+end;
+$$;
+
+create trigger print_jobs_set_refund_pending
+  before update on print_jobs
+  for each row execute function public.set_print_job_refund_pending();
+
+-- ============================================================================
 -- 6e. create_staff_print_job() / claim_next_paid_job()
 -- ============================================================================
 --
@@ -655,12 +738,24 @@ begin
   if public.current_app_role() not in ('owner', 'staff') then
     raise exception 'Not authorized.';
   end if;
-  -- refunded_at is null guards against a real money bug (ROADMAP.md #10):
-  -- print-agent auto-refunds the instant a job hits print_failed, so
-  -- without this check, reprinting an already-refunded job would give the
-  -- customer both their money back and a free print.
-  update print_jobs set status = 'paid', updated_at = now()
-  where id = p_job_id and status in ('print_failed', 'printed') and refunded_at is null;
+  -- refunded_at is null guards against a real money bug: reprinting an
+  -- already-refunded job would give the customer both their money back
+  -- and a free print. coalesce(refund_status, '') <> 'processing' closes a
+  -- related gap: without it, a reprint could race an in-flight refund
+  -- claim (money possibly already sent to the gateway, refunded_at not
+  -- set yet) and the job could still get reprinted during that window.
+  --
+  -- Also resets refund_status/refund_requested_at/refund_error to null on
+  -- a successful reprint — once a job is back in the live queue, "needs a
+  -- refund" is no longer true; if it fails again, set_print_job_refund_pending
+  -- fires again from this same clean null, exactly as if it were a first
+  -- failure. Without this, the Refunds admin page would keep showing an
+  -- already-resolved-by-reprint job forever.
+  update print_jobs set
+    status = 'paid', updated_at = now(),
+    refund_status = null, refund_requested_at = null, refund_error = null
+  where id = p_job_id and status in ('print_failed', 'printed')
+    and refunded_at is null and coalesce(refund_status, '') <> 'processing';
 end;
 $$;
 
@@ -676,8 +771,13 @@ begin
 
   select status into v_old_status from print_jobs where id = p_job_id;
 
+  -- 'print_blocked' included — a blocked job is still "in the active
+  -- queue, not yet resolved," and an owner/staff member should be able to
+  -- give up on it deliberately (e.g. to refund instead) rather than it
+  -- being a dead end until the print agent's own retry-time-limit expires
+  -- on its own.
   update print_jobs set status = 'cancelled', updated_at = now()
-  where id = p_job_id and status in ('pending_payment', 'paid', 'printing');
+  where id = p_job_id and status in ('pending_payment', 'paid', 'printing', 'print_blocked');
   get diagnostics v_updated_rows = row_count;
 
   if v_updated_rows > 0 then
@@ -908,6 +1008,12 @@ for select using (public.current_app_role() = 'owner');
 -- waived_amount) are included unmasked for every role — none are
 -- financial-masked the way total_price is: staff can already see who
 -- printed what at their own kiosk, and waived_amount isn't real revenue.
+--
+-- The five refund_* columns ARE masked, same as total_price — the Refunds
+-- admin page is owner-only, and this is the real enforcement of that (not
+-- just which admin page links where): a staff session querying this view
+-- directly gets null for every one of these, same as it already gets null
+-- for total_price.
 create view public.print_jobs_admin_view as
 select
   id, status, file_name, selected_pages, settings,
@@ -917,19 +1023,28 @@ select
   created_at, updated_at, error, cups_job_id, refunded_at,
   notify_opt_in, notified_at,
   payment_method, created_by_user_id, is_free, waived_amount,
-  claimed_at, spooled_at, printer_idle_at, ready_at
+  claimed_at, spooled_at, printer_idle_at, ready_at,
+  case when public.current_app_role() = 'owner' then refund_status else null end as refund_status,
+  case when public.current_app_role() = 'owner' then refund_requested_at else null end as refund_requested_at,
+  case when public.current_app_role() = 'owner' then refunded_by else null end as refunded_by,
+  case when public.current_app_role() = 'owner' then refund_provider_id else null end as refund_provider_id,
+  case when public.current_app_role() = 'owner' then refund_error else null end as refund_error,
+  blocked_reason
 from public.print_jobs;
 
 -- free_print_* are NOT masked for staff the way total_revenue is — waived
 -- revenue isn't real revenue, and staff already know what they themselves
 -- printed for free; there's no privacy reason to hide the aggregate.
+-- print_blocked_reason/print_blocked_at are likewise unmasked — a supply/
+-- readiness problem isn't money or PII.
 create view public.kiosk_status_admin_view as
 select
   id, tray_pages, cartridge_pages, tray_max_pages, cartridge_max_pages,
   case when public.current_app_role() = 'owner' then total_revenue else null end as total_revenue,
   total_lifetime_prints, updated_at, allow_color, allow_bw,
   agent_commit, agent_updated_at, allow_whatsapp,
-  free_print_count, free_print_pages, free_print_waived_amount
+  free_print_count, free_print_pages, free_print_waived_amount,
+  print_blocked_reason, print_blocked_at
 from public.kiosk_status;
 
 -- Nothing in kiosk_commands is financial/sensitive — no column masking
@@ -967,7 +1082,16 @@ grant select on public.kiosk_commands_admin_view to authenticated;
 --     same trust model /api/verify-payment already uses (whoever holds the
 --     id can read that job's status), just enforced by the database instead
 --     of the API route so Realtime can check it independently.
-grant select (id, status, error, ticket_number, updated_at, refunded_at) on public.print_jobs to anon;
+--   - refund_status included alongside refunded_at for the same reason —
+--     a print_failed job's own customer needs to know a refund is pending/
+--     processing/refunded/failed via Realtime's direct payload, not just
+--     the one-shot verify-payment poll (which reads it server-side with
+--     the service-role key regardless of any grant). Just an enum — no
+--     amount, no provider id, no payment details.
+-- blocked_reason included alongside refund_status/error for the same
+-- reason those are — a job's own customer should be able to see WHY it's
+-- currently paused via Realtime's direct payload, not just that it is.
+grant select (id, status, error, ticket_number, updated_at, refunded_at, refund_status, blocked_reason) on public.print_jobs to anon;
 
 create policy "Anyone holding a job id can read its own status" on public.print_jobs
 for select using (true);
@@ -1121,6 +1245,215 @@ end;
 $$;
 
 grant execute on function public.record_refund(uuid, text, uuid, text, text, text) to service_role;
+
+-- ============================================================================
+-- 11b. Refund approval workflow — claim_refund_for_processing() /
+--      complete_refund() / fail_refund() / record_refund_bulk_action().
+--      record_refund above stays as-is (dead code now that lib/refund.ts
+--      no longer calls it, but kept rather than dropped — additive only).
+-- ============================================================================
+--
+-- All four below: SECURITY DEFINER, granted to service_role ONLY, same
+-- split as record_refund above — the real authorization boundary is
+-- app/api/admin/refund's own signed-in-owner check, done server-side with
+-- the service-role key, never a direct RLS/current_app_role() check
+-- reachable from a browser session. No grant to authenticated/anon at all.
+
+-- The atomic claim (requirement: "claim the job atomically so a double
+-- click or two tabs cannot refund twice", and "re-check the job's current
+-- state and refuse if it actually printed after the failure"). The single
+-- atomic UPDATE is the whole claim: it can only ever match a row that is
+-- STILL status = 'print_failed' (refuses a job that's since been
+-- reprinted) AND still refund_status IN ('pending', 'failed') (refuses a
+-- job someone else is already mid-refund on, or one already refunded).
+-- Zero rows updated means the claim lost — the SELECT below exists purely
+-- to report back PRECISELY why, in plain language.
+create or replace function public.claim_refund_for_processing(p_job_id uuid)
+returns setof print_jobs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_updated_count integer;
+  v_current record;
+begin
+  update print_jobs
+  set refund_status = 'processing', updated_at = now()
+  where id = p_job_id and status = 'print_failed' and refund_status in ('pending', 'failed');
+  get diagnostics v_updated_count = row_count;
+
+  if v_updated_count = 0 then
+    select status, refund_status into v_current from print_jobs where id = p_job_id;
+
+    if v_current is null then
+      raise exception 'Job not found.';
+    -- Checked BEFORE refund_status below, deliberately: force_reprint_job
+    -- resets refund_status to null the instant a reprint starts, so a job
+    -- that printed successfully after its earlier failure would otherwise
+    -- fall into the much less informative "never needed a refund" branch.
+    -- Whenever status has moved off 'print_failed' at all, THIS is always
+    -- the real, relevant explanation, regardless of whatever refund_status
+    -- happens to read at that exact moment.
+    elsif v_current.status <> 'print_failed' then
+      raise exception 'This job is no longer print_failed (now "%") — it looks like it was reprinted or already printed. Refund cannot proceed.', v_current.status;
+    elsif v_current.refund_status is null then
+      raise exception 'This job never needed a refund.';
+    elsif v_current.refund_status = 'processing' then
+      raise exception 'This refund is already being processed — try again in a moment.';
+    elsif v_current.refund_status = 'refunded' then
+      raise exception 'This job was already refunded.';
+    else
+      raise exception 'Could not claim this refund right now — try again.';
+    end if;
+  end if;
+
+  return query select * from print_jobs where id = p_job_id;
+end;
+$$;
+
+grant execute on function public.claim_refund_for_processing(uuid) to service_role;
+
+-- Resolves a claimed ('processing') refund as successful. `refund_status =
+-- 'processing'` in the WHERE guard means this can only ever resolve a
+-- refund THIS SAME claim started — it is not a generic "mark any job
+-- refunded" function. `p_already_refunded_at_provider` records whether
+-- THIS call's own gateway response said "the money had already moved"
+-- rather than this call being the one that actually moved it — kept in the
+-- audit details purely for a human reviewing the trail later. Reuses the
+-- existing 'job_refunded' audit action (same label already in
+-- lib/admin/audit-descriptions.ts) — same action, same meaning, just
+-- reached through this claim-then-complete path instead of record_refund's
+-- older one-step path.
+create or replace function public.complete_refund(
+  p_job_id uuid,
+  p_refund_id text,
+  p_already_refunded_at_provider boolean default false,
+  p_actor_user_id uuid default null,
+  p_actor_role text default null,
+  p_ip text default null,
+  p_user_agent text default null
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_total_price numeric;
+  v_provider text;
+  v_updated_rows integer;
+begin
+  select total_price, provider into v_total_price, v_provider from print_jobs where id = p_job_id;
+
+  update print_jobs set
+    refund_status = 'refunded',
+    refunded_at = now(),
+    refunded_by = p_actor_user_id,
+    refund_provider_id = p_refund_id,
+    refund_error = null,
+    updated_at = now()
+  where id = p_job_id and refund_status = 'processing';
+  get diagnostics v_updated_rows = row_count;
+
+  perform public.log_audit(
+    p_action := 'job_refunded',
+    p_actor_user_id := p_actor_user_id,
+    p_actor_role := p_actor_role,
+    p_target_type := 'print_job',
+    p_target_id := p_job_id::text,
+    p_details := jsonb_build_object(
+      'refund_id', p_refund_id,
+      'amount', v_total_price,
+      'provider', v_provider,
+      'already_refunded_at_provider', p_already_refunded_at_provider,
+      'updated', v_updated_rows > 0
+    ),
+    p_ip := p_ip,
+    p_user_agent := p_user_agent
+  );
+end;
+$$;
+
+grant execute on function public.complete_refund(uuid, text, boolean, uuid, text, text, text) to service_role;
+
+-- Resolves a claimed ('processing') refund as failed. Same `refund_status
+-- = 'processing'` guard as complete_refund above. `left(p_error, 500)`
+-- bounds how much of a gateway error message ever lands in the database —
+-- never trust an upstream string's length. Never pass a secret into
+-- p_error — see lib/refund.ts's own comment on why a thrown gateway
+-- error's .message is safe to log (it never includes API keys).
+create or replace function public.fail_refund(
+  p_job_id uuid,
+  p_error text,
+  p_actor_user_id uuid default null,
+  p_actor_role text default null,
+  p_ip text default null,
+  p_user_agent text default null
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update print_jobs set
+    refund_status = 'failed',
+    refund_error = left(p_error, 500),
+    updated_at = now()
+  where id = p_job_id and refund_status = 'processing';
+
+  perform public.log_audit(
+    p_action := 'refund_failed',
+    p_actor_user_id := p_actor_user_id,
+    p_actor_role := p_actor_role,
+    p_target_type := 'print_job',
+    p_target_id := p_job_id::text,
+    p_details := jsonb_build_object('error', left(p_error, 500)),
+    p_ip := p_ip,
+    p_user_agent := p_user_agent
+  );
+end;
+$$;
+
+grant execute on function public.fail_refund(uuid, text, uuid, text, text, text) to service_role;
+
+-- One summary audit entry per bulk "Refund selected" click, separate from
+-- the per-job job_refunded/refund_failed entries complete_refund/
+-- fail_refund above already write for each job in the batch.
+create or replace function public.record_refund_bulk_action(
+  p_job_ids uuid[],
+  p_total numeric,
+  p_succeeded integer,
+  p_failed integer,
+  p_actor_user_id uuid default null,
+  p_actor_role text default null,
+  p_ip text default null,
+  p_user_agent text default null
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform public.log_audit(
+    p_action := 'refund_bulk_requested',
+    p_actor_user_id := p_actor_user_id,
+    p_actor_role := p_actor_role,
+    p_target_type := 'print_job_bulk',
+    p_target_id := null,
+    p_details := jsonb_build_object(
+      'job_ids', to_jsonb(p_job_ids),
+      'count', coalesce(array_length(p_job_ids, 1), 0),
+      'succeeded', p_succeeded,
+      'failed', p_failed,
+      'total', p_total
+    ),
+    p_ip := p_ip,
+    p_user_agent := p_user_agent
+  );
+end;
+$$;
+
+grant execute on function public.record_refund_bulk_action(uuid[], numeric, integer, integer, uuid, text, text, text) to service_role;
 
 -- ============================================================================
 -- 10. Admin Overview dashboard (period revenue/pages) + paper/toner refill

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT } from "@/lib/config";
-import { getKioskColorModes, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
+import { getKioskColorModes, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
 import { createOrder, type CreateOrderOutput } from "@/lib/payment";
 import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
 import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
@@ -147,6 +147,19 @@ export async function POST(request: Request) {
     const updateState = await getKioskUpdateState(kioskId);
     if (updateState.isUpdating) {
       return jsonError("This kiosk is being updated right now — please try again in a minute.");
+    }
+
+    // Requirement: "do not let new customers pay while the machine cannot
+    // print" — the customer page already blocks starting a new order
+    // while this is true (same /api/kiosk-status poll this re-checks),
+    // but that's a UI mirror only, same reasoning as every other kiosk-
+    // availability check above. Set only by the print agent itself the
+    // instant it detects a recoverable printer problem (lib/print/cups.ts),
+    // and cleared the same way once it's ready again — no admin action
+    // needed either way.
+    const printBlockedState = await getKioskPrintBlockedState(kioskId);
+    if (printBlockedState.printBlocked) {
+      return jsonError("This kiosk can't print right now (it needs attention) — please try again shortly.");
     }
 
     const originalBytes = await downloadJobPdf(pdfStoragePath);

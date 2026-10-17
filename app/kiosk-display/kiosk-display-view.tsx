@@ -18,7 +18,7 @@ import { formatTicketCode } from "@/lib/ticket-code";
 const POLL_INTERVAL_MS = 3000;
 
 interface KioskDisplayData {
-  current: { ticketNumber: number; status: "printing" | "printed" } | null;
+  current: { ticketNumber: number; status: "printing" | "print_blocked" | "printed" } | null;
   upcoming: { ticketNumber: number }[];
 }
 
@@ -69,7 +69,7 @@ function KioskDisplayView() {
   // kiosk's own Chromium autostart command) scopes it to just this
   // machine's jobs. Defaults to the original single kiosk.
   const kioskId = useSearchParams().get("k") || "oxway_01";
-  const { level: connectivity, isUpdating } = useConnectivityStatus(kioskId);
+  const { level: connectivity, isUpdating, printBlocked } = useConnectivityStatus(kioskId);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,16 +99,20 @@ function KioskDisplayView() {
     ? "Reconnecting..."
     : current?.status === "printing"
       ? `Now printing ${formatTicketCode(current.ticketNumber)}`
-      : current?.status === "printed"
-        ? `${formatTicketCode(current.ticketNumber)} is ready — please collect`
-        : "Scan the QR code to get started";
+      : current?.status === "print_blocked"
+        ? `${formatTicketCode(current.ticketNumber)} is paused — needs attention`
+        : current?.status === "printed"
+          ? `${formatTicketCode(current.ticketNumber)} is ready — please collect`
+          : "Scan the QR code to get started";
   const toneClass = !isOnline
     ? "text-slate-500"
     : current?.status === "printed"
       ? "text-emerald-400"
       : current?.status === "printing"
         ? "text-blue-400"
-        : "text-slate-200";
+        : current?.status === "print_blocked"
+          ? "text-amber-400"
+          : "text-slate-200";
 
   return (
     <div
@@ -135,6 +139,17 @@ function KioskDisplayView() {
           <div className="mt-2 rounded-2xl border border-blue-500/30 bg-blue-500/10 p-5">
             <h1 className="text-3xl font-black leading-tight text-blue-300">Updating, back in a minute</h1>
             <p className="mt-2 text-base text-slate-400">This kiosk is installing an update. New orders will resume automatically once it&apos;s done — no need to do anything.</p>
+          </div>
+        ) : printBlocked ? (
+          // Requirement: block new checkout and show a clear temporary-
+          // unavailable message, clearing on its own once the printer is
+          // ready again — this screen doesn't take payment itself, but
+          // it's exactly what tells a walking-up customer not to bother
+          // scanning right now (create-order's own server-side check is
+          // the real enforcement either way).
+          <div className="mt-2 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-5">
+            <h1 className="text-3xl font-black leading-tight text-amber-300">Temporarily unavailable</h1>
+            <p className="mt-2 text-base text-slate-400">This kiosk needs attention before it can print again. New orders will resume automatically — no need to scan right now.</p>
           </div>
         ) : (
           <>

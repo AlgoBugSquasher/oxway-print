@@ -9,7 +9,18 @@ export type JobStatus =
   | "print_failed"
   | "payment_failed"
   | "expired"
-  | "cancelled";
+  | "cancelled"
+  /**
+   * A paid job that was being printed hit a RECOVERABLE printer problem
+   * (out of paper, a door/cover open, low toner, offline) — see
+   * print-agent/index.ts's print loop and lib/print/cups.ts's own
+   * classification. Deliberately NOT print_failed: the job is still live,
+   * still counted as "ahead in queue" for other customers' ETA, and will
+   * resume automatically once the printer's ready again, up to
+   * READY_TIMING_CONFIG.blockedRetryLimitSeconds before it's finally given
+   * up on. blockedReason (below) holds the human-readable why.
+   */
+  | "print_blocked";
 
 export interface PrintSettingsSnapshot {
   copies: number;
@@ -59,8 +70,29 @@ export interface PrintJobRecord {
   updatedAt: string;
   error?: string;
   cupsJobId?: string;
-  /** Set when an owner marks a failed/cancelled job refunded from the admin panel (ROADMAP.md #6). Independent of `status` — a job's payment/print outcome and its refund state are two separate facts. */
+  /** Set once a refund genuinely completes at the payment gateway — see refundStatus below for the fuller lifecycle this is now one part of. Independent of `status` — a job's payment/print outcome and its refund state are two separate facts. */
   refundedAt?: string;
+  /**
+   * Refund approval workflow — undefined/null means "never needed a
+   * refund" (still live, or a free staff print, which never had money move
+   * in the first place). Set to 'pending' automatically (by a database
+   * trigger — see supabase/schema.sql's set_print_job_refund_pending) the
+   * instant a paid job first becomes print_failed; an owner then reviews
+   * it from the admin Refunds page (lib/refund.ts's attemptRefund), which
+   * atomically claims it to 'processing' before ever calling the payment
+   * gateway, then resolves it to 'refunded' or 'failed'.
+   */
+  refundStatus?: "pending" | "processing" | "refunded" | "failed";
+  /** Stamped once, the instant refundStatus first becomes 'pending' — never touched again by a later retry. */
+  refundRequestedAt?: string;
+  /** Which signed-in owner approved the refund that actually succeeded — only ever set once refundStatus reaches 'refunded'. */
+  refundedBy?: string;
+  /** The gateway's own refund id — only ever set once refundStatus reaches 'refunded'. */
+  refundProviderId?: string;
+  /** The most recent refund attempt's own failure message — only meaningful while refundStatus is 'failed'. */
+  refundError?: string;
+  /** Human-readable reason this job is currently 'print_blocked' (e.g. "media-empty") — see lib/print/cups.ts's classification. Only meaningful while status is 'print_blocked'; cleared (set back to undefined) the moment it resumes or is finally failed. */
+  blockedReason?: string;
   /**
    * Short per-kiosk, per-day pickup code (e.g. 42, shown to the customer as
    * "#042") — see ROADMAP.md §21. Assigned exactly once, atomically, at job
@@ -151,7 +183,13 @@ interface PrintJobRow {
   updated_at: string;
   error: string | null;
   cups_job_id: string | null;
+  blocked_reason: string | null;
   refunded_at: string | null;
+  refund_status: "pending" | "processing" | "refunded" | "failed" | null;
+  refund_requested_at: string | null;
+  refunded_by: string | null;
+  refund_provider_id: string | null;
+  refund_error: string | null;
   ticket_number: number | null;
   ticket_date: string | null;
   payment_id: string | null;
@@ -191,7 +229,13 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     updatedAt: row.updated_at,
     error: row.error ?? undefined,
     cupsJobId: row.cups_job_id ?? undefined,
+    blockedReason: row.blocked_reason ?? undefined,
     refundedAt: row.refunded_at ?? undefined,
+    refundStatus: row.refund_status ?? undefined,
+    refundRequestedAt: row.refund_requested_at ?? undefined,
+    refundedBy: row.refunded_by ?? undefined,
+    refundProviderId: row.refund_provider_id ?? undefined,
+    refundError: row.refund_error ?? undefined,
     ticketNumber: row.ticket_number ?? undefined,
     ticketDate: row.ticket_date ?? undefined,
     paymentId: row.payment_id ?? undefined,
@@ -234,13 +278,27 @@ function toInsertRow(job: PrintJobRecord): Partial<PrintJobRow> {
   };
 }
 
-function toUpdateRow(patch: Partial<PrintJobRecord>): Partial<PrintJobRow> {
+/**
+ * `blockedReason` is the one field updateJob callers legitimately need to
+ * CLEAR (set back to null) once a job stops being print_blocked, not just
+ * set — every other optional PrintJobRecord field only ever gets set once
+ * and never explicitly nulled back out through this path, hence the
+ * widened type just for this one. `Omit` first, not a plain `&`
+ * intersection — intersecting two object types that both declare the same
+ * optional property computes the INTERSECTION of its two value types
+ * (`(string | undefined) & (string | null)` collapses to just `string`,
+ * silently dropping `null` again), not an override.
+ */
+type JobPatch = Omit<Partial<PrintJobRecord>, "blockedReason"> & { blockedReason?: string | null };
+
+function toUpdateRow(patch: JobPatch): Partial<PrintJobRow> {
   const row: Partial<PrintJobRow> = { updated_at: new Date().toISOString() };
   if (patch.status !== undefined) row.status = patch.status;
   if (patch.providerOrderId !== undefined) row.provider_order_id = patch.providerOrderId;
   if (patch.providerMeta !== undefined) row.provider_meta = patch.providerMeta;
   if (patch.error !== undefined) row.error = patch.error;
   if (patch.cupsJobId !== undefined) row.cups_job_id = patch.cupsJobId;
+  if (patch.blockedReason !== undefined) row.blocked_reason = patch.blockedReason;
   if (patch.refundedAt !== undefined) row.refunded_at = patch.refundedAt;
   if (patch.paymentId !== undefined) row.payment_id = patch.paymentId;
   if (patch.upiTxnId !== undefined) row.upi_txn_id = patch.upiTxnId;
@@ -279,7 +337,7 @@ export async function getJob(jobId: string): Promise<PrintJobRecord | null> {
   return data ? fromRow(data as PrintJobRow) : null;
 }
 
-export async function updateJob(jobId: string, patch: Partial<PrintJobRecord>): Promise<PrintJobRecord | null> {
+export async function updateJob(jobId: string, patch: JobPatch): Promise<PrintJobRecord | null> {
   const { data, error } = await supabaseAdmin()
     .from("print_jobs")
     .update(toUpdateRow(patch))
@@ -324,6 +382,39 @@ export async function expireJobIfPending(jobId: string): Promise<PrintJobRecord 
     .select("*")
     .maybeSingle();
   if (error) throw new Error(`Could not expire job: ${error.message}`);
+  return data ? fromRow(data as PrintJobRow) : null;
+}
+
+/**
+ * The ONE place a job is ever marked print_failed — a plain `updateJob`
+ * call here would be a real, confirmed bug: "a job can be both failed and
+ * printed." A job's print agent can discover a genuine, unrecoverable
+ * problem (or a generous retry/blocked-time budget running out) at the
+ * exact same moment the PHYSICAL printer — independently, e.g. a
+ * multi-copy job already fully buffered on this printer's own USB/SPL
+ * hardware — actually finishes it, or some other path has already moved
+ * it to 'printed'. The atomic `WHERE status IN ('printing','print_blocked')`
+ * guard means this can only ever fail a job that is STILL, right now,
+ * genuinely in progress — if it's already 'printed' (or already
+ * 'print_failed', 'cancelled', anything else), this updates zero rows and
+ * returns null, and the caller (print-agent/index.ts) must treat that as
+ * "someone/something already resolved this, leave it alone" — never retry
+ * the write, never log it as an unexpected error.
+ *
+ * Clears blocked_reason back to null in the same statement — a failed job
+ * is no longer "waiting," it's done (and now a candidate for
+ * set_print_job_refund_pending's own trigger, via the status change
+ * itself).
+ */
+export async function failPrintingJob(jobId: string, reason: string): Promise<PrintJobRecord | null> {
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .update({ status: "print_failed", error: reason, blocked_reason: null, updated_at: new Date().toISOString() })
+    .eq("id", jobId)
+    .in("status", ["printing", "print_blocked"])
+    .select("*")
+    .maybeSingle();
+  if (error) throw new Error(`Could not mark job print_failed: ${error.message}`);
   return data ? fromRow(data as PrintJobRow) : null;
 }
 
@@ -531,13 +622,29 @@ export async function listStaleTempUploads(olderThanMs: number): Promise<string[
  * those are still active regardless of age, see ROADMAP.md §11's
  * file-cleanup-vs-stuck-job note (a kiosk offline for a day shouldn't come
  * back to its queued job's PDF deleted out from under it).
+ *
+ * Also excludes a print_failed job whose refund is still unresolved
+ * (refund_status 'pending', 'processing', or 'failed') — TERMINAL_JOB_RETENTION_HOURS
+ * is only 6 hours, far shorter than an owner might reasonably take to
+ * review a refund queue, and this cron runs unconditionally regardless of
+ * whether anyone's looked at it yet. Without this, a job an owner hasn't
+ * gotten to refunding yet could have its row (and the only record of what
+ * was owed) deleted out from under the Refunds admin page. A row only
+ * becomes eligible again once refund_status is null (never needed one) or
+ * 'refunded' (resolved) — never while real money is still owed or a refund
+ * attempt is actively in flight.
  */
 export async function listJobsEligibleForCleanup(): Promise<PrintJobRecord[]> {
   const terminalCutoff = new Date(Date.now() - TERMINAL_JOB_RETENTION_HOURS * 60 * 60 * 1000).toISOString();
   const abandonedCutoff = new Date(Date.now() - ABANDONED_JOB_RETENTION_HOURS * 60 * 60 * 1000).toISOString();
 
   const [terminalResult, abandonedResult] = await Promise.all([
-    supabaseAdmin().from("print_jobs").select("*").in("status", TERMINAL_STATUSES).lt("updated_at", terminalCutoff),
+    supabaseAdmin()
+      .from("print_jobs")
+      .select("*")
+      .in("status", TERMINAL_STATUSES)
+      .lt("updated_at", terminalCutoff)
+      .or("refund_status.is.null,refund_status.eq.refunded"),
     supabaseAdmin().from("print_jobs").select("*").eq("status", "pending_payment").lt("created_at", abandonedCutoff),
   ]);
 
@@ -638,17 +745,19 @@ export function settingsMatch(a: PrintSettingsSnapshot, b: PrintSettingsSnapshot
 
 /**
  * Jobs still queued ahead of this one at the same kiosk — used by
- * lib/eta.ts (ROADMAP.md #3). "Ahead" means still active (paid/printing,
- * same as what the print agent itself watches for) and created before this
- * job, since the print agent works through paid jobs roughly in arrival
- * order.
+ * lib/eta.ts (ROADMAP.md #3). "Ahead" means still active (paid/printing/
+ * print_blocked, same as what the print agent itself watches for) and
+ * created before this job, since the print agent works through paid jobs
+ * roughly in arrival order. print_blocked counts as "ahead" too — it's
+ * still occupying the printer and every job behind it in queue genuinely
+ * has to wait for it to resolve one way or another.
  */
 export async function listJobsAheadInQueue(job: Pick<PrintJobRecord, "id" | "kioskId" | "createdAt">): Promise<PrintJobRecord[]> {
   const { data, error } = await supabaseAdmin()
     .from("print_jobs")
     .select("*")
     .eq("kiosk_id", job.kioskId)
-    .in("status", ["paid", "printing"])
+    .in("status", ["paid", "printing", "print_blocked"])
     .lt("created_at", job.createdAt)
     .neq("id", job.id);
   if (error) throw new Error(`Could not list jobs ahead in queue: ${error.message}`);

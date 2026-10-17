@@ -51,11 +51,18 @@ export async function GET(request: Request) {
       // code before they've paid would be misleading.
       ticketNumber: reconciled.status === "pending_payment" ? undefined : reconciled.ticketNumber,
       // Lets the status page distinguish "print_failed, refund issued" from
-      // "print_failed, refund itself also failed" (attemptRefund in
-      // lib/refund.ts only sets this once the refund genuinely succeeded at
-      // the gateway) — a double-failure the customer needs to see, not one
-      // silently masked behind a generic "failed" message.
+      // "print_failed, refund still pending review" — refunds are no
+      // longer automatic (see print-agent/index.ts), so most print_failed
+      // jobs sit at refundStatus "pending" for a while before an owner
+      // approves one; refundedAt stays the moment-of-truth for "the money
+      // actually moved."
       refundedAt: reconciled.refundedAt,
+      refundStatus: reconciled.refundStatus,
+      // Only meaningful while status is "print_blocked" — see
+      // lib/print/cups.ts's classification and print-agent/index.ts's
+      // print loop. Lets the status page say WHY this specific job is
+      // currently paused, not just that it is.
+      blockedReason: reconciled.blockedReason,
     });
   } catch (error) {
     console.error("verify-payment error:", error);

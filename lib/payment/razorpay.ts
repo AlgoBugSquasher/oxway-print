@@ -100,15 +100,67 @@ export async function fetchRazorpayPaymentDetails(paymentId: string): Promise<Ra
 }
 
 /**
- * ROADMAP.md #10 — real money movement, called only from the owner-gated
- * app/api/admin/refund route (never a Postgres RPC: RAZORPAY_KEY_SECRET must
- * never reach RLS-gated browser code). Refunds the full captured amount;
- * partial refunds aren't something the roadmap asked for.
+ * Real money movement, called only from the owner-gated app/api/admin/
+ * refund route via lib/refund.ts's attemptRefund (never a Postgres RPC:
+ * RAZORPAY_KEY_SECRET must never reach RLS-gated browser code). Refunds
+ * the full captured amount; partial refunds aren't something this app
+ * supports. `speed: "normal"` is explicit, not left to Razorpay's own
+ * default — refunds here are a reviewed, owner-approved action on a
+ * NORMAL schedule (5-7 business days), never instant/optimum speed, per
+ * this feature's own requirement.
+ *
+ * Pre-checks the payment's own refund_status before attempting anything:
+ * if Razorpay already considers this payment fully refunded (a previous
+ * attempt whose own DB write failed — see complete_refund's own
+ * "CRITICAL" log scenario — followed by a manual retry), this returns
+ * success with `alreadyRefunded: true` instead of calling the refund
+ * endpoint again, which Razorpay would otherwise just reject (there's
+ * nothing left to refund). The catch block below is a second, defensive
+ * layer for the same situation in case of a race between the pre-check and
+ * the real call (another refund landing in between).
  */
 export async function refundRazorpayPayment(paymentId: string, amountRupees: number): Promise<RefundResult> {
   const razorpay = client();
-  const refund = await razorpay.payments.refund(paymentId, { amount: Math.round(amountRupees * 100) });
-  return { refundId: refund.id };
+
+  try {
+    const payment = await razorpay.payments.fetch(paymentId);
+    if (payment.refund_status === "full") {
+      return { refundId: await findExistingRazorpayRefundId(paymentId), alreadyRefunded: true };
+    }
+  } catch (checkError) {
+    // Non-fatal — if the pre-check itself fails, fall through to the real
+    // refund attempt below, which has its own already-refunded fallback.
+    console.warn(`Could not pre-check refund status for payment ${paymentId}:`, checkError);
+  }
+
+  try {
+    const refund = await razorpay.payments.refund(paymentId, { amount: Math.round(amountRupees * 100), speed: "normal" });
+    return { refundId: refund.id };
+  } catch (refundError) {
+    if (isAlreadyRefundedError(refundError)) {
+      return { refundId: await findExistingRazorpayRefundId(paymentId), alreadyRefunded: true };
+    }
+    throw refundError;
+  }
+
+  async function findExistingRazorpayRefundId(id: string): Promise<string> {
+    try {
+      const existing = await razorpay.payments.fetchMultipleRefund(id, { count: 1 });
+      return existing.items[0]?.id ?? id;
+    } catch {
+      // Falls back to the payment id itself — still unique, still enough
+      // for an owner reviewing the audit trail to find the right payment
+      // in the Razorpay dashboard even without the exact refund id.
+      return id;
+    }
+  }
+}
+
+/** Razorpay's own documented message for this case is "The payment has been fully refunded already" (BAD_REQUEST_ERROR) — matched loosely (refund + already/fully refunded) rather than on an exact string, since Razorpay doesn't document a stable machine-readable code for it. */
+function isAlreadyRefundedError(error: unknown): boolean {
+  const description = (error as { error?: { description?: string } } | undefined)?.error?.description
+    ?? (error instanceof Error ? error.message : "");
+  return /refund/i.test(description) && /(already|fully refunded)/i.test(description);
 }
 
 /**

@@ -17,6 +17,8 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   kiosk_whatsapp_updated: "WhatsApp availability changed",
   job_cancelled: "Job cancelled",
   job_refunded: "Job refunded",
+  refund_failed: "Refund attempt failed",
+  refund_bulk_requested: "Bulk refund requested",
   staff_print_created: "Free staff print created",
   kiosk_command_requested: "Kiosk command requested",
   kiosk_command_finished: "Kiosk command finished",
@@ -51,6 +53,19 @@ export function summarizeAuditEntry(entry: AuditLogRow): string {
     case "job_cancelled":
     case "job_refunded":
       return entry.target_id ? `${label} (job ${shortenId(entry.target_id)})` : label;
+    case "refund_failed": {
+      const error = typeof details.error === "string" ? details.error : null;
+      const job = entry.target_id ? ` (job ${shortenId(entry.target_id)})` : "";
+      return error ? `${label}${job}: ${error}` : `${label}${job}`;
+    }
+    case "refund_bulk_requested": {
+      const count = typeof details.count === "number" ? details.count : null;
+      const succeeded = typeof details.succeeded === "number" ? details.succeeded : null;
+      const total = typeof details.total === "number" ? details.total : null;
+      return count !== null
+        ? `${label}: ${succeeded ?? "?"}/${count} succeeded${total !== null ? `, ₹${total.toFixed(2)}` : ""}`
+        : label;
+    }
     case "staff_print_created": {
       const pages = typeof details.pages === "number" ? details.pages : null;
       return pages !== null ? `${label}: ${pages} page${pages === 1 ? "" : "s"}` : label;

@@ -42,6 +42,29 @@ export interface AdminJobRow {
   is_free: boolean | null;
   /** The price this job WOULD have cost a paying customer — set only for a staff print, computed server-side from the real pricing rules. */
   waived_amount: number | null;
+  /**
+   * Refund approval workflow — null for every job that never needed a
+   * refund (still live, or a free staff print). Owner-masked (null for
+   * staff), same convention total_price already uses — this is the real
+   * server-side enforcement of "staff cannot see this," not just which
+   * admin page links where.
+   */
+  refund_status: "pending" | "processing" | "refunded" | "failed" | null;
+  refund_requested_at: string | null;
+  refunded_by: string | null;
+  refund_provider_id: string | null;
+  refund_error: string | null;
+  /** Human-readable reason while status is 'print_blocked' (e.g. "media-empty") — see lib/print/cups.ts's classification. Null otherwise. */
+  blocked_reason: string | null;
+}
+
+/** One job's own outcome from a refund request (single or bulk) — see app/api/admin/refund/route.ts. */
+export interface RefundRouteResultItem {
+  jobId: string;
+  ok: boolean;
+  refundId?: string;
+  /** Already a clear, specific, customer-safe message — ready to show directly. */
+  error?: string;
 }
 
 /** Row shape returned by kiosk_status_admin_view. `total_revenue` is `null` for staff. */
@@ -65,6 +88,9 @@ export interface AdminKioskRow {
   free_print_count: number;
   free_print_pages: number;
   free_print_waived_amount: number;
+  /** Written only by the print agent itself the instant it detects a recoverable printer problem — null means not currently blocked, the normal state. */
+  print_blocked_reason: string | null;
+  print_blocked_at: string | null;
 }
 
 export type AdminKioskCommandName = "update" | "restart";
