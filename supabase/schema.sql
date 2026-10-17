@@ -64,6 +64,30 @@ create table print_jobs (
   -- blocked job hasn't failed, it's still live and expected to resume.
   blocked_reason text,
 
+  -- Set once, the instant a print-agent RESTART discovers CUPS has no
+  -- memory at all of a job that was still 'printing'/'print_blocked' when
+  -- the agent last died (see print-agent/index.ts's
+  -- reconcileInFlightJobsOnBoot and lib/print/cups.ts's isCupsJobKnown).
+  -- Deliberately never cleared/changed again afterward — it's a
+  -- historical fact about what happened at that restart, not a live
+  -- condition like blocked_reason above.
+  interrupted_reason text,
+  interrupted_at timestamptz,
+
+  -- Set only on a job created by the admin "Reprint pages" feature —
+  -- points back at the job it's reprinting pages from. This is the single
+  -- source of truth for "is this job a reprint" (drives the REPRINT badge
+  -- in the admin Jobs list, skips Razorpay-enrichment and the
+  -- refund-pending trigger the same way payment_method = 'staff' already
+  -- does, and tells recordCompletedPrint to skip both revenue AND
+  -- free_print_* bookkeeping — see lib/kiosk-stats.ts's isReprint).
+  original_job_id uuid references print_jobs(id),
+  -- Written on the ORIGINAL job the moment a reprint is created from it
+  -- (requirement: "Add a note on the original job ('reprinted pages X to
+  -- Y')") — see lib/print/reprint-note.ts's formatReprintNote. Purely
+  -- informational, never read by any code.
+  reprint_note text,
+
   -- set once a refund genuinely completes at the payment gateway — see
   -- refund_status below for the fuller lifecycle this is now one part of.
   refunded_at timestamptz,
@@ -83,8 +107,11 @@ create table print_jobs (
   -- refund_status reaches 'refunded'. refund_error holds the most recent
   -- attempt's own failure message if refund_status is 'failed'. All five
   -- owner-masked in print_jobs_admin_view the same way total_price already
-  -- is — staff cannot see any of this.
-  refund_status text check (refund_status in ('pending', 'processing', 'refunded', 'failed')),
+  -- is — staff cannot see any of this. 'not_needed' means a refund WAS
+  -- pending but an owner reprinted the job instead and that reprint went
+  -- on to print successfully (see set_original_job_refund_not_needed) —
+  -- distinct from null ("never needed one in the first place").
+  refund_status text check (refund_status in ('pending', 'processing', 'refunded', 'failed', 'not_needed')),
   refund_requested_at timestamptz,
   refunded_by uuid references auth.users(id),
   refund_provider_id text,
@@ -121,8 +148,13 @@ create table print_jobs (
   -- queue_time is stamped automatically (§6e's trigger) the instant a job's
   -- status becomes 'paid' — what the print agent's queue is actually
   -- ordered by, not created_at, so neither a customer job nor a staff job
-  -- ever gets priority over the other.
-  payment_method text check (payment_method in ('razorpay', 'cashfree', 'staff')),
+  -- ever gets priority over the other. 'reprint' is a THIRD free-job kind
+  -- (see original_job_id above) — deliberately distinct from 'staff': a
+  -- reprint isn't a discretionary staff favor, it's compensating for the
+  -- agent's own earlier failure/interruption on a different (the
+  -- original) job, and every refund/banner/enrichment call site that
+  -- already checks for 'staff' first also checks for this.
+  payment_method text check (payment_method in ('razorpay', 'cashfree', 'staff', 'reprint')),
   created_by_user_id uuid references auth.users(id),
   is_free boolean default false,
   waived_amount numeric,
@@ -143,11 +175,11 @@ create table print_jobs (
   printer_idle_at timestamptz,
   ready_at timestamptz,
 
-  -- reserved, unused this build — see ROADMAP.md §24/§25. The real
-  -- pickup-confirmation trigger (customer self-confirm? flap sensor? a
-  -- timeout?) isn't decided yet, so no code sets this column. It exists now
-  -- purely so that wiring it up later never requires a migration.
   collected_at timestamptz,
+  collected_via text check (collected_via in ('customer', 'staff')),
+  pickup_mode text not null default 'here' check (pickup_mode in ('here', 'later')),
+  force_cover_sheet boolean not null default false,
+  sheet_kind text check (sheet_kind in ('none', 'separator', 'cover')),
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -181,6 +213,7 @@ create index print_jobs_queue_claim_idx on print_jobs (status, kiosk_id, queue_t
 -- a null refund_status forever (every job that never failed, or never had
 -- money move at all).
 create index print_jobs_refund_status_idx on print_jobs (refund_status) where refund_status is not null;
+create index print_jobs_tray_lookup_idx on print_jobs (kiosk_id, ready_at) where status = 'printed' and collected_at is null;
 
 -- Guards against two jobs on the same kiosk/day ever getting the same
 -- ticket number. NULLs (jobs that fail before ticket assignment, if that
@@ -205,13 +238,82 @@ create table print_orders (
   amount numeric not null,
   color_mode boolean not null,
   status text not null default 'completed',
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+
+  -- Added 2026-10-20 (supabase/migrations/2026-10-20_revenue_durable_ledger.sql)
+  -- so this table can fully replace print_jobs as the source for
+  -- get_kiosk_period_breakdown() below — print_jobs rows are hard-deleted
+  -- by /api/cron/cleanup-jobs a few hours after printing, so "this
+  -- week/month/year" can never be computed from it. This table is never
+  -- touched by that cleanup, so every completed print (including a free
+  -- staff print or a reprint) is now logged here unconditionally — see
+  -- lib/kiosk-stats.ts's recordCompletedPrint. is_free/is_reprint let
+  -- get_kiosk_period_breakdown() exclude them from the revenue sum without
+  -- having skipped inserting the row at all; waived_amount mirrors
+  -- print_jobs.waived_amount for a free print; sheet_kind mirrors
+  -- print_jobs.sheet_kind.
+  kiosk_id text,
+  is_free boolean not null default false,
+  is_reprint boolean not null default false,
+  waived_amount numeric,
+  sheet_kind text check (sheet_kind in ('none', 'separator', 'cover'))
 );
+
+create index print_orders_kiosk_created_idx on print_orders (kiosk_id, created_at);
 
 alter table print_orders enable row level security;
 -- Policy created in §9 below, after current_app_role() exists — a CREATE
 -- POLICY's USING clause is resolved immediately, unlike a view or function
 -- body, so the function it calls must already exist at this point.
+
+-- ============================================================================
+-- 2b. refund_events — durable, append-only record of a refund actually
+-- resolving (complete_refund() below inserts one the instant its own
+-- atomic claim succeeds). print_jobs' own refund_status/refunded_at are
+-- hard-deleted along with the rest of the job a few hours after it
+-- resolves (same cleanup cron as print_orders above), so
+-- get_kiosk_period_breakdown() reads this table instead for "refunds
+-- actually processed in period X" — independent of which period the
+-- original payment fell in. kiosk_id/job_id are stored for completeness
+-- even though no query currently filters by job_id.
+-- ============================================================================
+
+create table refund_events (
+  id uuid primary key default gen_random_uuid(),
+  kiosk_id text not null,
+  job_id uuid not null,
+  amount numeric not null,
+  resolved_at timestamptz not null default now()
+);
+
+create index refund_events_kiosk_resolved_idx on refund_events (kiosk_id, resolved_at);
+
+alter table refund_events enable row level security;
+-- Policy created in §9 below, same reasoning as print_orders' own policy
+-- comment just above.
+
+-- ============================================================================
+-- 2c. print_failures — durable, append-only record of a job reaching
+-- print_failed (added 2026-10-21, supabase/migrations/2026-10-21_sales_stats.sql)
+-- so get_kiosk_sales_summary() below can report a failure rate without
+-- depending on print_jobs, which is cleaned up a few hours after this
+-- resolves (see refund_events' own comment above for the identical
+-- reasoning). Written from lib/store.ts's failPrintingJob — the one place
+-- a job is ever actually marked print_failed.
+-- ============================================================================
+
+create table print_failures (
+  id uuid primary key default gen_random_uuid(),
+  kiosk_id text not null,
+  job_id uuid not null,
+  created_at timestamptz not null default now()
+);
+
+create index print_failures_kiosk_created_idx on print_failures (kiosk_id, created_at);
+
+alter table print_failures enable row level security;
+-- Policy created in §9 below, same reasoning as print_orders' own policy
+-- comment above.
 
 -- ============================================================================
 -- 3. kiosk_status — one row per physical kiosk
@@ -223,6 +325,8 @@ create table kiosk_status (
   cartridge_pages integer not null default 0,
   tray_max_pages integer not null default 150,       -- Samsung ML-1866W tray max
   cartridge_max_pages integer not null default 1500,  -- standard MLT-D104S yield
+  -- "Remaining <= this %" triggers a low-supply alert (lib/alerts/) — editable from the kiosk card.
+  low_supply_threshold_percent integer not null default 10 check (low_supply_threshold_percent between 1 and 99),
   total_revenue numeric not null default 0,
   total_lifetime_prints integer not null default 0,
   -- Free staff/owner prints — incremented alongside total_revenue/
@@ -283,7 +387,13 @@ create table kiosk_status (
   -- new checkout and show a "temporarily unavailable" banner — requirement:
   -- never let a new customer pay while the machine can't actually print.
   print_blocked_reason text,
-  print_blocked_at timestamptz
+  print_blocked_at timestamptz,
+
+  separator_mode text not null default 'auto' check (separator_mode in ('auto', 'always', 'never')),
+  recent_job_minutes integer not null default 5,
+  later_hold_hours integer not null default 2,
+  large_job_pages integer not null default 15,
+  tray_cleared_at timestamptz
 );
 
 insert into kiosk_status (id) values ('oxway_01');
@@ -524,12 +634,15 @@ create trigger print_jobs_set_queue_time
 -- Structural, same reasoning set_print_job_queue_time above already
 -- established. Fires only on the one real transition that ever matters: a
 -- job that was NOT already print_failed becomes print_failed.
--- `coalesce(new.payment_method, '') <> 'staff'` is the SAME check
--- lib/refund.ts's own attemptRefund already used before this feature
--- existed (payment_method, not provider — a staff job's `provider` column
--- still holds a real-looking gateway name even though no gateway order
--- ever existed for one) — a free staff print must never get a
--- refund_status at all, since there was never any money to refund.
+-- `coalesce(new.payment_method, '') not in ('staff', 'reprint')` is the
+-- SAME check lib/refund.ts's own attemptRefund already used before this
+-- feature existed (payment_method, not provider — a staff/reprint job's
+-- `provider` column still holds a real-looking gateway name even though
+-- no gateway order ever existed for one) — a free staff print or a free
+-- reprint must never get a refund_status at all, since there was never
+-- any money to refund for either one specifically (a REPRINT job's own
+-- ORIGINAL job's refund situation, if any, is handled separately — see
+-- set_original_job_refund_not_needed below).
 -- `new.refund_status is null` makes this a no-op if refund_status somehow
 -- already has a value — specifically what lets a reprint-then-fail-again
 -- cycle re-enter 'pending' cleanly (force_reprint_job resets it to null
@@ -540,7 +653,7 @@ begin
   if tg_op = 'UPDATE'
      and new.status = 'print_failed'
      and old.status is distinct from 'print_failed'
-     and coalesce(new.payment_method, '') <> 'staff'
+     and coalesce(new.payment_method, '') not in ('staff', 'reprint')
      and new.refund_status is null then
     new.refund_status := 'pending';
     new.refund_requested_at := now();
@@ -552,6 +665,34 @@ $$;
 create trigger print_jobs_set_refund_pending
   before update on print_jobs
   for each row execute function public.set_print_job_refund_pending();
+
+-- ============================================================================
+-- 6g. set_original_job_refund_not_needed() trigger — requirement: "when
+--     the reprint completes set that refund to 'not_needed'." AFTER
+--     UPDATE (unlike the BEFORE triggers above) because this writes a
+--     DIFFERENT row (the original job), not the row this statement is
+--     itself updating. Only ever moves 'pending' -> 'not_needed' — any
+--     other refund_status on the original ('processing', 'refunded',
+--     'failed') is left exactly as it is.
+-- ============================================================================
+create or replace function public.set_original_job_refund_not_needed()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'UPDATE'
+     and new.status = 'printed'
+     and old.status is distinct from 'printed'
+     and new.original_job_id is not null then
+    update print_jobs
+    set refund_status = 'not_needed', updated_at = now()
+    where id = new.original_job_id and refund_status = 'pending';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger print_jobs_set_original_refund_not_needed
+  after update on print_jobs
+  for each row execute function public.set_original_job_refund_not_needed();
 
 -- ============================================================================
 -- 6e. create_staff_print_job() / claim_next_paid_job()
@@ -587,7 +728,8 @@ create or replace function public.create_staff_print_job(
   p_kiosk_id text,
   p_idempotency_key text,
   p_created_by uuid,
-  p_daily_cap integer
+  p_daily_cap integer,
+  p_force_cover_sheet boolean default false
 )
 returns setof print_jobs
 language plpgsql
@@ -642,6 +784,7 @@ begin
     provider, provider_order_id, pdf_storage_path, kiosk_id,
     ticket_number, ticket_date,
     payment_method, created_by_user_id, is_free, waived_amount, idempotency_key,
+    pickup_mode, force_cover_sheet,
     created_at, updated_at
   ) values (
     p_job_id, 'paid', p_file_name, p_selected_pages, p_settings, 0,
@@ -649,6 +792,7 @@ begin
     p_provider, '', p_pdf_storage_path, p_kiosk_id,
     v_ticket_number, v_ticket_date,
     'staff', p_created_by, true, p_waived_amount, p_idempotency_key,
+    'here', p_force_cover_sheet,
     v_now, v_now
   );
 
@@ -665,6 +809,112 @@ begin
   return query select * from print_jobs where id = p_job_id;
 end;
 $$;
+
+-- ============================================================================
+-- 6h. create_reprint_job() — owner-only, atomic "Reprint pages" creation
+--     (requirement #4/#5 of the restart/reprint feature): inserts the new
+--     linked job, writes the "reprinted pages X to Y" note onto the
+--     original, and logs one audit entry, all or nothing.
+-- ============================================================================
+--
+-- NOT granted to authenticated — unlike force_reprint_job/cancel_job
+-- (owner OR staff, reachable directly from the browser), this is
+-- owner-only AND needs real server-side work first (downloading the
+-- original PDF, extracting the selected pages, re-uploading the result,
+-- validating the selection against the real page count) that doesn't
+-- belong inside a Postgres function — the real authorization boundary is
+-- app/api/admin/reprint's own server-side session check, service-role
+-- key, same split create_staff_print_job's own comment describes for its
+-- (looser) check. `p_selected_pages`/`p_settings` are trusted here because
+-- the CALLER has already validated every page number against the
+-- original's own real page count before ever calling this — that
+-- requires actually parsing the PDF, a Node-side operation this function
+-- has no way to do.
+create or replace function public.create_reprint_job(
+  p_job_id uuid,
+  p_original_job_id uuid,
+  p_selected_pages jsonb,
+  p_settings jsonb,
+  p_include_banner_page boolean,
+  p_content_hash text,
+  p_pdf_storage_path text,
+  p_reprint_note text,
+  p_created_by uuid,
+  p_force_cover_sheet boolean default false
+)
+returns setof print_jobs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_original record;
+  v_ticket_number integer;
+  v_ticket_date date;
+  v_now timestamptz := now();
+begin
+  if public.current_app_role() <> 'owner' then
+    raise exception 'Not authorized.';
+  end if;
+
+  -- `for update` locks the original row for the rest of this transaction
+  -- — closes the same kind of race claim_refund_for_processing's own
+  -- atomic claim exists to close: an owner approving a refund and an
+  -- owner reprinting the same job, at the same moment, from two tabs.
+  select * into v_original from print_jobs where id = p_original_job_id for update;
+  if v_original is null then
+    raise exception 'Original job not found.';
+  end if;
+  if v_original.refund_status = 'refunded' then
+    raise exception 'This job has already been refunded — a free reprint would mean the customer keeps the refund AND gets a free reprint.';
+  end if;
+
+  if coalesce(jsonb_array_length(p_selected_pages), 0) = 0 then
+    raise exception 'No pages selected to reprint.';
+  end if;
+
+  select ticket_number, ticket_date into v_ticket_number, v_ticket_date
+  from public.next_ticket_number(v_original.kiosk_id);
+
+  insert into print_jobs (
+    id, status, file_name, selected_pages, settings, total_price,
+    phone_number, notify_opt_in, include_banner_page, content_hash,
+    provider, provider_order_id, pdf_storage_path, kiosk_id,
+    ticket_number, ticket_date,
+    payment_method, created_by_user_id, original_job_id,
+    pickup_mode, force_cover_sheet,
+    created_at, updated_at
+  ) values (
+    p_job_id, 'paid', v_original.file_name, p_selected_pages, p_settings, 0,
+    '', false, p_include_banner_page, p_content_hash,
+    v_original.provider, '', p_pdf_storage_path, v_original.kiosk_id,
+    v_ticket_number, v_ticket_date,
+    'reprint', p_created_by, p_original_job_id,
+    'here', p_force_cover_sheet,
+    v_now, v_now
+  );
+
+  update print_jobs set reprint_note = p_reprint_note, updated_at = v_now where id = p_original_job_id;
+
+  perform public.log_audit(
+    p_action := 'job_reprinted',
+    p_actor_user_id := p_created_by,
+    p_actor_role := 'owner',
+    p_kiosk_id := v_original.kiosk_id,
+    p_target_type := 'print_job',
+    p_target_id := p_original_job_id::text,
+    p_details := jsonb_build_object(
+      'new_job_id', p_job_id,
+      'pages', p_selected_pages,
+      'copies', coalesce((p_settings->>'copies')::int, 1)
+    )
+  );
+
+  return query select * from print_jobs where id = p_job_id;
+end;
+$$;
+
+grant execute on function public.create_reprint_job(uuid, uuid, jsonb, jsonb, boolean, text, text, text, uuid, boolean) to service_role;
 
 -- The print agent's atomic "pick the oldest ready job" claim, replacing the
 -- old list-then-claim-each pattern (listPaidJobs + a per-row claimJobForPrinting
@@ -810,7 +1060,8 @@ create or replace function public.update_kiosk_counters(
   p_tray_max_pages integer default null,
   p_cartridge_max_pages integer default null,
   p_allow_color boolean default null,
-  p_allow_bw boolean default null
+  p_allow_bw boolean default null,
+  p_low_supply_threshold_percent integer default null
 )
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -820,6 +1071,9 @@ declare
 begin
   if public.current_app_role() not in ('owner', 'staff') then
     raise exception 'Not authorized.';
+  end if;
+  if p_low_supply_threshold_percent is not null and (p_low_supply_threshold_percent < 1 or p_low_supply_threshold_percent > 99) then
+    raise exception 'Low-supply threshold must be between 1 and 99.';
   end if;
 
   select * into v_old from kiosk_status where id = p_kiosk_id;
@@ -845,6 +1099,7 @@ begin
     cartridge_max_pages = coalesce(p_cartridge_max_pages, cartridge_max_pages),
     allow_color = coalesce(p_allow_color, allow_color),
     allow_bw = coalesce(p_allow_bw, allow_bw),
+    low_supply_threshold_percent = coalesce(p_low_supply_threshold_percent, low_supply_threshold_percent),
     updated_at = now()
   where id = p_kiosk_id;
 
@@ -859,12 +1114,14 @@ begin
       'before', jsonb_build_object(
         'tray_pages', v_old.tray_pages, 'cartridge_pages', v_old.cartridge_pages,
         'tray_max_pages', v_old.tray_max_pages, 'cartridge_max_pages', v_old.cartridge_max_pages,
-        'allow_color', v_old.allow_color, 'allow_bw', v_old.allow_bw
+        'allow_color', v_old.allow_color, 'allow_bw', v_old.allow_bw,
+        'low_supply_threshold_percent', v_old.low_supply_threshold_percent
       ),
       'after', jsonb_build_object(
         'tray_pages', coalesce(p_tray_pages, v_old.tray_pages), 'cartridge_pages', coalesce(p_cartridge_pages, v_old.cartridge_pages),
         'tray_max_pages', coalesce(p_tray_max_pages, v_old.tray_max_pages), 'cartridge_max_pages', coalesce(p_cartridge_max_pages, v_old.cartridge_max_pages),
-        'allow_color', v_resulting_allow_color, 'allow_bw', v_resulting_allow_bw
+        'allow_color', v_resulting_allow_color, 'allow_bw', v_resulting_allow_bw,
+        'low_supply_threshold_percent', coalesce(p_low_supply_threshold_percent, v_old.low_supply_threshold_percent)
       )
     )
   );
@@ -978,16 +1235,90 @@ $$;
 grant execute on function public.mark_job_refunded(uuid) to authenticated;
 grant execute on function public.force_reprint_job(uuid) to authenticated;
 grant execute on function public.cancel_job(uuid) to authenticated;
-grant execute on function public.update_kiosk_counters(text, integer, integer, integer, integer, boolean, boolean) to authenticated;
+grant execute on function public.update_kiosk_counters(text, integer, integer, integer, integer, boolean, boolean, integer) to authenticated;
 grant execute on function public.update_pricing(numeric, numeric) to authenticated;
 grant execute on function public.request_kiosk_command(text, text) to authenticated;
 grant execute on function public.update_kiosk_whatsapp_availability(text, boolean) to authenticated;
+
+create or replace function public.update_kiosk_separator_settings(
+  p_kiosk_id text,
+  p_separator_mode text,
+  p_recent_job_minutes integer,
+  p_later_hold_hours integer,
+  p_large_job_pages integer
+)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if public.current_app_role() not in ('owner', 'staff') then
+    raise exception 'Not authorized.';
+  end if;
+  if p_separator_mode not in ('auto', 'always', 'never') then
+    raise exception 'Unknown separator_mode "%".', p_separator_mode;
+  end if;
+  if p_recent_job_minutes < 0 or p_later_hold_hours < 0 or p_large_job_pages < 1 then
+    raise exception 'Invalid setting value.';
+  end if;
+
+  update kiosk_status set
+    separator_mode = p_separator_mode,
+    recent_job_minutes = p_recent_job_minutes,
+    later_hold_hours = p_later_hold_hours,
+    large_job_pages = p_large_job_pages,
+    updated_at = now()
+  where id = p_kiosk_id;
+
+  perform public.log_audit(
+    p_action := 'kiosk_separator_settings_updated',
+    p_actor_user_id := auth.uid(),
+    p_actor_role := public.current_app_role(),
+    p_kiosk_id := p_kiosk_id,
+    p_target_type := 'kiosk',
+    p_target_id := p_kiosk_id,
+    p_details := jsonb_build_object(
+      'separator_mode', p_separator_mode,
+      'recent_job_minutes', p_recent_job_minutes,
+      'later_hold_hours', p_later_hold_hours,
+      'large_job_pages', p_large_job_pages
+    )
+  );
+end;
+$$;
+
+grant execute on function public.update_kiosk_separator_settings(text, text, integer, integer, integer) to authenticated;
+
+create or replace function public.clear_kiosk_tray(p_kiosk_id text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if public.current_app_role() not in ('owner', 'staff') then
+    raise exception 'Not authorized.';
+  end if;
+
+  update kiosk_status set tray_cleared_at = now() where id = p_kiosk_id;
+
+  perform public.log_audit(
+    p_action := 'tray_cleared',
+    p_actor_user_id := auth.uid(),
+    p_actor_role := public.current_app_role(),
+    p_kiosk_id := p_kiosk_id,
+    p_target_type := 'kiosk',
+    p_target_id := p_kiosk_id
+  );
+end;
+$$;
+
+grant execute on function public.clear_kiosk_tray(text) to authenticated;
 
 -- ============================================================================
 -- 8. Policies that depend on current_app_role() existing (§7 above)
 -- ============================================================================
 
 create policy "Owner reads print_orders" on print_orders
+for select using (public.current_app_role() = 'owner');
+
+create policy "Owner reads refund_events" on refund_events
+for select using (public.current_app_role() = 'owner');
+
+create policy "Owner reads print_failures" on print_failures
 for select using (public.current_app_role() = 'owner');
 
 create policy "Owner reads pricing" on pricing_config
@@ -1029,7 +1360,9 @@ select
   case when public.current_app_role() = 'owner' then refunded_by else null end as refunded_by,
   case when public.current_app_role() = 'owner' then refund_provider_id else null end as refund_provider_id,
   case when public.current_app_role() = 'owner' then refund_error else null end as refund_error,
-  blocked_reason
+  blocked_reason,
+  interrupted_reason, interrupted_at, original_job_id, reprint_note,
+  pickup_mode, force_cover_sheet, sheet_kind, collected_via
 from public.print_jobs;
 
 -- free_print_* are NOT masked for staff the way total_revenue is — waived
@@ -1044,7 +1377,9 @@ select
   total_lifetime_prints, updated_at, allow_color, allow_bw,
   agent_commit, agent_updated_at, allow_whatsapp,
   free_print_count, free_print_pages, free_print_waived_amount,
-  print_blocked_reason, print_blocked_at
+  print_blocked_reason, print_blocked_at,
+  separator_mode, recent_job_minutes, later_hold_hours, large_job_pages, tray_cleared_at,
+  low_supply_threshold_percent
 from public.kiosk_status;
 
 -- Nothing in kiosk_commands is financial/sensitive — no column masking
@@ -1341,9 +1676,10 @@ as $$
 declare
   v_total_price numeric;
   v_provider text;
+  v_kiosk_id text;
   v_updated_rows integer;
 begin
-  select total_price, provider into v_total_price, v_provider from print_jobs where id = p_job_id;
+  select total_price, provider, kiosk_id into v_total_price, v_provider, v_kiosk_id from print_jobs where id = p_job_id;
 
   update print_jobs set
     refund_status = 'refunded',
@@ -1354,6 +1690,14 @@ begin
     updated_at = now()
   where id = p_job_id and refund_status = 'processing';
   get diagnostics v_updated_rows = row_count;
+
+  -- Only a genuinely successful claim gets a durable ledger entry — see
+  -- refund_events' own table comment above for why this exists at all
+  -- (get_kiosk_period_breakdown() reads it instead of print_jobs, which
+  -- gets cleaned up a few hours after a refund resolves).
+  if v_updated_rows > 0 then
+    insert into refund_events (kiosk_id, job_id, amount) values (v_kiosk_id, p_job_id, v_total_price);
+  end if;
 
   perform public.log_audit(
     p_action := 'job_refunded',
@@ -1483,15 +1827,20 @@ as $$
 $$;
 
 -- 10b. get_kiosk_period_breakdown() — dense, zero-filled buckets for the
--- Overview page's period selector (Today/Week/Month/Year). Two different
--- bucketing timestamps on purpose: revenue/refunds by queue_time (when
--- money was actually received); pages/prints/free-stats by
--- coalesce(ready_at, updated_at) (when the job actually finished printing).
--- A job paid just before midnight IST and printed just after genuinely
--- belongs to two different buckets for these two different metrics — that's
--- correct, not a bug. Money fields masked to null for non-owners, same
--- convention print_jobs_admin_view/kiosk_status_admin_view already use.
--- Bucket boundaries always computed via the
+-- Overview page's period selector (Today/Week/Month/Year). Reads from
+-- print_orders/refund_events (added 2026-10-20), NOT print_jobs — print_jobs
+-- rows are hard-deleted by /api/cron/cleanup-jobs a few hours after reaching
+-- a terminal state, so any period wider than that retention window could
+-- never be computed from it; print_orders/refund_events are never touched
+-- by that cleanup. revenue/pages are bucketed by print_orders.created_at
+-- (stamped right as the job finishes printing — see
+-- lib/kiosk-stats.ts's recordCompletedPrint, called right after
+-- print-agent marks a job 'printed'); refunds are bucketed independently by
+-- refund_events.resolved_at, so a refund resolved in a LATER period than
+-- its original payment correctly reduces that later period's own revenue
+-- figure, not the original one's. Money fields masked to null for
+-- non-owners, same convention print_jobs_admin_view/kiosk_status_admin_view
+-- already use. Bucket boundaries always computed via the
 -- `date_trunc(unit, <ts> at time zone 'Asia/Kolkata') at time zone
 -- 'Asia/Kolkata'` double-conversion so they land on real Kolkata wall-clock
 -- boundaries regardless of the database session's own timezone; stepping a
@@ -1511,7 +1860,11 @@ returns table (
   prints_completed integer,
   free_print_count integer,
   free_print_pages integer,
-  free_print_waived_amount numeric
+  free_print_waived_amount numeric,
+  reprint_count integer,
+  reprint_pages integer,
+  separators_printed integer,
+  covers_printed integer
 )
 language plpgsql
 stable
@@ -1552,51 +1905,316 @@ begin
   with buckets as (
     select generate_series(v_period_start, v_now, v_step) as bucket_start
   ),
-  revenue_rows as (
+  order_rows as (
     select
-      (date_trunc(v_trunc_unit, pj.queue_time at time zone v_tz)) at time zone v_tz as bucket_start,
-      sum(case when pj.refunded_at is null then pj.total_price else 0 end) as revenue,
-      sum(case when pj.refunded_at is not null then pj.total_price else 0 end) as refund_amount,
-      count(*) filter (where pj.refunded_at is not null) as refund_count
-    from print_jobs pj
-    where (p_kiosk_id is null or pj.kiosk_id = p_kiosk_id)
-      and coalesce(pj.is_free, false) = false
-      and pj.queue_time is not null
-      and pj.queue_time >= v_period_start and pj.queue_time <= v_now
+      (date_trunc(v_trunc_unit, po.created_at at time zone v_tz)) at time zone v_tz as bucket_start,
+      count(*) filter (where not po.is_free and not po.is_reprint) as prints_completed,
+      coalesce(sum(po.pages_printed) filter (where not po.is_free and not po.is_reprint), 0) as pages_printed,
+      coalesce(sum(po.amount) filter (where not po.is_free and not po.is_reprint), 0) as revenue,
+      count(*) filter (where po.is_free) as free_print_count,
+      coalesce(sum(po.pages_printed) filter (where po.is_free), 0) as free_print_pages,
+      coalesce(sum(po.waived_amount) filter (where po.is_free), 0) as free_print_waived_amount,
+      count(*) filter (where po.is_reprint) as reprint_count,
+      coalesce(sum(po.pages_printed) filter (where po.is_reprint), 0) as reprint_pages,
+      count(*) filter (where po.sheet_kind = 'separator') as separators_printed,
+      count(*) filter (where po.sheet_kind = 'cover') as covers_printed
+    from print_orders po
+    where (p_kiosk_id is null or po.kiosk_id = p_kiosk_id)
+      and po.created_at >= v_period_start and po.created_at <= v_now
     group by 1
   ),
-  completion_rows as (
+  refund_rows as (
     select
-      (date_trunc(v_trunc_unit, coalesce(pj.ready_at, pj.updated_at) at time zone v_tz)) at time zone v_tz as bucket_start,
-      count(*) filter (where coalesce(pj.is_free, false) = false) as prints_completed,
-      coalesce(sum(public.physical_sheets_for_job(pj)) filter (where coalesce(pj.is_free, false) = false), 0) as pages_printed,
-      count(*) filter (where pj.is_free) as free_print_count,
-      coalesce(sum(public.physical_sheets_for_job(pj)) filter (where pj.is_free), 0) as free_print_pages,
-      coalesce(sum(pj.waived_amount) filter (where pj.is_free), 0) as free_print_waived_amount
-    from print_jobs pj
-    where (p_kiosk_id is null or pj.kiosk_id = p_kiosk_id)
-      and pj.status = 'printed'
-      and coalesce(pj.ready_at, pj.updated_at) >= v_period_start and coalesce(pj.ready_at, pj.updated_at) <= v_now
+      (date_trunc(v_trunc_unit, re.resolved_at at time zone v_tz)) at time zone v_tz as bucket_start,
+      coalesce(sum(re.amount), 0) as refund_amount,
+      count(*) as refund_count
+    from refund_events re
+    where (p_kiosk_id is null or re.kiosk_id = p_kiosk_id)
+      and re.resolved_at >= v_period_start and re.resolved_at <= v_now
     group by 1
   )
   select
     b.bucket_start,
-    case when v_is_owner then coalesce(r.revenue, 0) else null end,
-    case when v_is_owner then coalesce(r.refund_amount, 0) else null end,
-    case when v_is_owner then coalesce(r.refund_count, 0)::integer else null end,
-    coalesce(c.pages_printed, 0)::integer,
-    coalesce(c.prints_completed, 0)::integer,
-    coalesce(c.free_print_count, 0)::integer,
-    coalesce(c.free_print_pages, 0)::integer,
-    case when v_is_owner then coalesce(c.free_print_waived_amount, 0) else null end
+    case when v_is_owner then coalesce(o.revenue, 0) - coalesce(rf.refund_amount, 0) else null end,
+    case when v_is_owner then coalesce(rf.refund_amount, 0) else null end,
+    case when v_is_owner then coalesce(rf.refund_count, 0)::integer else null end,
+    coalesce(o.pages_printed, 0)::integer,
+    coalesce(o.prints_completed, 0)::integer,
+    coalesce(o.free_print_count, 0)::integer,
+    coalesce(o.free_print_pages, 0)::integer,
+    case when v_is_owner then coalesce(o.free_print_waived_amount, 0) else null end,
+    coalesce(o.reprint_count, 0)::integer,
+    coalesce(o.reprint_pages, 0)::integer,
+    coalesce(o.separators_printed, 0)::integer,
+    coalesce(o.covers_printed, 0)::integer
   from buckets b
-  left join revenue_rows r on r.bucket_start = b.bucket_start
-  left join completion_rows c on c.bucket_start = b.bucket_start
+  left join order_rows o on o.bucket_start = b.bucket_start
+  left join refund_rows rf on rf.bucket_start = b.bucket_start
   order by b.bucket_start;
 end;
 $$;
 
 grant execute on function public.get_kiosk_period_breakdown(text, text) to authenticated;
+
+-- 10b-2. get_pending_refund_summary() — "pending" is deliberately NOT a
+-- period: a refund stays pending until an owner resolves it regardless of
+-- when the original job was created, so it has to be reported separately
+-- from the bucketed breakdown above, never subtracted from any period's own
+-- revenue (see the standing requirement: "Pending refunds shown separately,
+-- not subtracted yet"). Safe to read live from print_jobs — a job with
+-- refund_status in ('pending','processing','failed') is explicitly excluded
+-- from /api/cron/cleanup-jobs until it resolves, so these rows are
+-- guaranteed to still exist. Both fields null for staff, same masking
+-- convention as get_kiosk_period_breakdown's own revenue fields.
+create or replace function public.get_pending_refund_summary(p_kiosk_id text default null)
+returns table (pending_refund_amount numeric, pending_refund_count integer)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_is_owner constant boolean := public.current_app_role() = 'owner';
+begin
+  return query
+  select
+    case when v_is_owner then coalesce(sum(total_price), 0) else null end,
+    case when v_is_owner then count(*)::integer else null end
+  from print_jobs
+  where (p_kiosk_id is null or kiosk_id = p_kiosk_id)
+    and refund_status in ('pending', 'processing', 'failed');
+end;
+$$;
+
+grant execute on function public.get_pending_refund_summary(text) to authenticated;
+
+-- 10b-3. period_start_for() — the same today/week/month/year branch
+-- get_kiosk_period_breakdown() above already computes inline (left as-is
+-- there, since it's already live and tested); every stats function added
+-- from here on (10b-4 through 10b-7) calls this instead of repeating that
+-- branch a fifth time.
+create or replace function public.period_start_for(p_period text, p_now timestamptz, p_tz text)
+returns timestamptz
+language plpgsql
+immutable
+as $$
+begin
+  if p_period = 'today' then
+    return (date_trunc('day', p_now at time zone p_tz)) at time zone p_tz;
+  elsif p_period = 'week' then
+    return (date_trunc('week', p_now at time zone p_tz)) at time zone p_tz;
+  elsif p_period = 'month' then
+    return (date_trunc('month', p_now at time zone p_tz)) at time zone p_tz;
+  elsif p_period = 'year' then
+    return (date_trunc('year', p_now at time zone p_tz)) at time zone p_tz;
+  else
+    raise exception 'Unknown period "%" — expected today, week, month, or year.', p_period;
+  end if;
+end;
+$$;
+
+-- 10b-4. get_kiosk_hourly_pattern() — "peak hours" for the Overview's
+-- Statistics section: jobs/pages by hour of day (Kolkata wall-clock,
+-- 0-23), dense zero-filled across all 24 hours so the bar chart never has
+-- a gap. Reads print_orders, same durable-ledger reasoning as
+-- get_kiosk_period_breakdown. No money — counts only, visible to staff.
+create or replace function public.get_kiosk_hourly_pattern(p_period text, p_kiosk_id text default null)
+returns table (hour_of_day integer, job_count integer, pages_printed integer)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_tz constant text := 'Asia/Kolkata';
+  v_now constant timestamptz := now();
+  v_period_start timestamptz;
+begin
+  v_period_start := public.period_start_for(p_period, v_now, v_tz);
+
+  return query
+  with hours as (
+    select generate_series(0, 23) as hour_of_day
+  ),
+  activity as (
+    select
+      extract(hour from po.created_at at time zone v_tz)::integer as hour_of_day,
+      count(*) as job_count,
+      coalesce(sum(po.pages_printed), 0) as pages_printed
+    from print_orders po
+    where (p_kiosk_id is null or po.kiosk_id = p_kiosk_id)
+      and po.created_at >= v_period_start and po.created_at <= v_now
+    group by 1
+  )
+  select h.hour_of_day, coalesce(a.job_count, 0)::integer, coalesce(a.pages_printed, 0)::integer
+  from hours h
+  left join activity a on a.hour_of_day = h.hour_of_day
+  order by h.hour_of_day;
+end;
+$$;
+
+grant execute on function public.get_kiosk_hourly_pattern(text, text) to authenticated;
+
+-- 10b-5. get_kiosk_weekday_pattern() — "busiest days of the week" (the
+-- weekday pattern, aggregated across the whole period — NOT specific
+-- calendar dates, see get_kiosk_daily_pattern below for that). day_of_week
+-- follows extract(dow ...)'s own convention: 0 = Sunday .. 6 = Saturday,
+-- same as JavaScript's Date.getDay(), so the admin panel needs no
+-- day-number translation.
+create or replace function public.get_kiosk_weekday_pattern(p_period text, p_kiosk_id text default null)
+returns table (day_of_week integer, job_count integer, pages_printed integer)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_tz constant text := 'Asia/Kolkata';
+  v_now constant timestamptz := now();
+  v_period_start timestamptz;
+begin
+  v_period_start := public.period_start_for(p_period, v_now, v_tz);
+
+  return query
+  with weekdays as (
+    select generate_series(0, 6) as day_of_week
+  ),
+  activity as (
+    select
+      extract(dow from po.created_at at time zone v_tz)::integer as day_of_week,
+      count(*) as job_count,
+      coalesce(sum(po.pages_printed), 0) as pages_printed
+    from print_orders po
+    where (p_kiosk_id is null or po.kiosk_id = p_kiosk_id)
+      and po.created_at >= v_period_start and po.created_at <= v_now
+    group by 1
+  )
+  select w.day_of_week, coalesce(a.job_count, 0)::integer, coalesce(a.pages_printed, 0)::integer
+  from weekdays w
+  left join activity a on a.day_of_week = w.day_of_week
+  order by w.day_of_week;
+end;
+$$;
+
+grant execute on function public.get_kiosk_weekday_pattern(text, text) to authenticated;
+
+-- 10b-6. get_kiosk_daily_pattern() — one row per calendar day (Kolkata) in
+-- the period, dense zero-filled. The admin panel finds the busiest/
+-- quietest day in the selected period by taking the max/min of what this
+-- returns client-side, rather than that being computed in SQL, since
+-- "best" vs "quietest" needs tie-breaking and date-formatting the client
+-- already does for every other period view (see
+-- lib/admin/period-stats.ts's formatBucketLabel).
+create or replace function public.get_kiosk_daily_pattern(p_period text, p_kiosk_id text default null)
+returns table (day date, job_count integer, pages_printed integer)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_tz constant text := 'Asia/Kolkata';
+  v_now constant timestamptz := now();
+  v_period_start timestamptz;
+begin
+  v_period_start := public.period_start_for(p_period, v_now, v_tz);
+
+  return query
+  with days as (
+    select generate_series((v_period_start at time zone v_tz)::date, (v_now at time zone v_tz)::date, interval '1 day')::date as day
+  ),
+  activity as (
+    select
+      (po.created_at at time zone v_tz)::date as day,
+      count(*) as job_count,
+      coalesce(sum(po.pages_printed), 0) as pages_printed
+    from print_orders po
+    where (p_kiosk_id is null or po.kiosk_id = p_kiosk_id)
+      and po.created_at >= v_period_start and po.created_at <= v_now
+    group by 1
+  )
+  select d.day, coalesce(a.job_count, 0)::integer, coalesce(a.pages_printed, 0)::integer
+  from days d
+  left join activity a on a.day = d.day
+  order by d.day;
+end;
+$$;
+
+grant execute on function public.get_kiosk_daily_pattern(text, text) to authenticated;
+
+-- 10b-7. get_kiosk_sales_summary() — single-row summary for the period:
+-- color/B&W split, averages, and the two reliability rates. failure_rate is
+-- an operational metric (how often a print attempt of ANY kind — paying,
+-- free, or reprint — fails), so its denominator is every completed OR
+-- failed attempt. refund_rate's denominator is paid attempts only (paying
+-- completed + failed) — a free or reprint job never has anything to refund
+-- (see print_orders.is_free/is_reprint's own reasoning above). Both rates
+-- are counts, not money, so visible to staff same as everything else in
+-- this function except avg_order_value, which is masked to null for staff
+-- the same way every other money field in this file already is.
+create or replace function public.get_kiosk_sales_summary(p_period text, p_kiosk_id text default null)
+returns table (
+  color_jobs integer,
+  bw_jobs integer,
+  avg_pages_per_job numeric,
+  avg_order_value numeric,
+  failed_jobs integer,
+  failure_rate numeric,
+  refunded_jobs integer,
+  refund_rate numeric
+)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_tz constant text := 'Asia/Kolkata';
+  v_now constant timestamptz := now();
+  v_period_start timestamptz;
+  v_is_owner constant boolean := public.current_app_role() = 'owner';
+  v_completed_jobs integer;
+  v_paying_jobs integer;
+  v_failed_jobs integer;
+  v_refunded_jobs integer;
+begin
+  v_period_start := public.period_start_for(p_period, v_now, v_tz);
+
+  select
+    count(*)::integer,
+    count(*) filter (where not is_free and not is_reprint)::integer,
+    count(*) filter (where color_mode)::integer,
+    count(*) filter (where not color_mode)::integer,
+    coalesce(avg(pages_printed), 0),
+    coalesce(avg(amount) filter (where not is_free and not is_reprint), 0)
+  into v_completed_jobs, v_paying_jobs, color_jobs, bw_jobs, avg_pages_per_job, avg_order_value
+  from print_orders
+  where (p_kiosk_id is null or kiosk_id = p_kiosk_id)
+    and created_at >= v_period_start and created_at <= v_now;
+
+  select count(*)::integer into v_failed_jobs
+  from print_failures
+  where (p_kiosk_id is null or kiosk_id = p_kiosk_id)
+    and created_at >= v_period_start and created_at <= v_now;
+
+  select count(*)::integer into v_refunded_jobs
+  from refund_events
+  where (p_kiosk_id is null or kiosk_id = p_kiosk_id)
+    and resolved_at >= v_period_start and resolved_at <= v_now;
+
+  failed_jobs := v_failed_jobs;
+  refunded_jobs := v_refunded_jobs;
+  failure_rate := case when v_completed_jobs + v_failed_jobs > 0 then v_failed_jobs::numeric / (v_completed_jobs + v_failed_jobs) else 0 end;
+  refund_rate := case when v_paying_jobs + v_failed_jobs > 0 then v_refunded_jobs::numeric / (v_paying_jobs + v_failed_jobs) else 0 end;
+  if not v_is_owner then
+    avg_order_value := null;
+  end if;
+
+  return next;
+end;
+$$;
+
+grant execute on function public.get_kiosk_sales_summary(text, text) to authenticated;
 
 -- 10c. refill_events — append-ish history of "paper refilled" / "toner
 -- replaced" actions, the baseline every supply estimate is computed
@@ -1683,7 +2301,9 @@ grant execute on function public.record_refill(text, text, integer, text) to aut
 -- computeSupplyEstimate() does the remaining/percentage/clamping math from
 -- these, so that logic has a real unit test that doesn't need a database
 -- at all; this function's own job is just "sum what's been consumed since
--- the last baseline," which does need one.
+-- the last baseline," which does need one. Reads print_orders, not
+-- print_jobs (fixed 2026-10-22) — print_jobs is cleaned up a few hours
+-- after a job prints, so a baseline older than that would undercount.
 create or replace function public.get_kiosk_supply_status(p_kiosk_id text)
 returns table (
   cartridge_max_pages integer,
@@ -1717,20 +2337,18 @@ begin
     v_paper.id is not null,
     v_paper.quantity,
     case when v_paper.id is not null then (
-      select coalesce(sum(public.physical_sheets_for_job(pj)), 0)::integer
-      from print_jobs pj
-      where pj.kiosk_id = p_kiosk_id and pj.status = 'printed'
-        and coalesce(pj.ready_at, pj.updated_at) >= v_paper.at
+      select coalesce(sum(po.pages_printed), 0)::integer
+      from print_orders po
+      where po.kiosk_id = p_kiosk_id and po.created_at >= v_paper.at
     ) end,
     v_paper.at,
     v_paper.by_user_id,
     v_toner.id is not null,
     v_toner.quantity,
     case when v_toner.id is not null then (
-      select coalesce(sum(public.physical_sheets_for_job(pj)), 0)::integer
-      from print_jobs pj
-      where pj.kiosk_id = p_kiosk_id and pj.status = 'printed'
-        and coalesce(pj.ready_at, pj.updated_at) >= v_toner.at
+      select coalesce(sum(po.pages_printed), 0)::integer
+      from print_orders po
+      where po.kiosk_id = p_kiosk_id and po.created_at >= v_toner.at
     ) end,
     v_toner.at,
     v_toner.by_user_id;
@@ -1738,6 +2356,78 @@ end;
 $$;
 
 grant execute on function public.get_kiosk_supply_status(text) to authenticated;
+
+-- 10f. Low-supply / offline alerts (lib/alerts/) — Telegram + email + a
+-- banner, never WhatsApp. kiosk_alert_settings holds the per-kiosk
+-- Telegram chat id (owner-only); alerts is the dedupe/reminder/recovery
+-- ledger, one active row per (kiosk_id, kind) enforced by the partial
+-- unique index below.
+create table kiosk_alert_settings (
+  kiosk_id text primary key references kiosk_status(id),
+  telegram_chat_id text,
+  updated_at timestamptz not null default now(),
+  updated_by uuid references auth.users(id)
+);
+
+alter table kiosk_alert_settings enable row level security;
+create policy "Owner reads kiosk_alert_settings" on kiosk_alert_settings
+for select using (public.current_app_role() = 'owner');
+
+create or replace function public.update_kiosk_alert_settings(p_kiosk_id text, p_telegram_chat_id text default null)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if public.current_app_role() <> 'owner' then
+    raise exception 'Not authorized.';
+  end if;
+
+  insert into kiosk_alert_settings (kiosk_id, telegram_chat_id, updated_by)
+  values (p_kiosk_id, p_telegram_chat_id, auth.uid())
+  on conflict (kiosk_id) do update set telegram_chat_id = excluded.telegram_chat_id, updated_at = now(), updated_by = excluded.updated_by;
+
+  perform public.log_audit(
+    p_action := 'alert_settings_updated',
+    p_actor_user_id := auth.uid(),
+    p_actor_role := public.current_app_role(),
+    p_kiosk_id := p_kiosk_id,
+    p_target_type := 'kiosk',
+    p_target_id := p_kiosk_id,
+    p_details := jsonb_build_object('telegram_chat_id_set', p_telegram_chat_id is not null)
+  );
+end;
+$$;
+
+grant execute on function public.update_kiosk_alert_settings(text, text) to authenticated;
+
+create table alerts (
+  id uuid primary key default gen_random_uuid(),
+  kiosk_id text not null,
+  kind text not null check (kind in ('paper_low', 'toner_low', 'kiosk_offline')),
+  status text not null default 'active' check (status in ('active', 'resolved')),
+  created_at timestamptz not null default now(),
+  last_reminded_at timestamptz,
+  resolved_at timestamptz
+);
+
+create unique index alerts_active_kiosk_kind_idx on alerts (kiosk_id, kind) where status = 'active';
+create index alerts_kiosk_status_idx on alerts (kiosk_id, status);
+
+alter table alerts enable row level security;
+create policy "Signed-in admins read alerts" on alerts
+for select using (public.current_app_role() in ('owner', 'staff'));
+
+create or replace function public.get_active_alerts(p_kiosk_id text default null)
+returns setof alerts
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select * from alerts
+  where status = 'active' and (p_kiosk_id is null or kiosk_id = p_kiosk_id)
+  order by created_at desc;
+$$;
+
+grant execute on function public.get_active_alerts(text) to authenticated;
 
 -- ============================================================================
 -- Not part of this file: the Storage bucket.

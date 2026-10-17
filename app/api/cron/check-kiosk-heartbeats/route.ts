@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { evaluateAlert } from "@/lib/alerts";
 import { KIOSK_SILENT_THRESHOLD_MINUTES } from "@/lib/config";
 import { listKioskHeartbeats } from "@/lib/kiosk-stats";
-// ROADMAP.md §2 (notifications) is disabled for v2.5 — see the call site
-// below, which falls back to a console log (still checked by the admin
-// dashboard's kiosk cards showing last-seen) rather than assuming §2 is wired up.
+// ROADMAP.md §2 (WhatsApp notifications) is disabled for v2.5 — see
+// lib/alerts/ for the Telegram/email/banner channels actually used below.
 // import { notifyKioskSilent } from "@/lib/notify";
 
 export const runtime = "nodejs";
@@ -16,14 +16,9 @@ export const dynamic = "force-dynamic";
  * Reads kiosk_status.last_seen_at, which the print agent touches on its own
  * heartbeat timer (see print-agent/index.ts), independent of print activity.
  *
- * KNOWN LIMITATION, not an oversight: unlike the low-supply alert in
- * lib/kiosk-stats.ts, there's no "alert once, not every cycle" debounce here
- * — every run while a kiosk stays silent re-sends the alert. Doing better
- * would need somewhere to persist "already alerted," which means a new
- * column; left out deliberately rather than touching the shared DB schema
- * for this. In practice this just means repeat alerts for an ongoing
- * outage, which most monitoring setups do on purpose anyway — tune the
- * cron schedule (see CRON_SETUP.md) if that's too noisy.
+ * Dedupe/reminder/recovery (one alert per outage, a reminder after
+ * ALERT_REMINDER_HOURS, auto-cleared once the kiosk checks in again) is
+ * handled by evaluateAlert — see lib/alerts/index.ts.
  */
 export async function GET(request: Request) {
   const cronSecret = process.env.CRON_SECRET;
@@ -37,26 +32,21 @@ export async function GET(request: Request) {
   try {
     const kiosks = await listKioskHeartbeats();
     const now = Date.now();
-    const silentKiosks = kiosks
-      // A kiosk that has never sent a heartbeat (null last_seen_at — e.g. right
-      // after last_seen_at was added, before its print agent restarted) counts
-      // as silent rather than being skipped.
-      .map((kiosk) => ({
-        ...kiosk,
-        minutesSinceLastSeen: kiosk.lastSeenAt ? Math.round((now - new Date(kiosk.lastSeenAt).getTime()) / 60_000) : Number.POSITIVE_INFINITY,
-      }))
-      .filter((kiosk) => kiosk.minutesSinceLastSeen >= KIOSK_SILENT_THRESHOLD_MINUTES);
+    const kiosksWithStatus = kiosks.map((kiosk) => ({
+      ...kiosk,
+      minutesSinceLastSeen: kiosk.lastSeenAt ? Math.round((now - new Date(kiosk.lastSeenAt).getTime()) / 60_000) : Number.POSITIVE_INFINITY,
+    }));
 
-    // Disabled for v2.5 — see the §2 note in this file's imports above.
-    // const results = await Promise.allSettled(
-    //   silentKiosks.map((kiosk) => notifyKioskSilent(kiosk.id, kiosk.minutesSinceLastSeen))
-    // );
-    // const failed = results.filter((result) => result.status === "rejected").length;
-    for (const kiosk of silentKiosks) {
-      console.warn(`[ALERT] Kiosk "${kiosk.id}" hasn't checked in for ${kiosk.minutesSinceLastSeen} minutes.`);
+    for (const kiosk of kiosksWithStatus) {
+      const isSilent = kiosk.minutesSinceLastSeen >= KIOSK_SILENT_THRESHOLD_MINUTES;
+      await evaluateAlert(kiosk.id, "kiosk_offline", isSilent, {
+        title: `OXWAY — ${kiosk.id} is offline`,
+        body: `Hasn't checked in for ${kiosk.minutesSinceLastSeen} minutes — the print agent may be down.`,
+      });
     }
+    const silentCount = kiosksWithStatus.filter((k) => k.minutesSinceLastSeen >= KIOSK_SILENT_THRESHOLD_MINUTES).length;
 
-    return NextResponse.json({ checked: kiosks.length, silent: silentKiosks.length });
+    return NextResponse.json({ checked: kiosks.length, silent: silentCount });
   } catch (error) {
     console.error("check-kiosk-heartbeats error:", error);
     return NextResponse.json(

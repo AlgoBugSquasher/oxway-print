@@ -1,7 +1,9 @@
 import { jsonNoStore } from "@/lib/api-response";
 import { estimateMinutesUntilReady } from "@/lib/eta";
+import { getKioskTrayClearedAt } from "@/lib/kiosk-stats";
 import { reconcilePendingPayment } from "@/lib/payment-reconciliation";
-import { getJob } from "@/lib/store";
+import { computeStackEstimate } from "@/lib/print/tray-estimate";
+import { getJob, listUncollectedJobsAheadInTray } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,6 +41,20 @@ export async function GET(request: Request) {
       }
     }
 
+    let stackPosition: number | undefined;
+    let sheetsAhead: number | undefined;
+    if (reconciled.status === "printed" && !reconciled.collectedAt && reconciled.readyAt) {
+      try {
+        const trayClearedAt = await getKioskTrayClearedAt(reconciled.kioskId);
+        const jobsAhead = await listUncollectedJobsAheadInTray(reconciled.kioskId, trayClearedAt, reconciled.readyAt);
+        const estimate = computeStackEstimate(jobsAhead);
+        stackPosition = estimate.stackPosition;
+        sheetsAhead = estimate.sheetsAhead;
+      } catch (stackError) {
+        console.error("computeStackEstimate failed:", stackError);
+      }
+    }
+
     return jsonNoStore({
       jobId: reconciled.id,
       status: reconciled.status,
@@ -63,6 +79,15 @@ export async function GET(request: Request) {
       // print loop. Lets the status page say WHY this specific job is
       // currently paused, not just that it is.
       blockedReason: reconciled.blockedReason,
+      // Only meaningful while status is "interrupted" — see
+      // print-agent/index.ts's reconcileInFlightJobsOnBoot. Not shown on
+      // the customer page itself (that always says the same plain
+      // "Printing delayed, please wait"), kept here for parity with
+      // blockedReason and any future admin-facing reuse.
+      interruptedReason: reconciled.interruptedReason,
+      collectedAt: reconciled.collectedAt,
+      stackPosition,
+      sheetsAhead,
     });
   } catch (error) {
     console.error("verify-payment error:", error);

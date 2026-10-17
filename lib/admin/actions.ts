@@ -34,6 +34,27 @@ export async function forceReprintJob(jobId: string): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
+/**
+ * "Reprint pages" (owner-only) — distinct from forceReprintJob above,
+ * which just resubmits a job's EXISTING stored file as-is. This creates a
+ * NEW job containing only the requested pages, so it goes through
+ * app/api/admin/reprint (a plain route, not an RPC): that route needs to
+ * download the original PDF, extract the requested pages, and re-upload
+ * the result, none of which belongs inside a Postgres function.
+ */
+export async function requestReprint(input: {
+  originalJobId: string;
+  selectedPages: number[];
+  copies: number;
+  forceCoverSheet: boolean;
+}): Promise<{ jobId: string; ticketNumber: number }> {
+  return fetchJson<{ jobId: string; ticketNumber: number }>("/api/admin/reprint", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
 export async function cancelJob(jobId: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("cancel_job", { p_job_id: jobId });
@@ -48,6 +69,7 @@ export interface UpdateKioskCountersInput {
   cartridgeMaxPages?: number;
   allowColor?: boolean;
   allowBw?: boolean;
+  lowSupplyThresholdPercent?: number;
 }
 
 export async function updateKioskCounters(input: UpdateKioskCountersInput): Promise<void> {
@@ -60,8 +82,23 @@ export async function updateKioskCounters(input: UpdateKioskCountersInput): Prom
     p_cartridge_max_pages: input.cartridgeMaxPages ?? null,
     p_allow_color: input.allowColor ?? null,
     p_allow_bw: input.allowBw ?? null,
+    p_low_supply_threshold_percent: input.lowSupplyThresholdPercent ?? null,
   });
   if (error) throw new Error(error.message);
+}
+
+export async function updateKioskAlertSettings(kioskId: string, telegramChatId: string): Promise<void> {
+  const supabase = createSupabaseBrowserClient();
+  const { error } = await supabase.rpc("update_kiosk_alert_settings", { p_kiosk_id: kioskId, p_telegram_chat_id: telegramChatId || null });
+  if (error) throw new Error(error.message);
+}
+
+export async function sendTestAlert(kioskId: string): Promise<{ results: { channel: string; ok: boolean; error?: string }[] }> {
+  return fetchJson("/api/admin/test-alert", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kioskId }),
+  });
 }
 
 /**
@@ -105,5 +142,31 @@ export async function updatePricing(priceBw: number, priceColor: number): Promis
 export async function recordRefill(kioskId: string, kind: "paper" | "toner", quantity: number, note?: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("record_refill", { p_kiosk_id: kioskId, p_kind: kind, p_quantity: quantity, p_note: note ?? null });
+  if (error) throw new Error(error.message);
+}
+
+export interface UpdateKioskSeparatorSettingsInput {
+  kioskId: string;
+  separatorMode: "auto" | "always" | "never";
+  recentJobMinutes: number;
+  laterHoldHours: number;
+  largeJobPages: number;
+}
+
+export async function updateKioskSeparatorSettings(input: UpdateKioskSeparatorSettingsInput): Promise<void> {
+  const supabase = createSupabaseBrowserClient();
+  const { error } = await supabase.rpc("update_kiosk_separator_settings", {
+    p_kiosk_id: input.kioskId,
+    p_separator_mode: input.separatorMode,
+    p_recent_job_minutes: input.recentJobMinutes,
+    p_later_hold_hours: input.laterHoldHours,
+    p_large_job_pages: input.largeJobPages,
+  });
+  if (error) throw new Error(error.message);
+}
+
+export async function clearKioskTray(kioskId: string): Promise<void> {
+  const supabase = createSupabaseBrowserClient();
+  const { error } = await supabase.rpc("clear_kiosk_tray", { p_kiosk_id: kioskId });
   if (error) throw new Error(error.message);
 }

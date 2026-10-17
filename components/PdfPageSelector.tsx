@@ -46,9 +46,12 @@ import {
   MAX_TOTAL_PAGES_PER_BASKET,
   useFileBasket,
 } from "@/lib/hooks/useFileBasket";
+import { detectInAppBrowser } from "@/lib/in-app-browser";
+import { reportClientDiagnostic } from "@/lib/client-log";
 import { loadRazorpayCheckout } from "@/lib/loadRazorpay";
 import type { CreateOrderOutput } from "@/lib/payment";
 import { mergeSelectedPdfPages } from "@/lib/pdf-merge";
+import { INSTAGRAM_HANDLE, INSTAGRAM_URL } from "@/lib/social-links";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import { formatTicketCode } from "@/lib/ticket-code";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
@@ -64,11 +67,21 @@ type OrderStatus =
   | "print_failed"
   | "payment_failed"
   | "expired"
-  | "cancelled";
+  | "cancelled"
+  /**
+   * The print agent restarted while this job was mid-print and, on
+   * reboot, CUPS had no record of it — see print-agent/index.ts's
+   * reconcileInFlightJobsOnBoot. Unlike print_blocked, nothing will ever
+   * change this status again on its own (no watcher is tracking it), so
+   * it's included in TERMINAL_ORDER_STATUSES below — there's no point
+   * polling/staying subscribed for a status that will never move.
+   */
+  | "interrupted";
 
 // Once a job reaches one of these, nothing about it changes again — no point
-// still polling or staying subscribed to Realtime for it.
-const TERMINAL_ORDER_STATUSES: OrderStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled"];
+// still polling or staying subscribed to Realtime for it. 'interrupted'
+// included for that same reason, not because it "completed" anything.
+const TERMINAL_ORDER_STATUSES: OrderStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled", "interrupted"];
 // Not latency-sensitive (see the kiosk online/offline signal's own doc) — a
 // device outage or recovery showing up within ~15s is plenty responsive for
 // a banner, so this stays a plain poll rather than Realtime.
@@ -113,6 +126,7 @@ const PHONE_PATTERN = /^[6-9]\d{9}$/;
 
 export default function PdfPageSelector() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pickupCardRef = useRef<HTMLDivElement>(null);
   const [settings, setSettings] = useState<PrintSettings>({
     copies: 1,
     layout: "portrait",
@@ -128,6 +142,7 @@ export default function PdfPageSelector() {
   // app/api/create-order/route.ts) — this UI is only a mirror of that.
   const [notifyOptIn, setNotifyOptIn] = useState(false);
   const [phone, setPhone] = useState("");
+  const [pickupMode, setPickupMode] = useState<"here" | "later">("here");
   const [phoneTouched, setPhoneTouched] = useState(false);
   const [isDark, setIsDark] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -151,6 +166,10 @@ export default function PdfPageSelector() {
   // "pending" for a while before an owner approves one from the admin
   // Refunds page.
   const [refundStatus, setRefundStatus] = useState<string | null>(null);
+  const [collectedAt, setCollectedAt] = useState<string | null>(null);
+  const [stackPosition, setStackPosition] = useState<number | null>(null);
+  const [sheetsAhead, setSheetsAhead] = useState<number | null>(null);
+  const [isCollecting, setIsCollecting] = useState(false);
   const [error, setError] = useState("");
   // 0-100 while the raw file itself is uploading directly to Supabase
   // Storage (see handleStartPayment) — null the rest of the time,
@@ -212,6 +231,27 @@ export default function PdfPageSelector() {
   // mismatch — please refresh and try again." at checkout.
   const [priceBw, setPriceBw] = useState(2);
   const [priceColor, setPriceColor] = useState(10);
+  // Goal 4 (UPI missing on some phones) — a friendly, non-blocking notice
+  // when the page is open inside an in-app browser (Instagram/WhatsApp/
+  // Facebook/Google Lens views/MIUI Browser), since UPI apps often can't
+  // deep-link out of those webviews. Computed once on mount (navigator is
+  // client-only); never hidden behind a loading state, never blocks Pay.
+  const [inAppBrowser, setInAppBrowser] = useState<{ isInAppBrowser: boolean; label: string | null }>({ isInAppBrowser: false, label: null });
+  const [copiedLink, setCopiedLink] = useState(false);
+  useEffect(() => {
+    // navigator.userAgent doesn't exist during SSR — this can only run once mounted, not computed during render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setInAppBrowser(detectInAppBrowser(navigator.userAgent));
+  }, []);
+  const handleCopyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2000);
+    } catch {
+      // Clipboard access can be denied/unsupported — the link is still visible for a manual copy.
+    }
+  };
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
@@ -329,6 +369,23 @@ export default function PdfPageSelector() {
   // server never trusts totalPrice/selectedPages sent here — see
   // app/api/create-order/route.ts, which re-derives the real page count,
   // sheets and price from the merged PDF it actually receives.
+  const handleCollect = async () => {
+    if (!jobId || isCollecting) return;
+    setIsCollecting(true);
+    try {
+      const result = await fetchJson<{ collectedAt: string }>("/api/collect-job", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId }),
+      });
+      setCollectedAt(result.collectedAt);
+    } catch (collectError) {
+      console.error("collect-job error:", collectError);
+    } finally {
+      setIsCollecting(false);
+    }
+  };
+
   const handleStartPayment = async () => {
     if (basket.items.length === 0) return setError("Add at least one file before paying.");
     if (basket.isProcessing) return setError("Please wait for your files to finish preparing.");
@@ -403,6 +460,7 @@ export default function PdfPageSelector() {
           // unticked again).
           phone: notifyOptIn ? phone : undefined,
           kioskId: paramKioskId || undefined,
+          pickupMode,
         }),
       });
 
@@ -416,6 +474,8 @@ export default function PdfPageSelector() {
       } else {
         await loadRazorpayCheckout();
         if (!window.Razorpay) throw new Error("Razorpay Checkout could not be loaded");
+        const inAppBrowser = detectInAppBrowser(navigator.userAgent);
+        reportClientDiagnostic("razorpay-checkout-open", { isInAppBrowser: inAppBrowser.isInAppBrowser, inAppLabel: inAppBrowser.label });
         const razorpay = new window.Razorpay({
           key: order.keyId,
           amount: order.amount,
@@ -432,10 +492,24 @@ export default function PdfPageSelector() {
           handler: () => {},
           modal: {},
         });
+        // Diagnostic only (Goal 4) — error.code/description, no payment or
+        // personal data. Never blocks or alters the actual checkout flow.
+        razorpay.on("payment.failed", (response) => {
+          reportClientDiagnostic("razorpay-payment-failed", {
+            errorCode: response.error?.code,
+            errorDescription: response.error?.description,
+            errorSource: response.error?.source,
+            errorStep: response.error?.step,
+            errorReason: response.error?.reason,
+            isInAppBrowser: inAppBrowser.isInAppBrowser,
+            inAppLabel: inAppBrowser.label,
+          });
+        });
         razorpay.open();
       }
     } catch (paymentError) {
       console.error("Payment order error:", paymentError);
+      reportClientDiagnostic("razorpay-checkout-open-failed", { message: paymentError instanceof Error ? paymentError.message : String(paymentError) });
       setError(paymentError instanceof Error ? paymentError.message : "Payment could not be started.");
       setOrderStatus("idle");
     } finally {
@@ -508,9 +582,15 @@ export default function PdfPageSelector() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await fetchJson<{ jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number; refundStatus?: string | null }>(`/api/verify-payment?jobId=${jobId}`);
+        const data = await fetchJson<{
+          jobId: string; status: OrderStatus; error?: string; etaMinutes?: number; ticketNumber?: number; refundStatus?: string | null;
+          collectedAt?: string | null; stackPosition?: number; sheetsAhead?: number;
+        }>(`/api/verify-payment?jobId=${jobId}`);
         if (cancelled) return;
         setEtaMinutes(data.etaMinutes ?? null);
+        setCollectedAt(data.collectedAt ?? null);
+        setStackPosition(data.stackPosition ?? null);
+        setSheetsAhead(data.sheetsAhead ?? null);
         applyStatusUpdate(jobId, { status: data.status, error: data.error, ticketNumber: data.ticketNumber, refundStatus: data.refundStatus });
       } catch (pollError) {
         console.error("Status poll error:", pollError);
@@ -573,6 +653,13 @@ export default function PdfPageSelector() {
     setError("");
   };
 
+  useEffect(() => {
+    if (ticketNumber === null) return;
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top: 0, behavior: prefersReducedMotion ? "auto" : "smooth" });
+    pickupCardRef.current?.focus();
+  }, [ticketNumber]);
+
   const theme = isDark ? "bg-[#101419] text-slate-100" : "bg-[#f4f6f8] text-slate-950";
   const panel = isDark ? "border-white/10 bg-white/[0.06]" : "border-slate-200 bg-white";
   const muted = isDark ? "text-slate-400" : "text-slate-500";
@@ -597,7 +684,7 @@ export default function PdfPageSelector() {
        actual design requirement here, not a nice-to-have. */}
     {ticketNumber !== null && orderStatus !== "idle" && orderStatus !== "pending_payment" && (
       <div className="mx-auto max-w-6xl px-5 pt-6 lg:px-8">
-        <div className={`flex flex-col items-center rounded-[2rem] border-2 border-blue-600 px-6 py-8 text-center shadow-xl shadow-blue-600/10 ${isDark ? "bg-blue-600/15" : "bg-blue-50"}`}>
+        <div ref={pickupCardRef} tabIndex={-1} className={`flex flex-col items-center rounded-[2rem] border-2 border-blue-600 px-6 py-8 text-center shadow-xl shadow-blue-600/10 outline-none focus-visible:ring-4 focus-visible:ring-blue-500/40 ${isDark ? "bg-blue-600/15" : "bg-blue-50"}`}>
           <p className="text-xs font-black uppercase tracking-[0.35em] text-blue-600">Your pickup code</p>
           {/* Fixed sizing (text-[5.5rem]/text-[8rem]) was hand-tuned for the
              usual 3-digit code ("#042") and never shrinks for a longer one —
@@ -673,6 +760,22 @@ export default function PdfPageSelector() {
       </div>}
 
       {error && <div className="mt-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-500">{error}</div>}
+      {orderStatus === "printed" && !collectedAt && (
+        <div className="mt-4 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-700">
+          {stackPosition !== null && (
+            <p className="mb-2">
+              Your print is the {stackPosition === 1 ? "1st" : stackPosition === 2 ? "2nd" : stackPosition === 3 ? "3rd" : `${stackPosition}th`} stack from the top
+              {sheetsAhead !== null && sheetsAhead > 0 ? ` (about ${sheetsAhead} sheets)` : ""} — estimate only.
+            </p>
+          )}
+          <button onClick={handleCollect} disabled={isCollecting} className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-black text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50">
+            {isCollecting ? "Marking as collected..." : "I've collected my print"}
+          </button>
+        </div>
+      )}
+      {orderStatus === "printed" && collectedAt && (
+        <div className="mt-4 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-700">Thanks — marked as collected.</div>
+      )}
       {/* Requirement: a clear message that the print didn't complete and a
          refund is under review, with a non-exact timeline — never a raw
          internal failure reason (CUPS error, etc.), which the pre-refund-
@@ -685,6 +788,25 @@ export default function PdfPageSelector() {
         ? <div className="mt-4 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-600">Your refund has been approved and sent to your original payment method.</div>
         : <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-700">We&apos;re sorry — this print didn&apos;t complete. We&apos;re reviewing a refund for this order; once approved, it will reach your original payment method in about 5–7 business days.</div>)}
     </section><aside className="lg:pt-[86px]"><div className={`rounded-[2rem] border p-5 shadow-xl shadow-slate-900/5 ${panel}`}><div className="mb-5 flex items-center justify-between"><div><p className={`text-xs font-bold uppercase tracking-[0.2em] ${muted}`}>Print order</p><p className="mt-1 text-lg font-black">Configure output</p></div><Settings2 className="text-blue-500" size={19} /></div><div className={`mb-4 rounded-2xl p-4 ${isDark ? "bg-blue-500/10" : "bg-blue-50"}`}><div className="flex items-center justify-between"><span className={`text-xs font-semibold ${muted}`}>Estimated total</span><span className="text-2xl font-black text-blue-600">₹{totalPrice}</span></div><div className={`mt-2 text-xs ${muted}`}>{basket.items.length} {basket.items.length === 1 ? "file" : "files"} · {billableSheets} billable sheets · {totalActivePages} of {totalPages} pages · {settings.copies} {settings.copies === 1 ? "copy" : "copies"}</div></div>
+      <div className={`mb-4 rounded-xl border p-3 ${isDark ? "border-white/10" : "border-slate-200"}`}>
+        <p className="mb-2 text-sm font-bold">When will you collect?</p>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => setPickupMode("here")}
+            className={`rounded-xl border px-3 py-2.5 text-xs font-bold ${pickupMode === "here" ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}
+          >
+            I&apos;m at the kiosk now
+          </button>
+          <button
+            type="button"
+            onClick={() => setPickupMode("later")}
+            className={`rounded-xl border px-3 py-2.5 text-xs font-bold ${pickupMode === "later" ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}
+          >
+            I&apos;ll collect later
+          </button>
+        </div>
+      </div>
       {allowWhatsapp && (
         <div className={`mb-4 rounded-xl border p-3 ${isDark ? "border-white/10" : "border-slate-200"}`}>
           <label className="flex cursor-pointer items-start gap-2.5">
@@ -718,6 +840,26 @@ export default function PdfPageSelector() {
       )}
       <button onClick={() => setIsSettingsOpen(true)} className={`flex w-full items-center justify-between rounded-xl border px-4 py-3 text-sm font-bold ${isDark ? "border-white/10" : "border-slate-200"}`}><span className="flex items-center gap-2"><LayoutGrid size={16} className="text-blue-500" /> Print settings</span><ChevronDown size={16} className={muted} /></button><div className={`mt-4 space-y-3 text-xs ${muted}`}><div className="flex justify-between"><span>Color mode</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.isColor ? "Color" : "B&W"}</b></div><div className="flex justify-between"><span>Paper</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.paperSize} · {settings.layout}</b></div><div className="flex justify-between"><span>Pages per sheet</span><b className={isDark ? "text-slate-200" : "text-slate-700"}>{settings.pagesPerSheet}</b></div></div></div></aside></main>
     <BrandWatermark isDark={isDark} />
+    <footer className="mx-auto max-w-6xl px-5 pb-8 lg:px-8">
+      <a href={INSTAGRAM_URL} target="_blank" rel="noopener noreferrer" className={`flex w-fit items-center gap-2 text-sm font-semibold ${muted} hover:text-blue-500`}>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <rect x="2" y="2" width="20" height="20" rx="5" ry="5" />
+          <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z" />
+          <line x1="17.5" y1="6.5" x2="17.51" y2="6.5" />
+        </svg>
+        {INSTAGRAM_HANDLE}
+      </a>
+    </footer>
+    {basket.items.length > 0 && orderStatus === "idle" && inAppBrowser.isInAppBrowser && (
+      <div className="fixed bottom-[88px] left-0 right-0 z-30 mx-auto max-w-6xl px-5 lg:px-8">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-400/40 bg-amber-500/10 px-4 py-2.5 text-xs font-medium text-amber-700">
+          <span>For UPI, open this page in Chrome or Safari — {inAppBrowser.label ?? "this browser"} may not support it.</span>
+          <button type="button" onClick={handleCopyLink} className="flex items-center gap-1 rounded-lg border border-amber-400/50 bg-white px-2.5 py-1 font-bold text-amber-700 hover:bg-amber-50">
+            <Copy size={12} /> {copiedLink ? "Copied!" : "Copy link"}
+          </button>
+        </div>
+      </div>
+    )}
     {basket.items.length > 0 && <div className={`fixed bottom-0 left-0 right-0 z-30 border-t backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/90" : "border-slate-200 bg-white/90"}`}><div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-4 lg:px-8">
       {/* The ticket code itself now lives in the big hero banner above
          <main> (see ticketNumber !== null below) — this slot stays on
@@ -736,6 +878,9 @@ export default function PdfPageSelector() {
          pill just needs to say "still in progress, not stuck." Resumes
          automatically — no action for the customer to take. */}
       {orderStatus === "print_blocked" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500/10 px-5 py-3.5 text-sm font-black text-amber-600"><AlertTriangle size={17} /> Print paused — resuming shortly</div>}
+      {/* Requirement (restart handling, Part A): literal copy "Printing
+         delayed, please wait" for an interrupted job. */}
+      {orderStatus === "interrupted" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-rose-500/10 px-5 py-3.5 text-sm font-black text-rose-600"><AlertTriangle size={17} /> Printing delayed, please wait</div>}
       {orderStatus === "printed" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-emerald-500/10 px-5 py-3.5 text-sm font-black text-emerald-500"><Check size={17} /> Your print is ready — please collect it</div>}
       {orderStatus === "expired" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Payment expired — try again</button>}
       {orderStatus === "payment_failed" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-red-500 px-5 py-3.5 text-sm font-black text-white">Failed — try again</button>}
@@ -751,7 +896,7 @@ export default function PdfPageSelector() {
         : <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-3.5 text-sm font-black text-white">Refund under review</button>)}
       {orderStatus === "cancelled" && <button onClick={resetOrder} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-slate-500 px-5 py-3.5 text-sm font-black text-white">Cancelled — see kiosk staff</button>}
     </div></div>}
-    {isSettingsOpen && <div className="fixed inset-0 z-40 flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsSettingsOpen(false); }}><div className={`w-full max-w-lg rounded-t-[2rem] p-6 shadow-2xl sm:rounded-[2rem] ${isDark ? "bg-[#171d24]" : "bg-white"}`}><div className="mb-6 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Print settings</p><h2 className="mt-1 text-xl font-black">Tune your document</h2></div><button onClick={() => setIsSettingsOpen(false)} className={`grid size-9 place-items-center rounded-xl ${isDark ? "bg-white/10" : "bg-slate-100"}`}><X size={17} /></button></div><div className="space-y-5"><SettingRow label="Copies" icon={<Copy size={16} />}><div className={`flex items-center gap-1 rounded-xl border p-1 ${isDark ? "border-white/10" : "border-slate-200"}`}><button onClick={() => updateSettings("copies", Math.max(1, settings.copies - 1))} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Minus size={15} /></button><span className="w-8 text-center text-sm font-black">{settings.copies}</span><button onClick={() => updateSettings("copies", settings.copies + 1)} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Plus size={15} /></button></div></SettingRow><SettingRow label="Layout" icon={<LayoutGrid size={16} />}><Segmented value={settings.layout} options={["portrait", "landscape"]} onChange={(value) => updateSettings("layout", value as Layout)} /></SettingRow><SettingRow label="Color mode" icon={<Palette size={16} />}><Segmented value={settings.isColor ? "color" : "bw"} options={["bw", "color"]} labels={[`B&W · ₹${priceBw}`, `Color · ₹${priceColor}`]} disabledOptions={[...(!allowBw ? ["bw"] : []), ...(!allowColor ? ["color"] : [])]} onChange={(value) => updateSettings("isColor", value === "color")} /></SettingRow><div><p className={`mb-2 text-sm font-bold ${muted}`}>Pages</p><div className="grid grid-cols-4 gap-2">{(["all", "odd", "even", "custom"] as PageMode[]).map((mode) => <button key={mode} onClick={() => updateSettings("pageMode", mode)} className={`rounded-xl border px-2 py-2.5 text-xs font-bold capitalize ${settings.pageMode === mode ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}>{mode}</button>)}</div>{settings.pageMode === "custom" && <input value={settings.customRange} onChange={(event) => updateSettings("customRange", event.target.value)} placeholder="Example: 1-5, 8" className={`mt-2 w-full rounded-xl border px-3 py-2.5 text-sm outline-none focus:border-blue-500 ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`} />}</div><SettingRow label="Paper size" icon={<FileText size={16} />}><select value={settings.paperSize} onChange={(event) => updateSettings("paperSize", event.target.value as PaperSize)} className={`rounded-xl border px-3 py-2 text-xs font-bold outline-none ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`}>{(["A4", "Letter", "Legal"] as PaperSize[]).map((size) => <option key={size}>{size}</option>)}</select></SettingRow><SettingRow label="Pages per sheet" icon={<LayoutGrid size={16} />}><Segmented value={String(settings.pagesPerSheet)} options={["1", "2", "4"]} labels={["1", "2 in 1", "4 in 1"]} onChange={(value) => updateSettings("pagesPerSheet", Number(value) as 1 | 2 | 4)} /></SettingRow></div><button onClick={() => setIsSettingsOpen(false)} className="mt-7 w-full rounded-xl bg-blue-600 py-3.5 text-sm font-black text-white">Apply settings</button></div></div>}
+    {isSettingsOpen && <div className="fixed inset-0 z-40 flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsSettingsOpen(false); }}><div className={`w-full max-w-lg rounded-t-[2rem] p-6 shadow-2xl sm:rounded-[2rem] ${isDark ? "bg-[#171d24]" : "bg-white"}`}><div className="mb-6 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-500">Print settings</p><h2 className="mt-1 text-xl font-black">Tune your document</h2></div><button onClick={() => setIsSettingsOpen(false)} className={`grid size-9 place-items-center rounded-xl ${isDark ? "bg-white/10" : "bg-slate-100"}`}><X size={17} /></button></div><div className="space-y-5"><SettingRow label="Copies" icon={<Copy size={16} />}><div className={`flex items-center gap-1 rounded-xl border p-1 ${isDark ? "border-white/10" : "border-slate-200"}`}><button onClick={() => updateSettings("copies", Math.max(1, settings.copies - 1))} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Minus size={15} /></button><span className="w-8 text-center text-sm font-black">{settings.copies}</span><button onClick={() => updateSettings("copies", settings.copies + 1)} className="grid size-8 place-items-center rounded-lg hover:bg-blue-500/10"><Plus size={15} /></button></div></SettingRow><SettingRow label="Layout" icon={<LayoutGrid size={16} />}><Segmented value={settings.layout} options={["portrait", "landscape"]} onChange={(value) => updateSettings("layout", value as Layout)} /></SettingRow><SettingRow label="Color mode" icon={<Palette size={16} />}><Segmented value={settings.isColor ? "color" : "bw"} options={["bw", "color"]} labels={[`B&W · ₹${priceBw}`, `Color · ₹${priceColor}`]} disabledOptions={[...(!allowBw ? ["bw"] : []), ...(!allowColor ? ["color"] : [])]} onChange={(value) => updateSettings("isColor", value === "color")} /></SettingRow>{(!allowColor || !allowBw) && <p className="text-xs font-medium text-amber-600">{!allowColor ? "Color is unavailable right now." : "B&W is unavailable right now."}</p>}<div><p className={`mb-2 text-sm font-bold ${muted}`}>Pages</p><div className="grid grid-cols-4 gap-2">{(["all", "odd", "even", "custom"] as PageMode[]).map((mode) => <button key={mode} onClick={() => updateSettings("pageMode", mode)} className={`rounded-xl border px-2 py-2.5 text-xs font-bold capitalize ${settings.pageMode === mode ? "border-blue-500 bg-blue-500/10 text-blue-500" : isDark ? "border-white/10" : "border-slate-200"}`}>{mode}</button>)}</div>{settings.pageMode === "custom" && <input value={settings.customRange} onChange={(event) => updateSettings("customRange", event.target.value)} placeholder="Example: 1-5, 8" className={`mt-2 w-full rounded-xl border px-3 py-2.5 text-sm outline-none focus:border-blue-500 ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`} />}</div><SettingRow label="Paper size" icon={<FileText size={16} />}><select value={settings.paperSize} onChange={(event) => updateSettings("paperSize", event.target.value as PaperSize)} className={`rounded-xl border px-3 py-2 text-xs font-bold outline-none ${isDark ? "border-white/10 bg-white/5" : "border-slate-200 bg-slate-50"}`}>{(["A4", "Letter", "Legal"] as PaperSize[]).map((size) => <option key={size}>{size}</option>)}</select></SettingRow><SettingRow label="Pages per sheet" icon={<LayoutGrid size={16} />}><Segmented value={String(settings.pagesPerSheet)} options={["1", "2", "4"]} labels={["1", "2 in 1", "4 in 1"]} onChange={(value) => updateSettings("pagesPerSheet", Number(value) as 1 | 2 | 4)} /></SettingRow></div><button onClick={() => setIsSettingsOpen(false)} className="mt-7 w-full rounded-xl bg-blue-600 py-3.5 text-sm font-black text-white">Apply settings</button></div></div>}
     {/* Preview used to also render as an always-open floating panel on
        desktop, sitting over the page-selection grid whether you wanted it
        or not. Now button-triggered on every screen size, same as it

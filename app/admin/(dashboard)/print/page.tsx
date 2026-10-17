@@ -19,8 +19,8 @@ import { formatTicketCode } from "@/lib/ticket-code";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
 
 /** Mirrors lib/store.ts JobStatus, plus a local "idle" state before any job exists — same shape the customer page tracks, just without the payment-specific states (pending_payment/payment_failed/expired never happen here, a staff job is created already-paid). */
-type JobStatus = "idle" | "submitting" | "paid" | "printing" | "print_blocked" | "printed" | "print_failed" | "cancelled";
-const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "cancelled"];
+type JobStatus = "idle" | "submitting" | "paid" | "printing" | "print_blocked" | "interrupted" | "printed" | "print_failed" | "cancelled";
+const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "cancelled", "interrupted"];
 
 /** Which kiosk this print goes to — ?k=<kiosk-id> for a multi-kiosk setup, same convention the customer page and kiosk-display screen already use. Defaults to the single kiosk this build ships with. */
 function readKioskIdFromUrl(): string {
@@ -55,6 +55,7 @@ export default function AdminPrintPage() {
   const [jobBlockedReason, setJobBlockedReason] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [forceCoverSheet, setForceCoverSheet] = useState(false);
 
   const [kioskId] = useState(readKioskIdFromUrl);
   const [isKioskOnline, setIsKioskOnline] = useState(true);
@@ -157,6 +158,7 @@ export default function AdminPrintPage() {
           settings,
           kioskId,
           idempotencyKey: idempotencyKeyRef.current,
+          forceCoverSheet,
         }),
       });
 
@@ -346,6 +348,9 @@ export default function AdminPrintPage() {
                     <input value={settings.customRange} onChange={(event) => updateSettings("customRange", event.target.value)} placeholder="Example: 1-5, 8" className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none focus:border-blue-500" />
                   )}
                 </div>
+                <SettingRow label="Force cover sheet" icon={null}>
+                  <input type="checkbox" checked={forceCoverSheet} onChange={(event) => setForceCoverSheet(event.target.checked)} className="size-5 accent-blue-600" />
+                </SettingRow>
               </div>
             </div>
 
@@ -377,6 +382,7 @@ export default function AdminPrintPage() {
           {status === "paid" && <p className="flex items-center gap-2 text-sm font-bold text-blue-600"><RefreshCw className="animate-spin" size={16} /> Queued, starting print...</p>}
           {status === "printing" && <p className="flex items-center gap-2 text-sm font-bold text-blue-600"><Printer size={16} /> Printing...</p>}
           {status === "print_blocked" && <p className="flex items-center gap-2 text-sm font-bold text-amber-600"><Printer size={16} /> Paused — resuming automatically{jobBlockedReason ? ` (${jobBlockedReason})` : ""}.</p>}
+          {status === "interrupted" && <p className="flex items-center gap-2 text-sm font-bold text-rose-600"><Printer size={16} /> Printing delayed, please wait.</p>}
           {status === "printed" && <p className="flex items-center gap-2 text-sm font-bold text-emerald-600"><Check size={16} /> Printed — collect it from the kiosk.</p>}
           {status === "print_failed" && <p className="text-sm font-bold text-red-600">{error || "Print failed."}</p>}
           {TERMINAL_STATUSES.includes(status) && (

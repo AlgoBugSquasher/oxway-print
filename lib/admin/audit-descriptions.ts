@@ -15,13 +15,18 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   pricing_updated: "Pricing changed",
   kiosk_settings_updated: "Kiosk settings changed",
   kiosk_whatsapp_updated: "WhatsApp availability changed",
+  kiosk_separator_settings_updated: "Separator settings changed",
+  tray_cleared: "Tray cleared",
   job_cancelled: "Job cancelled",
   job_refunded: "Job refunded",
+  job_reprinted: "Pages reprinted",
   refund_failed: "Refund attempt failed",
   refund_bulk_requested: "Bulk refund requested",
   staff_print_created: "Free staff print created",
   kiosk_command_requested: "Kiosk command requested",
   kiosk_command_finished: "Kiosk command finished",
+  alert_sent: "Alert sent",
+  alert_settings_updated: "Alert settings changed",
 };
 
 /** Every action name in display order, for the viewer's filter dropdown. */
@@ -53,6 +58,14 @@ export function summarizeAuditEntry(entry: AuditLogRow): string {
     case "job_cancelled":
     case "job_refunded":
       return entry.target_id ? `${label} (job ${shortenId(entry.target_id)})` : label;
+    case "job_reprinted": {
+      const pages = Array.isArray(details.pages) ? details.pages.length : null;
+      const copies = typeof details.copies === "number" ? details.copies : null;
+      const job = entry.target_id ? ` (original job ${shortenId(entry.target_id)})` : "";
+      return pages !== null
+        ? `${label}: ${pages} page${pages === 1 ? "" : "s"}${copies !== null ? ` x${copies}` : ""}${job}`
+        : `${label}${job}`;
+    }
     case "refund_failed": {
       const error = typeof details.error === "string" ? details.error : null;
       const job = entry.target_id ? ` (job ${shortenId(entry.target_id)})` : "";
@@ -75,6 +88,12 @@ export function summarizeAuditEntry(entry: AuditLogRow): string {
       const command = typeof details.command === "string" ? details.command : null;
       const status = typeof details.status === "string" ? ` — ${details.status}` : "";
       return command ? `${label}: ${command}${status}` : label;
+    }
+    case "alert_sent": {
+      const kind = typeof details.kind === "string" ? details.kind : null;
+      const results = Array.isArray(details.results) ? (details.results as { channel?: string; ok?: boolean }[]) : [];
+      const channels = results.map((r) => `${r.channel}${r.ok ? "" : " (failed)"}`).join(", ");
+      return kind ? `${label}: ${kind}${channels ? ` via ${channels}` : ""}` : label;
     }
     default:
       return label;

@@ -43,6 +43,7 @@ interface CreateOrderRequestBody {
   notifyOptIn?: unknown;
   phone?: unknown;
   kioskId?: unknown;
+  pickupMode?: unknown;
 }
 
 /** Reconstructs the same response shape /api/create-order normally returns, from an existing job — used for the duplicate-order short-circuit (ROADMAP.md #13). */
@@ -123,10 +124,8 @@ export async function POST(request: Request) {
       return jsonError("Enter a valid 10-digit phone number, or untick WhatsApp updates.");
     }
     const phone = rawPhone;
-    // The pickup-ID banner is mandatory on every job — never read from the
-    // client (there's no checkbox for it anymore in PdfPageSelector.tsx,
-    // but even if a request forged this field, it's ignored).
     const includeBannerPage = true;
+    const pickupMode: "here" | "later" = body.pickupMode === "later" ? "later" : "here";
 
     // Admin can disable color or B&W per kiosk (owner/staff only, see
     // update_kiosk_counters in supabase/schema.sql) — the customer page
@@ -268,6 +267,8 @@ export async function POST(request: Request) {
       kioskId,
       ticketNumber,
       ticketDate,
+      pickupMode,
+      forceCoverSheet: false,
       createdAt: now,
       updatedAt: now,
     };

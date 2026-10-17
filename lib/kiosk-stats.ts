@@ -7,16 +7,38 @@ import { supabaseAdmin } from "./supabase-admin";
 
 export interface CompletedPrintStats {
   pagesPrinted: number;
+  /** Real money actually collected for this job — 0 for a free staff/owner print or a reprint (see waivedAmount for what a free print would have cost). */
   amount: number;
   colorMode: boolean;
   /**
+   * The price a free staff/owner print (job.isFree) WOULD have cost a
+   * paying customer — what free_print_waived_amount and print_orders'
+   * own waived_amount column accumulate, kept separate from `amount`
+   * (always real revenue, always 0 for a free print) so the two concepts
+   * can never be conflated. Unused unless isFree is true.
+   */
+  waivedAmount?: number;
+  /**
    * True for a free staff/owner print (job.isFree) — when set, this
    * completed print bumps free_print_count/free_print_pages/
-   * free_print_waived_amount instead of total_revenue, and `amount` is
-   * read as the waived value for that counter, not real revenue. See the
-   * admin dashboard's "Free staff prints" summary.
+   * free_print_waived_amount instead of total_revenue. See the admin
+   * dashboard's "Free staff prints" summary.
    */
   isFree?: boolean;
+  /**
+   * True for a "Reprint pages" job (job.originalJobId set) — physical
+   * paper/toner consumption still counts (tray/cartridge/
+   * total_lifetime_prints below), but NEITHER total_revenue NOR
+   * free_print_* increment: this isn't new revenue, and it isn't a
+   * discretionary staff favor either — it's compensating for the agent's
+   * own earlier failure/interruption on the ORIGINAL job. Takes priority
+   * over isFree if both were somehow set (they never are in practice — a
+   * reprint job's own isFree is always false, see PrintJobRecord's
+   * originalJobId comment).
+   */
+  isReprint?: boolean;
+  /** Mirrors the job's own sheet_kind ('none'/'separator'/'cover') — kept on the durable print_orders ledger too since print_jobs rows get cleaned up after a few hours (see get_kiosk_period_breakdown's own comment in supabase/schema.sql). */
+  sheetKind?: "none" | "separator" | "cover";
 }
 
 export interface KioskCounters {
@@ -101,18 +123,26 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
   try {
     const supabase = supabaseAdmin();
 
-    // print_orders is revenue history specifically — a free staff print
-    // never had any revenue to log here (see free_print_* below for where
-    // it IS tracked instead), so it's deliberately skipped rather than
-    // inserting a meaningless ₹0 "order."
-    if (!stats.isFree) {
-      await supabase.from("print_orders").insert({
-        pages_printed: stats.pagesPrinted,
-        amount: stats.amount,
-        color_mode: stats.colorMode,
-        status: "completed",
-      });
-    }
+    // print_orders is the durable ledger get_kiosk_period_breakdown() reads
+    // from (print_jobs rows this job itself lives in get cleaned up a few
+    // hours after printing — see that function's own comment in
+    // supabase/schema.sql) — every completed print is logged here,
+    // including free/reprint ones, so the admin overview's period
+    // breakdown can still show accurate free-print/reprint counts for a
+    // period long after the underlying print_jobs row is gone. Revenue
+    // itself stays correct because is_free/is_reprint are stored alongside
+    // and excluded from the revenue sum in SQL, not by skipping the insert.
+    await supabase.from("print_orders").insert({
+      kiosk_id: kioskId,
+      pages_printed: stats.pagesPrinted,
+      amount: stats.amount,
+      color_mode: stats.colorMode,
+      status: "completed",
+      is_free: stats.isFree ?? false,
+      is_reprint: stats.isReprint ?? false,
+      waived_amount: stats.isFree ? (stats.waivedAmount ?? 0) : null,
+      sheet_kind: stats.sheetKind ?? "none",
+    });
 
     const { data: kiosk, error } = await supabase
       .from("kiosk_status")
@@ -127,21 +157,23 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
 
     // Paper/toner consumption is physical and real regardless of who paid
     // for it, so tray/cartridge/total_lifetime_prints always increment —
-    // only the MONEY side (total_revenue vs. free_print_*) branches on
-    // isFree below.
+    // only the MONEY side (total_revenue vs. free_print_* vs. nothing at
+    // all) branches on isFree/isReprint below.
     const trayPages = (kiosk.tray_pages || 0) + stats.pagesPrinted;
     const cartridgePages = (kiosk.cartridge_pages || 0) + stats.pagesPrinted;
     const totalLifetimePrints = (kiosk.total_lifetime_prints || 0) + stats.pagesPrinted;
     const trayMaxPages = kiosk.tray_max_pages || 150;
     const cartridgeMaxPages = kiosk.cartridge_max_pages || 1500;
 
-    const moneyColumns = stats.isFree
-      ? {
-          free_print_count: (kiosk.free_print_count || 0) + 1,
-          free_print_pages: (kiosk.free_print_pages || 0) + stats.pagesPrinted,
-          free_print_waived_amount: Number(kiosk.free_print_waived_amount || 0) + Number(stats.amount),
-        }
-      : { total_revenue: Number(kiosk.total_revenue || 0) + Number(stats.amount) };
+    const moneyColumns = stats.isReprint
+      ? {}
+      : stats.isFree
+        ? {
+            free_print_count: (kiosk.free_print_count || 0) + 1,
+            free_print_pages: (kiosk.free_print_pages || 0) + stats.pagesPrinted,
+            free_print_waived_amount: Number(kiosk.free_print_waived_amount || 0) + Number(stats.waivedAmount || 0),
+          }
+        : { total_revenue: Number(kiosk.total_revenue || 0) + Number(stats.amount) };
 
     await supabase
       .from("kiosk_status")
@@ -255,6 +287,35 @@ export async function clearKioskPrintBlocked(kioskId: string): Promise<void> {
   } catch (error) {
     console.error("Failed to clear kiosk print-blocked state:", error);
   }
+}
+
+export interface KioskSeparatorSettings {
+  separatorMode: "auto" | "always" | "never";
+  recentJobMinutes: number;
+  laterHoldHours: number;
+  largeJobPages: number;
+}
+
+export async function getKioskSeparatorSettings(kioskId: string): Promise<KioskSeparatorSettings> {
+  const { data, error } = await supabaseAdmin()
+    .from("kiosk_status")
+    .select("separator_mode, recent_job_minutes, later_hold_hours, large_job_pages")
+    .eq("id", kioskId)
+    .maybeSingle();
+  if (error) throw new Error(`Could not read kiosk separator settings: ${error.message}`);
+  const row = data as { separator_mode: "auto" | "always" | "never"; recent_job_minutes: number; later_hold_hours: number; large_job_pages: number } | null;
+  return {
+    separatorMode: row?.separator_mode ?? "auto",
+    recentJobMinutes: row?.recent_job_minutes ?? 5,
+    laterHoldHours: row?.later_hold_hours ?? 2,
+    largeJobPages: row?.large_job_pages ?? 15,
+  };
+}
+
+export async function getKioskTrayClearedAt(kioskId: string): Promise<string | null> {
+  const { data, error } = await supabaseAdmin().from("kiosk_status").select("tray_cleared_at").eq("id", kioskId).maybeSingle();
+  if (error) throw new Error(`Could not read kiosk tray_cleared_at: ${error.message}`);
+  return (data as { tray_cleared_at: string | null } | null)?.tray_cleared_at ?? null;
 }
 
 export interface KioskUpdateState {

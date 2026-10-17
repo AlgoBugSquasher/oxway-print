@@ -13,6 +13,10 @@ function bucket(overrides: Partial<PeriodBreakdownRow>): PeriodBreakdownRow {
     free_print_count: 0,
     free_print_pages: 0,
     free_print_waived_amount: 0,
+    reprint_count: 0,
+    reprint_pages: 0,
+    separators_printed: 0,
+    covers_printed: 0,
     ...overrides,
   };
 }
@@ -28,14 +32,21 @@ describe("summarizePeriodBreakdown", () => {
     expect(totals.printsCompleted).toBe(2);
   });
 
-  it("nets revenue against refunds within the same buckets, keeping the refund amount separately", () => {
-    // A job refunded within the period: revenue bucket already excludes it
-    // (get_kiosk_period_breakdown's own SQL only counts refunded_at IS NULL
-    // toward `revenue`), refund_amount carries what was given back.
-    const totals = summarizePeriodBreakdown([bucket({ revenue: 200, refund_amount: 50, refund_count: 1 })]);
-    expect(totals.revenue).toBe(200);
+  it("carries the RPC's own revenue (already net of refunds processed in-period) and the refund amount separately", () => {
+    // get_kiosk_period_breakdown() nets revenue against refund_events in SQL
+    // before returning the row — this helper just sums what it's given.
+    const totals = summarizePeriodBreakdown([bucket({ revenue: 150, refund_amount: 50, refund_count: 1 })]);
+    expect(totals.revenue).toBe(150);
     expect(totals.refundAmount).toBe(50);
     expect(totals.refundCount).toBe(1);
+  });
+
+  it("keeps reprints out of revenue and pages_printed, counted in their own fields", () => {
+    const totals = summarizePeriodBreakdown([bucket({ revenue: 80, pages_printed: 4, reprint_count: 1, reprint_pages: 3 })]);
+    expect(totals.revenue).toBe(80);
+    expect(totals.pagesPrinted).toBe(4);
+    expect(totals.reprintCount).toBe(1);
+    expect(totals.reprintPages).toBe(3);
   });
 
   it("keeps free staff prints out of revenue but counted in their own pages/count fields", () => {

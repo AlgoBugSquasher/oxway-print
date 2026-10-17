@@ -14,9 +14,16 @@ const SAFE_MARGIN = 15;
 const DOCX_MARGIN = 24;
 const DOCX_FONT_SIZE = 11;
 const DOCX_LINE_HEIGHT = 16;
+const DOCX_CHARS_PER_PAGE_ESTIMATE = 2800;
+const DOCX_PAGE_COUNT_RATIO_WARNING = 2;
+
+export interface ConvertedFile {
+  bytes: Uint8Array;
+  warnings: string[];
+}
 
 const isPdf = (file: File) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-const isDocx = (file: File) => file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || file.name.toLowerCase().endsWith(".docx");
+export const isDocx = (file: File) => file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || file.name.toLowerCase().endsWith(".docx");
 const isHeic = (file: File) => ["image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"].includes(file.type) || /\.(heic|heif)$/i.test(file.name);
 export const isImageFile = (file: File) => file.type.startsWith("image/") || isHeic(file) || /\.(png|jpe?g|webp)$/i.test(file.name);
 
@@ -91,7 +98,7 @@ async function imageToPdf(file: File, layout: Layout) {
     const page = pdfDocument.addPage([pageWidth, pageHeight]);
     page.drawImage(embeddedImage, { x: (pageWidth - width) / 2, y: (pageHeight - height) / 2, width, height });
     if ("close" in image && typeof image.close === "function") image.close();
-    return await pdfDocument.save();
+    return { bytes: await pdfDocument.save(), warnings: [] };
   } catch (pdfLibError) {
     reportClientError("image-to-pdf-failed", pdfLibError, { fileType: file.type });
     throw new Error("We couldn't process this file, please try again.");
@@ -114,14 +121,14 @@ function readFileAsArrayBuffer(file: File) {
   });
 }
 
-async function docxToPdf(file: File) {
+async function docxToPdf(file: File): Promise<ConvertedFile> {
   const [mammothModule, { jsPDF }] = await Promise.all([
     import("mammoth/mammoth.browser"),
     import("jspdf"),
   ]);
   const mammoth = mammothModule.default ?? mammothModule;
   const arrayBuffer = await readFileAsArrayBuffer(file);
-  const { value: rawText } = await mammoth.extractRawText({ arrayBuffer });
+  const { value: rawText, messages } = await mammoth.extractRawText({ arrayBuffer });
   const value = rawText
     .replace(/ /g, " ")
     .replace(/\r\n?/g, "\n")
@@ -141,21 +148,30 @@ async function docxToPdf(file: File) {
   });
   let y = DOCX_MARGIN + DOCX_LINE_HEIGHT;
   let linesOnPage = 0;
+  let pageCount = 1;
   for (const line of lines) {
     if (y > A4_HEIGHT - DOCX_MARGIN || linesOnPage >= 48) {
       pdf.addPage("a4", "p");
       y = DOCX_MARGIN + DOCX_LINE_HEIGHT;
       linesOnPage = 0;
+      pageCount += 1;
     }
     pdf.text(line, DOCX_MARGIN, y);
     y += DOCX_LINE_HEIGHT;
     linesOnPage += 1;
   }
-  return new Uint8Array(pdf.output("arraybuffer"));
+
+  const warnings = (messages as { message: string }[]).map((message) => message.message);
+  const expectedPageCount = Math.max(1, Math.round(value.length / DOCX_CHARS_PER_PAGE_ESTIMATE));
+  if (pageCount > expectedPageCount * DOCX_PAGE_COUNT_RATIO_WARNING || expectedPageCount > pageCount * DOCX_PAGE_COUNT_RATIO_WARNING) {
+    warnings.push(`The converted page count (${pageCount}) looks very different from the original document's text length — tables, images, or formatting may not have converted cleanly.`);
+  }
+
+  return { bytes: new Uint8Array(pdf.output("arraybuffer")), warnings };
 }
 
-export async function convertFileInBrowser(file: File, layout: Layout) {
-  if (isPdf(file)) return new Uint8Array(await file.arrayBuffer());
+export async function convertFileInBrowser(file: File, layout: Layout): Promise<ConvertedFile> {
+  if (isPdf(file)) return { bytes: new Uint8Array(await file.arrayBuffer()), warnings: [] };
   if (isDocx(file)) return docxToPdf(file);
   if (isImageFile(file)) return imageToPdf(file, layout);
   throw new Error("Unsupported file. Upload a PDF, PNG, JPG, JPEG, WEBP, HEIC, HEIF, or DOCX file.");

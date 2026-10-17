@@ -30,18 +30,14 @@ export interface SupplyEstimate {
  * is what's actually tracked now.
  */
 export const LOW_SUPPLY_REMAINING_RATIO = 0.1;
+export const DEFAULT_LOW_SUPPLY_THRESHOLD_PERCENT = LOW_SUPPLY_REMAINING_RATIO * 100;
 
-function estimateFromRemaining(remaining: number, denominator: number, lastRefillAt: string | null, lastRefillByUserId: string | null): SupplyEstimate {
-  // The only way this estimate can be "out of range" — remaining can never
-  // mathematically exceed its own denominator (percent can't go above
-  // 100%), but consumption since the baseline can exceed what was loaded
-  // (percent can go below 0%) if a refill was recorded late or consumption
-  // was under-counted for some other reason.
+function estimateFromRemaining(remaining: number, denominator: number, thresholdPercent: number, lastRefillAt: string | null, lastRefillByUserId: string | null): SupplyEstimate {
   if (remaining < 0) {
     return { status: "needs_refill_update", remaining: null, percent: null, lastRefillAt, lastRefillByUserId };
   }
   const percent = denominator > 0 ? (remaining / denominator) * 100 : 0;
-  const status: SupplyStatus = percent / 100 <= LOW_SUPPLY_REMAINING_RATIO ? "low" : "ok";
+  const status: SupplyStatus = percent <= thresholdPercent ? "low" : "ok";
   return { status, remaining, percent, lastRefillAt, lastRefillByUserId };
 }
 
@@ -50,14 +46,19 @@ function estimateFromRemaining(remaining: number, denominator: number, lastRefil
  * in the tray as of the last refill event, so remaining = quantity minus
  * whatever's printed since. The percentage denominator is that same
  * `quantity` — "100%" means "as much as was loaded," not a fixed tray
- * capacity the owner might not have filled all the way.
+ * capacity the owner might not have filled all the way. thresholdPercent
+ * is kiosk_status.low_supply_threshold_percent, editable from the admin
+ * page — defaults to the old fixed 10% for any caller that doesn't pass it.
  */
-export function computePaperEstimate(row: Pick<SupplyStatusRow, "has_paper_baseline" | "paper_quantity" | "paper_consumed_since" | "paper_refilled_at" | "paper_refilled_by">): SupplyEstimate {
+export function computePaperEstimate(
+  row: Pick<SupplyStatusRow, "has_paper_baseline" | "paper_quantity" | "paper_consumed_since" | "paper_refilled_at" | "paper_refilled_by">,
+  thresholdPercent: number = DEFAULT_LOW_SUPPLY_THRESHOLD_PERCENT,
+): SupplyEstimate {
   if (!row.has_paper_baseline || row.paper_quantity === null) {
     return { status: "not_set_up", remaining: null, percent: null, lastRefillAt: null, lastRefillByUserId: null };
   }
   const remaining = row.paper_quantity - (row.paper_consumed_since ?? 0);
-  return estimateFromRemaining(remaining, row.paper_quantity, row.paper_refilled_at, row.paper_refilled_by);
+  return estimateFromRemaining(remaining, row.paper_quantity, thresholdPercent, row.paper_refilled_at, row.paper_refilled_by);
 }
 
 /**
@@ -67,11 +68,14 @@ export function computePaperEstimate(row: Pick<SupplyStatusRow, "has_paper_basel
  * cartridge_max_pages (the configurable yield) minus that total. The
  * percentage denominator is cartridge_max_pages, not the starting pages.
  */
-export function computeTonerEstimate(row: Pick<SupplyStatusRow, "cartridge_max_pages" | "has_toner_baseline" | "toner_starting_pages" | "toner_consumed_since" | "toner_refilled_at" | "toner_refilled_by">): SupplyEstimate {
+export function computeTonerEstimate(
+  row: Pick<SupplyStatusRow, "cartridge_max_pages" | "has_toner_baseline" | "toner_starting_pages" | "toner_consumed_since" | "toner_refilled_at" | "toner_refilled_by">,
+  thresholdPercent: number = DEFAULT_LOW_SUPPLY_THRESHOLD_PERCENT,
+): SupplyEstimate {
   if (!row.has_toner_baseline || row.toner_starting_pages === null) {
     return { status: "not_set_up", remaining: null, percent: null, lastRefillAt: null, lastRefillByUserId: null };
   }
   const usedSoFar = row.toner_starting_pages + (row.toner_consumed_since ?? 0);
   const remaining = row.cartridge_max_pages - usedSoFar;
-  return estimateFromRemaining(remaining, row.cartridge_max_pages, row.toner_refilled_at, row.toner_refilled_by);
+  return estimateFromRemaining(remaining, row.cartridge_max_pages, thresholdPercent, row.toner_refilled_at, row.toner_refilled_by);
 }

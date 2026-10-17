@@ -1,5 +1,6 @@
 import { PDFDocument, StandardFonts, rgb, type Color, type PDFFont, type PDFPage } from "pdf-lib";
 import { shortRequestId } from "../request-id";
+import { INSTAGRAM_HANDLE, INSTAGRAM_URL } from "../social-links";
 import type { PrintJobRecord } from "../store";
 import { formatTicketCode } from "../ticket-code";
 import { computeQrModuleRuns, generateQrMatrix, qrModuleSizePt, type QrMatrix } from "./qr";
@@ -31,8 +32,8 @@ export const BANNER_LAYOUT_CONFIG = {
    * scan). Confirm this URL with the business before changing it.
    */
   instagram: {
-    url: "https://www.instagram.com/oxway.geu/",
-    handle: "@oxway.geu",
+    url: INSTAGRAM_URL,
+    handle: INSTAGRAM_HANDLE,
     errorCorrectionLevel: "M" as const,
   },
   /** Gap between the two side-by-side columns in landscape mode. */
@@ -210,7 +211,7 @@ function fontCanEncode(font: PDFFont, text: string): boolean {
  * small to read comfortably is still far better than showing a different,
  * wrong one.
  */
-function fitTextWidth(font: PDFFont, text: string, startSize: number, minSize: number, maxWidth: number, allowTruncate = true): { text: string; size: number; width: number } {
+export function fitTextWidth(font: PDFFont, text: string, startSize: number, minSize: number, maxWidth: number, allowTruncate = true): { text: string; size: number; width: number } {
   const floor = allowTruncate ? minSize : Math.min(minSize, TICKET_CODE_ABSOLUTE_MIN_FONT_PT);
   let size = startSize;
   let width = safeWidthOfTextAtSize(font, text, size);
@@ -233,16 +234,14 @@ function fitTextWidth(font: PDFFont, text: string, startSize: number, minSize: n
 // Blocks — the unit the layout solver stacks, shrinks and drops
 // ----------------------------------------------------------------------------
 
-interface MeasuredBlock {
+export interface MeasuredBlock {
   id: string;
   height: number;
-  /** Gap between this block's bottom and the next block's top — 0 for whatever block ends up last. */
   gapAfterPt: number;
-  /** Draws the block so its top edge sits at `topY` (PDF points, bottom-up axis). Returns the rect(s) actually occupied. */
   build: (topY: number) => PlannedElement[];
 }
 
-function makeTextBlock(
+export function makeTextBlock(
   id: string,
   text: string,
   font: PDFFont,
@@ -339,11 +338,11 @@ function makePaymentLinesBlock(
   };
 }
 
-function totalStackHeight(blocks: MeasuredBlock[]): number {
+export function totalStackHeight(blocks: MeasuredBlock[]): number {
   return blocks.reduce((sum, b, i) => sum + b.height + (i < blocks.length - 1 ? b.gapAfterPt : 0), 0);
 }
 
-function placeBlocks(blocks: MeasuredBlock[], topStartY: number): PlannedElement[] {
+export function placeBlocks(blocks: MeasuredBlock[], topStartY: number): PlannedElement[] {
   let y = topStartY;
   const elements: PlannedElement[] = [];
   for (const block of blocks) {
@@ -600,7 +599,7 @@ function buildSimpleFallbackElements(bold: PDFFont, regular: PDFFont, pageWidth:
 
 const QR_MODULE_COLOR = rgb(0, 0, 0);
 
-function commitElements(page: PDFPage, elements: PlannedElement[]): void {
+export function commitElements(page: PDFPage, elements: PlannedElement[]): void {
   for (const el of elements) {
     if (el.content.kind === "text") {
       const { text, font, size, color } = el.content;

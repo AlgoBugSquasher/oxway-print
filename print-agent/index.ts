@@ -30,14 +30,17 @@ import { writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { AGENT_API_SECRET, BASE_URL, KIOSK_HEARTBEAT_INTERVAL_MS, KIOSK_ID, PRINT_AGENT_POLL_INTERVAL_MS } from "../lib/config";
 import { failDanglingRunningCommand, finishKioskCommand } from "../lib/kiosk-commands";
-import { clearKioskPrintBlocked, recordAgentBoot, recordCompletedPrint, setKioskPrintBlocked, touchKioskHeartbeat } from "../lib/kiosk-stats";
+import { clearKioskPrintBlocked, getKioskSeparatorSettings, recordAgentBoot, recordCompletedPrint, setKioskPrintBlocked, touchKioskHeartbeat } from "../lib/kiosk-stats";
 import { enrichJobWithRazorpayPaymentDetails } from "../lib/payment-reconciliation";
 import { prependBannerPage } from "../lib/print/banner";
-import { cancelPrintJob, getCupsJobQueueState, isPrinterAcceptingNewJobs, submitPrintJob } from "../lib/print/cups";
+import { cancelPrintJob, getCupsJobQueueState, isCupsJobKnown, isPrinterAcceptingNewJobs, submitPrintJob } from "../lib/print/cups";
 import { expandCopies } from "../lib/print/pdf";
 import { computeMinimumReadyAtMs, decidePrintWatchOutcome, needsWarmup, READY_TIMING_CONFIG } from "../lib/print/ready-timing";
+import { decideRestartOutcome } from "../lib/print/restart-reconciliation";
+import { prependSeparatorPage } from "../lib/print/separator";
 import { physicalSheetsForJob } from "../lib/print/sheets";
-import { claimNextPaidJob, downloadJobPdf, failPrintingJob, getJob, updateJob, type PrintJobRecord } from "../lib/store";
+import { decideSheetKind } from "../lib/print/sheet-kind";
+import { claimNextPaidJob, downloadJobPdf, failPrintingJob, getJob, isTrayLikelyOccupied, listInFlightJobsForKiosk, markJobInterrupted, updateJob, type PrintJobRecord } from "../lib/store";
 import { getCurrentCommit, flushPendingResult, processKioskCommand } from "./kiosk-update";
 import { readPendingCommandResult } from "./pending-command-result";
 import { clearUpdateMarker, readUpdateMarker } from "./update-marker";
@@ -105,6 +108,21 @@ async function notifyAgentTerminalState(jobId: string): Promise<void> {
   }
 }
 
+/** Fire-and-forget: asks the website to re-check low-supply alerts (lib/alerts/low-supply.ts) right after a completed print, same AGENT_API_SECRET pattern as notifyAgentTerminalState above. */
+async function checkLowSupplyAfterPrint(kioskId: string): Promise<void> {
+  if (!AGENT_API_SECRET) return;
+  try {
+    const response = await fetch(`${BASE_URL}/api/agent/check-low-supply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${AGENT_API_SECRET}` },
+      body: JSON.stringify({ kioskId }),
+    });
+    if (!response.ok) console.error(`[print-agent] check-low-supply failed for kiosk ${kioskId}: HTTP ${response.status}`);
+  } catch (error) {
+    console.error(`[print-agent] check-low-supply request failed for kiosk ${kioskId}:`, error);
+  }
+}
+
 /**
  * Prints one job that claimNextPaidJob (pollLoop below) has ALREADY
  * atomically claimed — its status is already 'printing' by the time this
@@ -119,27 +137,30 @@ async function processJob(job: PrintJobRecord): Promise<void> {
   try {
     console.log(`[print-agent] Printing job ${job.id} (${job.fileName})...`);
     let pdfBytes = await downloadJobPdf(job.pdfStoragePath);
-    // Copies are baked directly into the PDF (copy 1's pages, then copy
-    // 2's, etc.) rather than left to CUPS's own -n/collate handling — see
-    // expandCopies' own docstring for why — so the single banner page
-    // prepended next lands once at the very front of the whole job, ahead
-    // of every copy, not once per copy.
     pdfBytes = await expandCopies(pdfBytes, job.settings.copies);
-    if (job.includeBannerPage) {
-      // The UPI transaction id is usually already saved by the time a job
-      // reaches printing (see reconcilePendingPayment's own enrichment
-      // call) — this is only a second, best-effort try for the case it
-      // genuinely wasn't settled at Razorpay yet back then. Explicitly
-      // skipped for a staff job (payment_method === "staff") even though
-      // enrichJobWithRazorpayPaymentDetails would itself safely no-op for
-      // one anyway (no paymentId/providerMeta.paymentRef ever gets set) —
-      // never worth a real network round trip to Razorpay for a job that
-      // was never a Razorpay payment to begin with.
-      if (job.paymentMethod !== "staff" && job.provider === "razorpay" && !job.upiTxnId) {
+
+    const separatorSettings = await getKioskSeparatorSettings(job.kioskId);
+    const trayLikelyOccupied = await isTrayLikelyOccupied(job.kioskId, new Date(), separatorSettings);
+    const sheetKind = decideSheetKind({
+      pickupMode: job.pickupMode ?? "here",
+      separatorMode: separatorSettings.separatorMode,
+      forceCoverSheet: job.forceCoverSheet ?? false,
+      trayLikelyOccupied,
+      physicalSheets: physicalSheetsForJob(job),
+      largeJobPages: separatorSettings.largeJobPages,
+    });
+
+    if (sheetKind === "cover") {
+      if (job.paymentMethod !== "staff" && job.paymentMethod !== "reprint" && job.provider === "razorpay" && !job.upiTxnId) {
         job = await enrichJobWithRazorpayPaymentDetails(job);
       }
       pdfBytes = await prependBannerPage(pdfBytes, job);
+    } else if (sheetKind === "separator") {
+      pdfBytes = await prependSeparatorPage(pdfBytes, job);
     }
+
+    await updateJob(job.id, { sheetKind });
+    job.sheetKind = sheetKind;
     await writeFile(tempPdfPath, pdfBytes);
 
     await printWithRetries(job, tempPdfPath);
@@ -411,13 +432,27 @@ async function watchUntilPrinted(
 
     await recordCompletedPrint(job.kioskId, {
       pagesPrinted: physicalSheets,
-      // A free staff print's own totalPrice is always 0 (see
-      // createStaffPrintJob) — waivedAmount is what recordCompletedPrint
-      // actually accumulates into free_print_waived_amount for one.
-      amount: job.isFree ? (job.waivedAmount ?? 0) : job.totalPrice,
+      // A free staff print's own totalPrice and a reprint's own totalPrice
+      // are both always 0 (see createStaffPrintJob) — real revenue is 0 for
+      // either, so `amount` only ever carries a real paying customer's
+      // price. waivedAmount carries what a free print WOULD have cost,
+      // used only for free_print_waived_amount/print_orders.waived_amount.
+      amount: job.isFree || job.originalJobId !== undefined ? 0 : job.totalPrice,
+      waivedAmount: job.isFree ? (job.waivedAmount ?? 0) : undefined,
       colorMode: job.settings.isColor,
       isFree: job.isFree,
+      isReprint: job.originalJobId !== undefined,
+      sheetKind: job.sheetKind,
     });
+
+    await checkLowSupplyAfterPrint(job.kioskId);
+
+    if (job.originalJobId) {
+      // This job itself printing is what set_original_job_refund_not_needed
+      // (the status update just above) already resolved the ORIGINAL job's
+      // own pending refund, if it had one — nothing further to do here.
+      console.log(`[print-agent] Job ${job.id} was a reprint of ${job.originalJobId} — that job's refund (if pending) is now marked not_needed.`);
+    }
     return;
   }
 }
@@ -432,6 +467,52 @@ function stageDurationSeconds(start: string | number | null | undefined, end: st
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs once, before the normal poll loop starts — reconciles every job
+ * THIS kiosk had still "printing"/"print_blocked" the moment the agent's
+ * previous process stopped (a crash, a manual restart, a Pi reboot — this
+ * can't tell which, and doesn't need to). Requirement: "a restart never
+ * fails or refunds a job."
+ *
+ * For each one: a job with no cupsJobId yet never reached `lp` before the
+ * crash, so CUPS never had it — straight to 'interrupted', nothing to
+ * check. A job that WAS submitted asks isCupsJobKnown (lib/print/cups.ts)
+ * the deliberately narrow "does CUPS have any memory of this job id at
+ * all" question (not the richer getCupsJobQueueState, which is the wrong
+ * tool for THIS specific question at boot — see that function's own
+ * reliability note for why): known -> let it finish, by reattaching the
+ * exact same watchUntilPrinted loop a job this process just submitted
+ * itself would get, so it resolves to 'printed' or genuinely fails
+ * exactly as correctly as it always would; unknown -> 'interrupted', with
+ * a reason, never print_failed and never auto-reprinted.
+ *
+ * Deliberately fire-and-forget for the "reattach" case (never awaited) so
+ * a job that's going to take several more minutes to finish printing
+ * doesn't delay this kiosk's own poll loop from starting — reattached
+ * watchers run concurrently with it, touching only their own job's row,
+ * same as a job this process submits itself already does.
+ */
+async function reconcileInFlightJobsOnBoot(): Promise<void> {
+  const inFlightJobs = await listInFlightJobsForKiosk(KIOSK_ID);
+  for (const job of inFlightJobs) {
+    const cupsKnowsJob = job.cupsJobId ? await isCupsJobKnown(job.cupsJobId) : false;
+    const outcome = decideRestartOutcome({ cupsJobId: job.cupsJobId, cupsKnowsJob });
+
+    if (outcome.kind === "interrupted") {
+      console.warn(`[print-agent] Job ${job.id} was still "${job.status}" at boot — ${outcome.reason}`);
+      await markJobInterrupted(job.id, outcome.reason);
+      continue;
+    }
+
+    // outcome.kind === "reattach" — job.cupsJobId is guaranteed defined
+    // here (decideRestartOutcome only ever reaches "reattach" when it is).
+    console.log(`[print-agent] Reattaching to job ${job.id} (CUPS ${job.cupsJobId}) — still known to CUPS after restart, letting it finish.`);
+    const spooledAtMs = job.spooledAt ? new Date(job.spooledAt).getTime() : Date.now();
+    void watchUntilPrinted(job, job.cupsJobId as string, { spooledAtMs, warmupNeeded: needsWarmup(spooledAtMs, lastJobFinishedAtMs), initialBlockedElapsedMs: 0 })
+      .catch((error) => console.error(`[print-agent] Reattached watch for job ${job.id} failed unexpectedly:`, error));
+  }
 }
 
 /**
@@ -527,7 +608,9 @@ async function reportBoot(): Promise<void> {
   await failDanglingRunningCommand(KIOSK_ID, marker?.commandId ?? stillPendingResult?.commandId ?? null);
 }
 
-void reportBoot().then(() => {
-  startHeartbeat();
-  pollLoop();
-});
+void reportBoot()
+  .then(() => reconcileInFlightJobsOnBoot())
+  .then(() => {
+    startHeartbeat();
+    pollLoop();
+  });

@@ -32,10 +32,13 @@ export interface AdminJobRow {
   /** ROADMAP.md §21 — the customer's own pickup code, null until assignTicketNumber runs (always set in practice, since that happens at job creation). */
   ticket_number: number | null;
   ticket_date: string | null;
-  /** ROADMAP.md §24/§25 — reserved, unused this build. Always null; see the column's own comment in supabase/schema.sql. */
   collected_at: string | null;
-  /** 'staff' for a free print created via app/api/staff-print; 'razorpay'/'cashfree' (mirroring `provider`) for everything else. Null for jobs created before this column existed. */
-  payment_method: "razorpay" | "cashfree" | "staff" | null;
+  collected_via: "customer" | "staff" | null;
+  pickup_mode: "here" | "later";
+  force_cover_sheet: boolean;
+  sheet_kind: "none" | "separator" | "cover" | null;
+  /** 'staff' for a free print created via app/api/staff-print, 'reprint' for one created via app/api/admin/reprint; 'razorpay'/'cashfree' (mirroring `provider`) for everything else. Null for jobs created before this column existed. */
+  payment_method: "razorpay" | "cashfree" | "staff" | "reprint" | null;
   /** Which owner/staff account created this job — only ever set for a staff print. Resolve to an email via /api/admin/staff-users (print_jobs_admin_view can't join auth.users directly). */
   created_by_user_id: string | null;
   /** True only for a staff print. */
@@ -49,13 +52,20 @@ export interface AdminJobRow {
    * server-side enforcement of "staff cannot see this," not just which
    * admin page links where.
    */
-  refund_status: "pending" | "processing" | "refunded" | "failed" | null;
+  refund_status: "pending" | "processing" | "refunded" | "failed" | "not_needed" | null;
   refund_requested_at: string | null;
   refunded_by: string | null;
   refund_provider_id: string | null;
   refund_error: string | null;
-  /** Human-readable reason while status is 'print_blocked' (e.g. "media-empty") — see lib/print/cups.ts's classification. Null otherwise. */
+  /** Human-readable reason while status is 'print_blocked' (e.g. "media-empty"). Null otherwise. */
   blocked_reason: string | null;
+  /** Set once, the instant a print-agent restart discovers CUPS has no memory of this job — see print-agent/index.ts's reconcileInFlightJobsOnBoot. Never cleared afterward. */
+  interrupted_reason: string | null;
+  interrupted_at: string | null;
+  /** Set only on a job created by the "Reprint pages" admin feature — points back at the job it's reprinting pages from. The single source of truth for the REPRINT badge. */
+  original_job_id: string | null;
+  /** Written on the ORIGINAL job the moment a reprint is created from it — e.g. "Reprinted pages 2 to 4 on 17 Oct 2026, 10:42 am." */
+  reprint_note: string | null;
 }
 
 /** One job's own outcome from a refund request (single or bulk) — see app/api/admin/refund/route.ts. */
@@ -91,6 +101,29 @@ export interface AdminKioskRow {
   /** Written only by the print agent itself the instant it detects a recoverable printer problem — null means not currently blocked, the normal state. */
   print_blocked_reason: string | null;
   print_blocked_at: string | null;
+  separator_mode: "auto" | "always" | "never";
+  recent_job_minutes: number;
+  later_hold_hours: number;
+  large_job_pages: number;
+  tray_cleared_at: string | null;
+  low_supply_threshold_percent: number;
+}
+
+export type AlertKind = "paper_low" | "toner_low" | "kiosk_offline";
+
+export interface AlertRow {
+  id: string;
+  kiosk_id: string;
+  kind: AlertKind;
+  status: "active" | "resolved";
+  created_at: string;
+  last_reminded_at: string | null;
+  resolved_at: string | null;
+}
+
+export interface KioskAlertSettingsRow {
+  kiosk_id: string;
+  telegram_chat_id: string | null;
 }
 
 export type AdminKioskCommandName = "update" | "restart";
@@ -134,6 +167,49 @@ export interface PeriodBreakdownRow {
   free_print_count: number;
   free_print_pages: number;
   free_print_waived_amount: number | null;
+  reprint_count: number;
+  reprint_pages: number;
+  separators_printed: number;
+  covers_printed: number;
+}
+
+/** Row shape returned by get_pending_refund_summary — a single totals row, not bucketed by period (a pending refund is reported until resolved, regardless of when the original job happened). Both fields `null` for staff. */
+export interface PendingRefundSummary {
+  pending_refund_amount: number | null;
+  pending_refund_count: number | null;
+}
+
+/** Row shape returned by get_kiosk_hourly_pattern — one of 24 dense-filled hours (Asia/Kolkata), for the Statistics section's "peak hours" chart. */
+export interface HourlyPatternRow {
+  hour_of_day: number;
+  job_count: number;
+  pages_printed: number;
+}
+
+/** Row shape returned by get_kiosk_weekday_pattern — one of 7 dense-filled weekdays (0 = Sunday, matching JS Date.getDay()), for "busiest day of the week." */
+export interface WeekdayPatternRow {
+  day_of_week: number;
+  job_count: number;
+  pages_printed: number;
+}
+
+/** Row shape returned by get_kiosk_daily_pattern — one dense-filled row per calendar day (Asia/Kolkata) in the period, for "best and quietest days." */
+export interface DailyPatternRow {
+  day: string;
+  job_count: number;
+  pages_printed: number;
+}
+
+/** Row shape returned by get_kiosk_sales_summary — a single totals row for the period. avg_order_value is `null` for staff; every other field is a count or rate, visible to staff same as pages_printed elsewhere. */
+export interface SalesSummaryRow {
+  color_jobs: number;
+  bw_jobs: number;
+  avg_pages_per_job: number;
+  avg_order_value: number | null;
+  failed_jobs: number;
+  failure_rate: number;
+  refunded_jobs: number;
+  refund_rate: number;
 }
 
 /** Row shape returned by get_kiosk_supply_status — raw inputs only; lib/admin/supply-estimate.ts turns these into a remaining/percent/status a card can render. */

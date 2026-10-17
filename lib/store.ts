@@ -20,7 +20,27 @@ export type JobStatus =
    * READY_TIMING_CONFIG.blockedRetryLimitSeconds before it's finally given
    * up on. blockedReason (below) holds the human-readable why.
    */
-  | "print_blocked";
+  | "print_blocked"
+  /**
+   * The print agent restarted while this job was still 'printing' or
+   * 'print_blocked', and on reboot CUPS had no memory of it at all (not in
+   * its active queue, not in its completed-job history) — see
+   * print-agent/index.ts's reconcileInFlightJobsOnBoot and
+   * lib/print/cups.ts's isCupsJobKnown for exactly how that's detected, and
+   * that function's own reliability note for the one real limitation (a
+   * job that actually finished successfully a LONG time before the agent
+   * came back up can look identical to one CUPS genuinely lost, if its
+   * completed-job history already rotated the entry out).
+   *
+   * Deliberately NOT print_failed: a restart is never, by itself, evidence
+   * the print failed — it's evidence the agent can no longer VOUCH for
+   * what happened. So this never triggers a refund (set_print_job_refund_pending
+   * only ever fires on a transition into 'print_failed', never this) and is
+   * never auto-reprinted — an owner decides from the admin Jobs list
+   * whether to use the "Reprint pages" feature (original_job_id below) once
+   * they've actually checked whether it printed.
+   */
+  | "interrupted";
 
 export interface PrintSettingsSnapshot {
   copies: number;
@@ -82,7 +102,18 @@ export interface PrintJobRecord {
    * atomically claims it to 'processing' before ever calling the payment
    * gateway, then resolves it to 'refunded' or 'failed'.
    */
-  refundStatus?: "pending" | "processing" | "refunded" | "failed";
+  /**
+   * 'not_needed' means a job's refund was pending when, instead, an owner
+   * used the "Reprint pages" feature on it and that reprint went on to
+   * print successfully (see the set_original_job_refund_not_needed
+   * trigger) — the customer got their document after all, so the refund
+   * that was about to happen is no longer warranted. Distinct from
+   * undefined/null ("this job never needed a refund in the first place")
+   * even though both ultimately mean "nothing to pay out" — 'not_needed'
+   * specifically records that a refund WAS pending and was resolved by a
+   * reprint instead, for an owner reviewing the history later.
+   */
+  refundStatus?: "pending" | "processing" | "refunded" | "failed" | "not_needed";
   /** Stamped once, the instant refundStatus first becomes 'pending' — never touched again by a later retry. */
   refundRequestedAt?: string;
   /** Which signed-in owner approved the refund that actually succeeded — only ever set once refundStatus reaches 'refunded'. */
@@ -93,6 +124,31 @@ export interface PrintJobRecord {
   refundError?: string;
   /** Human-readable reason this job is currently 'print_blocked' (e.g. "media-empty") — see lib/print/cups.ts's classification. Only meaningful while status is 'print_blocked'; cleared (set back to undefined) the moment it resumes or is finally failed. */
   blockedReason?: string;
+  /** Why this job is 'interrupted' (e.g. "Print agent restarted; CUPS had no record of this job.") — see print-agent/index.ts's boot reconciliation. Only meaningful while status is 'interrupted'; never cleared afterward (it's a historical fact about what happened, not a live condition). */
+  interruptedReason?: string;
+  /** When this job was marked 'interrupted' — stamped once, at that same moment. */
+  interruptedAt?: string;
+  /**
+   * Set only on a job CREATED by the "Reprint pages" admin feature —
+   * points back at the job it's reprinting pages from. This, not a
+   * separate boolean, is the single source of truth for "is this job a
+   * reprint" (drives the REPRINT badge in the admin Jobs list, the
+   * Razorpay-enrichment skip in print-agent/index.ts, the refund-pending
+   * trigger's exclusion, and recordCompletedPrint's isReprint flag).
+   */
+  originalJobId?: string;
+  /**
+   * Written on the ORIGINAL job the moment someone reprints pages from it
+   * (requirement: "Add a note on the original job") — e.g. "Reprinted
+   * pages 2-4 on 17 Oct 2026, 10:42 am." Purely informational; never read
+   * by any code, only displayed.
+   */
+  reprintNote?: string;
+  pickupMode?: "here" | "later";
+  forceCoverSheet?: boolean;
+  sheetKind?: "none" | "separator" | "cover";
+  collectedAt?: string;
+  collectedVia?: "customer" | "staff";
   /**
    * Short per-kiosk, per-day pickup code (e.g. 42, shown to the customer as
    * "#042") — see ROADMAP.md §21. Assigned exactly once, atomically, at job
@@ -121,14 +177,17 @@ export interface PrintJobRecord {
   paidAmount?: number;
   /**
    * How this job actually got paid — 'staff' for a free print created by
-   * createStaffPrintJob below, 'razorpay'/'cashfree' mirroring `provider`
-   * for everything else. Undefined for jobs created before this column
-   * existed. This, not `provider`, is the real source of truth for "is this
-   * a staff job" — every refund/banner/Razorpay-enrichment call site checks
-   * it FIRST, since `provider` is still set to a real (but meaningless)
-   * value on a staff job too (see the migration's own comment on why).
+   * createStaffPrintJob below, 'reprint' for one created by
+   * createReprintJob (also free, but distinct — see originalJobId's own
+   * comment for why this isn't folded into 'staff'), 'razorpay'/'cashfree'
+   * mirroring `provider` for everything else. Undefined for jobs created
+   * before this column existed. This, not `provider`, is the real source
+   * of truth for "is this a staff/reprint job" — every refund/banner/
+   * Razorpay-enrichment call site checks it FIRST, since `provider` is
+   * still set to a real (but meaningless) value on one of these too (see
+   * the migration's own comment on why).
    */
-  paymentMethod?: "razorpay" | "cashfree" | "staff";
+  paymentMethod?: "razorpay" | "cashfree" | "staff" | "reprint";
   /** Which signed-in owner/staff user created this job — only ever set for a staff print (createStaffPrintJob). */
   createdByUserId?: string;
   /** True only for a staff print — total_price is 0 and waivedAmount below holds what it would have cost. */
@@ -159,7 +218,15 @@ export interface PrintJobRecord {
   readyAt?: string;
 }
 
-const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled"];
+// 'interrupted' included — it's never going to resolve on its own (no
+// watcher is tracking it; see JobStatus's own comment), so it's eligible
+// for cleanup after TERMINAL_JOB_RETENTION_HOURS exactly like any other
+// resolved job, UNLESS an owner reprints it first (which doesn't change
+// its own status, just adds reprint_note — so an interrupted job an owner
+// cares about should be reprinted promptly, within that window, same as
+// the existing "the stored file must still exist" constraint on reprinting
+// print_failed jobs already implies).
+const TERMINAL_STATUSES: JobStatus[] = ["printed", "print_failed", "payment_failed", "expired", "cancelled", "interrupted"];
 
 // Maps between our camelCase record shape and the snake_case `print_jobs` table.
 interface PrintJobRow {
@@ -184,8 +251,17 @@ interface PrintJobRow {
   error: string | null;
   cups_job_id: string | null;
   blocked_reason: string | null;
+  interrupted_reason: string | null;
+  interrupted_at: string | null;
+  original_job_id: string | null;
+  reprint_note: string | null;
+  pickup_mode: "here" | "later";
+  force_cover_sheet: boolean;
+  sheet_kind: "none" | "separator" | "cover" | null;
+  collected_at: string | null;
+  collected_via: "customer" | "staff" | null;
   refunded_at: string | null;
-  refund_status: "pending" | "processing" | "refunded" | "failed" | null;
+  refund_status: "pending" | "processing" | "refunded" | "failed" | "not_needed" | null;
   refund_requested_at: string | null;
   refunded_by: string | null;
   refund_provider_id: string | null;
@@ -195,7 +271,7 @@ interface PrintJobRow {
   payment_id: string | null;
   upi_txn_id: string | null;
   paid_amount: number | null;
-  payment_method: "razorpay" | "cashfree" | "staff" | null;
+  payment_method: "razorpay" | "cashfree" | "staff" | "reprint" | null;
   created_by_user_id: string | null;
   is_free: boolean | null;
   waived_amount: number | null;
@@ -230,6 +306,15 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     error: row.error ?? undefined,
     cupsJobId: row.cups_job_id ?? undefined,
     blockedReason: row.blocked_reason ?? undefined,
+    interruptedReason: row.interrupted_reason ?? undefined,
+    interruptedAt: row.interrupted_at ?? undefined,
+    originalJobId: row.original_job_id ?? undefined,
+    reprintNote: row.reprint_note ?? undefined,
+    pickupMode: row.pickup_mode,
+    forceCoverSheet: row.force_cover_sheet,
+    sheetKind: row.sheet_kind ?? undefined,
+    collectedAt: row.collected_at ?? undefined,
+    collectedVia: row.collected_via ?? undefined,
     refundedAt: row.refunded_at ?? undefined,
     refundStatus: row.refund_status ?? undefined,
     refundRequestedAt: row.refund_requested_at ?? undefined,
@@ -273,6 +358,8 @@ function toInsertRow(job: PrintJobRecord): Partial<PrintJobRow> {
     kiosk_id: job.kioskId,
     ticket_number: job.ticketNumber ?? null,
     ticket_date: job.ticketDate ?? null,
+    pickup_mode: job.pickupMode ?? "here",
+    force_cover_sheet: job.forceCoverSheet ?? false,
     created_at: job.createdAt,
     updated_at: job.updatedAt,
   };
@@ -306,6 +393,7 @@ function toUpdateRow(patch: JobPatch): Partial<PrintJobRow> {
   if (patch.spooledAt !== undefined) row.spooled_at = patch.spooledAt;
   if (patch.printerIdleAt !== undefined) row.printer_idle_at = patch.printerIdleAt;
   if (patch.readyAt !== undefined) row.ready_at = patch.readyAt;
+  if (patch.sheetKind !== undefined) row.sheet_kind = patch.sheetKind;
   return row;
 }
 
@@ -415,7 +503,59 @@ export async function failPrintingJob(jobId: string, reason: string): Promise<Pr
     .select("*")
     .maybeSingle();
   if (error) throw new Error(`Could not mark job print_failed: ${error.message}`);
+  const job = data ? fromRow(data as PrintJobRow) : null;
+
+  // Durable failure-rate ledger for get_kiosk_sales_summary (supabase/migrations/2026-10-21_sales_stats.sql)
+  // — print_jobs itself gets cleaned up a few hours after this resolves
+  // (see get_kiosk_period_breakdown's own comment), so this has to be
+  // logged here, at the one place a job is ever actually marked
+  // print_failed, not derived later from print_jobs. Only logged when this
+  // call is the one that actually caused the transition (job !== null) —
+  // never for a call that found the job already resolved.
+  if (job) {
+    const { error: logError } = await supabaseAdmin().from("print_failures").insert({ kiosk_id: job.kioskId, job_id: jobId });
+    if (logError) console.error("Failed to log print_failures entry:", logError.message);
+  }
+
+  return job;
+}
+
+/**
+ * The ONE place a job is ever marked 'interrupted' — same atomic
+ * `WHERE status IN ('printing','print_blocked')` guard as failPrintingJob
+ * above, for the identical reason: called only from print-agent/index.ts's
+ * boot reconciliation, which runs once at startup, but there is no harm in
+ * (and real defense-in-depth from) making it refuse to touch a job that
+ * somehow isn't in one of those two states anymore by the time it runs.
+ */
+export async function markJobInterrupted(jobId: string, reason: string): Promise<PrintJobRecord | null> {
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .update({ status: "interrupted", interrupted_reason: reason, interrupted_at: new Date().toISOString(), blocked_reason: null, updated_at: new Date().toISOString() })
+    .eq("id", jobId)
+    .in("status", ["printing", "print_blocked"])
+    .select("*")
+    .maybeSingle();
+  if (error) throw new Error(`Could not mark job interrupted: ${error.message}`);
   return data ? fromRow(data as PrintJobRow) : null;
+}
+
+/**
+ * Every job THIS kiosk's print agent still had "in flight" (printing or
+ * print_blocked) — checked once at boot, before the normal poll loop
+ * starts, to reconcile anything the agent's own previous process never got
+ * to finish watching (see print-agent/index.ts's reconcileInFlightJobsOnBoot).
+ * Scoped to one kiosk, same as every other kiosk-scoped query here — each
+ * Pi only ever owns its own kiosk's rows.
+ */
+export async function listInFlightJobsForKiosk(kioskId: string): Promise<PrintJobRecord[]> {
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .select("*")
+    .eq("kiosk_id", kioskId)
+    .in("status", ["printing", "print_blocked"]);
+  if (error) throw new Error(`Could not list in-flight jobs: ${error.message}`);
+  return (data as PrintJobRow[]).map(fromRow);
 }
 
 /** Used by the scheduled payment recheck (ROADMAP.md #9) to sweep every kiosk's unconfirmed jobs, not just one. */
@@ -494,6 +634,7 @@ export interface CreateStaffPrintJobInput {
   idempotencyKey: string | null;
   createdByUserId: string;
   dailyCap: number;
+  forceCoverSheet: boolean;
 }
 
 /**
@@ -524,10 +665,59 @@ export async function createStaffPrintJob(input: CreateStaffPrintJobInput): Prom
     p_idempotency_key: input.idempotencyKey,
     p_created_by: input.createdByUserId,
     p_daily_cap: input.dailyCap,
+    p_force_cover_sheet: input.forceCoverSheet,
   });
   if (error) throw new Error(`Could not create staff print job: ${error.message}`);
   const rows = data as PrintJobRow[] | null;
   if (!rows || rows.length === 0) throw new Error("create_staff_print_job returned no row.");
+  return fromRow(rows[0]);
+}
+
+export interface CreateReprintJobInput {
+  jobId: string;
+  originalJobId: string;
+  selectedPages: number[];
+  settings: PrintSettingsSnapshot;
+  includeBannerPage: boolean;
+  contentHash: string;
+  pdfStoragePath: string;
+  createdByUserId: string;
+  reprintNote: string;
+  forceCoverSheet: boolean;
+}
+
+/**
+ * Creates a free "reprint pages" job linked to an earlier one (requirement:
+ * "Submitting creates a NEW linked job (original_job_id, reason =
+ * reprint)") — wraps create_reprint_job(), one atomic Postgres transaction
+ * that: re-checks the original job isn't already refunded (the real,
+ * authoritative check — app/api/admin/reprint's own upfront check is just a
+ * faster-failing UX nicety), assigns a ticket number from the SAME sequence
+ * every other job uses, inserts the new row already 'paid', writes the
+ * "reprinted pages X to Y" note onto the ORIGINAL job, and writes one audit
+ * entry — all or nothing, so this can never leave the original job noted as
+ * reprinted without the new job actually existing, or vice versa.
+ *
+ * Throws on a genuine failure (including "already refunded," which the RPC
+ * raises as a Postgres exception) — the caller (app/api/admin/reprint) is
+ * responsible for turning that into a clear, owner-facing error message.
+ */
+export async function createReprintJob(input: CreateReprintJobInput): Promise<PrintJobRecord> {
+  const { data, error } = await supabaseAdmin().rpc("create_reprint_job", {
+    p_job_id: input.jobId,
+    p_original_job_id: input.originalJobId,
+    p_selected_pages: input.selectedPages,
+    p_settings: input.settings,
+    p_include_banner_page: input.includeBannerPage,
+    p_content_hash: input.contentHash,
+    p_pdf_storage_path: input.pdfStoragePath,
+    p_reprint_note: input.reprintNote,
+    p_created_by: input.createdByUserId,
+    p_force_cover_sheet: input.forceCoverSheet,
+  });
+  if (error) throw new Error(`Could not create reprint job: ${error.message}`);
+  const rows = data as PrintJobRow[] | null;
+  if (!rows || rows.length === 0) throw new Error("create_reprint_job returned no row.");
   return fromRow(rows[0]);
 }
 
@@ -548,6 +738,23 @@ export async function downloadJobPdf(storagePath: string): Promise<Uint8Array> {
   const { data, error } = await supabaseAdmin().storage.from(SUPABASE_PRINT_BUCKET).download(storagePath);
   if (error || !data) throw new Error(`Could not download print PDF: ${error?.message || "not found"}`);
   return new Uint8Array(await data.arrayBuffer());
+}
+
+/**
+ * Short-lived signed URL for the admin "Reprint pages" modal to download an
+ * EXISTING job's own stored PDF directly into the browser (so it can reuse
+ * the same client-side thumbnail pipeline — lib/hooks/useFileBasket.ts —
+ * every other page in this app already uses, rather than duplicating that
+ * logic server-side). Mirrors createTempUploadUrl's shape but for reading,
+ * not writing (createSignedUrl, not createSignedUploadUrl). Throws if the
+ * object doesn't exist — the caller (app/api/admin/jobs/[jobId]/pdf-url)
+ * turns that into "the file was removed and can't be reprinted," per
+ * requirement #5.
+ */
+export async function createJobPdfDownloadUrl(storagePath: string, expiresInSeconds: number): Promise<string> {
+  const { data, error } = await supabaseAdmin().storage.from(SUPABASE_PRINT_BUCKET).createSignedUrl(storagePath, expiresInSeconds);
+  if (error || !data) throw new Error(`Could not create a download URL: ${error?.message || "file not found"}`);
+  return data.signedUrl;
 }
 
 // ----------------------------------------------------------------------------
@@ -630,9 +837,10 @@ export async function listStaleTempUploads(olderThanMs: number): Promise<string[
  * whether anyone's looked at it yet. Without this, a job an owner hasn't
  * gotten to refunding yet could have its row (and the only record of what
  * was owed) deleted out from under the Refunds admin page. A row only
- * becomes eligible again once refund_status is null (never needed one) or
- * 'refunded' (resolved) — never while real money is still owed or a refund
- * attempt is actively in flight.
+ * becomes eligible again once refund_status is null (never needed one),
+ * 'refunded' (resolved), or 'not_needed' (an owner reprinted it instead —
+ * see set_original_job_refund_not_needed) — never while real money is
+ * still owed or a refund attempt is actively in flight.
  */
 export async function listJobsEligibleForCleanup(): Promise<PrintJobRecord[]> {
   const terminalCutoff = new Date(Date.now() - TERMINAL_JOB_RETENTION_HOURS * 60 * 60 * 1000).toISOString();
@@ -644,7 +852,7 @@ export async function listJobsEligibleForCleanup(): Promise<PrintJobRecord[]> {
       .select("*")
       .in("status", TERMINAL_STATUSES)
       .lt("updated_at", terminalCutoff)
-      .or("refund_status.is.null,refund_status.eq.refunded"),
+      .or("refund_status.is.null,refund_status.eq.refunded,refund_status.eq.not_needed"),
     supabaseAdmin().from("print_jobs").select("*").eq("status", "pending_payment").lt("created_at", abandonedCutoff),
   ]);
 
@@ -761,6 +969,72 @@ export async function listJobsAheadInQueue(job: Pick<PrintJobRecord, "id" | "kio
     .lt("created_at", job.createdAt)
     .neq("id", job.id);
   if (error) throw new Error(`Could not list jobs ahead in queue: ${error.message}`);
+  return (data as PrintJobRow[]).map(fromRow);
+}
+
+export async function markJobCollected(jobId: string, via: "customer" | "staff"): Promise<PrintJobRecord | null> {
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .update({ collected_at: new Date().toISOString(), collected_via: via, updated_at: new Date().toISOString() })
+    .eq("id", jobId)
+    .eq("status", "printed")
+    .is("collected_at", null)
+    .select("*")
+    .maybeSingle();
+  if (error) throw new Error(`Could not mark job collected: ${error.message}`);
+  return data ? fromRow(data as PrintJobRow) : null;
+}
+
+export async function isTrayLikelyOccupied(kioskId: string, now: Date, config: { recentJobMinutes: number; laterHoldHours: number }): Promise<boolean> {
+  const { data: kiosk, error: kioskError } = await supabaseAdmin().from("kiosk_status").select("tray_cleared_at").eq("id", kioskId).maybeSingle();
+  if (kioskError) throw new Error(`Could not read kiosk tray state: ${kioskError.message}`);
+  const trayClearedAt = (kiosk as { tray_cleared_at: string | null } | null)?.tray_cleared_at ?? null;
+
+  const laterCutoff = new Date(now.getTime() - config.laterHoldHours * 3600_000).toISOString();
+  const hereCutoff = new Date(now.getTime() - config.recentJobMinutes * 60_000).toISOString();
+
+  let query = supabaseAdmin()
+    .from("print_jobs")
+    .select("id")
+    .eq("kiosk_id", kioskId)
+    .eq("status", "printed")
+    .is("collected_at", null)
+    .or(`and(pickup_mode.eq.later,ready_at.gte.${laterCutoff}),and(pickup_mode.eq.here,ready_at.gte.${hereCutoff})`)
+    .limit(1);
+  if (trayClearedAt) query = query.gt("ready_at", trayClearedAt);
+
+  const { data, error } = await query;
+  if (error) throw new Error(`Could not check tray occupancy: ${error.message}`);
+  return (data?.length ?? 0) > 0;
+}
+
+export async function countUncollectedPrintedJobs(kioskId: string, trayClearedAt: string | null): Promise<number> {
+  let query = supabaseAdmin()
+    .from("print_jobs")
+    .select("id", { count: "exact", head: true })
+    .eq("kiosk_id", kioskId)
+    .eq("status", "printed")
+    .is("collected_at", null);
+  if (trayClearedAt) query = query.gt("ready_at", trayClearedAt);
+
+  const { count, error } = await query;
+  if (error) throw new Error(`Could not count uncollected jobs: ${error.message}`);
+  return count ?? 0;
+}
+
+export async function listUncollectedJobsAheadInTray(kioskId: string, trayClearedAt: string | null, beforeReadyAt: string): Promise<PrintJobRecord[]> {
+  let query = supabaseAdmin()
+    .from("print_jobs")
+    .select("*")
+    .eq("kiosk_id", kioskId)
+    .eq("status", "printed")
+    .is("collected_at", null)
+    .lt("ready_at", beforeReadyAt)
+    .order("ready_at", { ascending: true });
+  if (trayClearedAt) query = query.gt("ready_at", trayClearedAt);
+
+  const { data, error } = await query;
+  if (error) throw new Error(`Could not list jobs ahead in tray: ${error.message}`);
   return (data as PrintJobRow[]).map(fromRow);
 }
 

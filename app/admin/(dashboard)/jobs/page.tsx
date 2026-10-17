@@ -1,7 +1,7 @@
 "use client";
 
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Ban, RefreshCw, RotateCcw, Search } from "lucide-react";
+import { Ban, Copy, RefreshCw, RotateCcw, Search } from "lucide-react";
 import { cancelJob, forceReprintJob } from "@/lib/admin/actions";
 import { useAdminRole } from "@/lib/admin/role-context";
 import { fetchJson } from "@/lib/fetch-json";
@@ -11,8 +11,9 @@ import { createSupabaseBrowserClient } from "@/lib/supabase";
 import { formatTicketCode } from "@/lib/ticket-code";
 import LiveIndicator from "../live-indicator";
 import StatusBadge from "../status-badge";
+import ReprintModal from "./reprint-modal";
 
-const STATUS_OPTIONS = ["", "pending_payment", "paid", "printing", "print_blocked", "printed", "print_failed", "payment_failed", "expired", "cancelled"];
+const STATUS_OPTIONS = ["", "pending_payment", "paid", "printing", "print_blocked", "interrupted", "printed", "print_failed", "payment_failed", "expired", "cancelled"];
 const REPRINTABLE_STATUSES = ["print_failed", "printed"];
 // print_blocked included — still "in the active queue, not yet
 // resolved," same reasoning cancel_job's own SQL guard was extended for
@@ -27,6 +28,10 @@ const REFUND_STATUS_LABELS: Record<string, { text: string; className: string }> 
   processing: { text: "refund processing", className: "bg-blue-100 text-blue-700" },
   refunded: { text: "refunded", className: "bg-slate-100 text-slate-500" },
   failed: { text: "refund failed", className: "bg-red-100 text-red-600" },
+  // Set by set_original_job_refund_not_needed once a reprint of this job
+  // prints successfully — a refund WAS pending, but the customer got their
+  // document after all.
+  not_needed: { text: "refund not needed (reprinted)", className: "bg-slate-100 text-slate-500" },
 };
 
 interface JobFilters {
@@ -66,6 +71,8 @@ export default function AdminJobsPage() {
   const [sinceDate, setSinceDate] = useState("");
   const [actionError, setActionError] = useState("");
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
+  // The job currently open in the "Reprint pages" modal — null when closed.
+  const [reprintJob, setReprintJob] = useState<AdminJobRow | null>(null);
 
   // What the table is actually querying by — only ever updated on submit
   // (handleSearchSubmit below). A ref, not state: fetchData reads it fresh
@@ -89,7 +96,14 @@ export default function AdminJobsPage() {
 
     const { data, error: queryError } = await query;
     if (queryError) throw new Error(queryError.message);
-    setJobs((data as AdminJobRow[]) ?? []);
+    const rows = (data as AdminJobRow[]) ?? [];
+    // Requirement: "Interrupted jobs appear at the top of the admin Jobs
+    // list" — a stable partition (Array.prototype.sort has been
+    // guaranteed stable since ES2019), so interrupted rows move to the
+    // front without disturbing the created_at-desc order within either
+    // group.
+    rows.sort((a, b) => Number(b.status === "interrupted") - Number(a.status === "interrupted"));
+    setJobs(rows);
   }, []);
 
   // Paused while an action (reprint/cancel/refund) is in flight — not for
@@ -175,22 +189,31 @@ export default function AdminJobsPage() {
               <tr key={job.id} className="border-b border-slate-50 last:border-0 align-top">
                 <td className="max-w-[180px] truncate px-4 py-3" title={job.id}>
                   {job.is_free && <span className="mr-1.5 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700">STAFF</span>}
+                  {/* original_job_id is the single source of truth for "is this a reprint" — requirement: "marked REPRINT in lists." */}
+                  {job.original_job_id && <span className="mr-1.5 rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-bold text-violet-700">REPRINT</span>}
                   {job.file_name}
+                  {/* Requirement #6: "Add a note on the original job." */}
+                  {job.reprint_note && <p className="mt-1 text-[11px] font-normal text-violet-600">{job.reprint_note}</p>}
                 </td>
                 <td className="px-4 py-3 font-bold text-blue-600">{job.ticket_number != null ? formatTicketCode(job.ticket_number) : "—"}</td>
                 <td className="px-4 py-3">
                   <StatusBadge status={job.status} />
                   {/* Requirement: "Show the blocked reason ... on the job." */}
                   {job.status === "print_blocked" && job.blocked_reason && <p className="mt-1 text-[11px] text-orange-600">{job.blocked_reason}</p>}
+                  {job.status === "interrupted" && job.interrupted_reason && <p className="mt-1 text-[11px] text-rose-600">{job.interrupted_reason}</p>}
                 </td>
                 <td className="px-4 py-3 text-slate-500">{job.phone_number}</td>
                 <td className="px-4 py-3 text-slate-500">{job.kiosk_id}</td>
                 <td className="px-4 py-3">
                   {/* A staff job's own total_price is always 0 — waived_amount (what it
-                     WOULD have cost) is the number actually worth showing here. */}
+                     WOULD have cost) is the number actually worth showing here. A reprint
+                     job's total_price is also always 0, but nothing was "waived" for it —
+                     see original_job_id's own comment in lib/store.ts. */}
                   {job.is_free
                     ? <span className="text-emerald-700">FREE{job.waived_amount !== null && ` (₹${Number(job.waived_amount).toFixed(2)} waived)`}</span>
-                    : job.total_price !== null ? `₹${Number(job.total_price).toFixed(2)}` : "—"}
+                    : job.original_job_id
+                      ? <span className="text-violet-700">FREE (reprint)</span>
+                      : job.total_price !== null ? `₹${Number(job.total_price).toFixed(2)}` : "—"}
                   {/* refund_status (owner-masked — null for staff) drives this now,
                      not the old binary refunded_at badge — see the Refunds admin page
                      (owner-only) for the actual approve/retry action. */}
@@ -218,6 +241,19 @@ export default function AdminJobsPage() {
                         onClick={() => runAction(job.id, () => forceReprintJob(job.id))}
                       />
                     )}
+                    {/* Requirement #3: "Each job in the admin Jobs list gets
+                       a 'Reprint pages' button," owner/admin only — distinct
+                       from the plain "Reprint" button above, which only ever
+                       resubmits the whole stored file as-is. Available
+                       regardless of status (unlike REPRINTABLE_STATUSES
+                       above) — an owner might want extra copies of a job
+                       that printed fine, or specific pages from one that
+                       didn't; app/api/admin/reprint's own validation (file
+                       still exists, already-refunded block) is the real
+                       guard, not a status filter here. */}
+                    {role === "owner" && (
+                      <ActionButton icon={Copy} label="Reprint pages" pending={false} onClick={() => setReprintJob(job)} />
+                    )}
                     {(role === "owner" || role === "staff") && CANCELLABLE_STATUSES.includes(job.status) && (
                       <ActionButton
                         icon={Ban}
@@ -235,6 +271,17 @@ export default function AdminJobsPage() {
         {!isLoading && jobs.length === 0 && <p className="p-4 text-sm text-slate-500">No jobs match this search.</p>}
         {isLoading && <p className="flex items-center gap-2 p-4 text-sm text-slate-500"><RefreshCw size={14} className="animate-spin" /> Loading...</p>}
       </div>
+
+      {reprintJob && (
+        <ReprintModal
+          job={reprintJob}
+          onClose={() => setReprintJob(null)}
+          onDone={() => {
+            setReprintJob(null);
+            void refreshNow();
+          }}
+        />
+      )}
     </div>
   );
 }

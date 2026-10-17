@@ -30,7 +30,7 @@
  *   3. If the child crashes, or the marker is still "verifying" once the
  *      timeout elapses (a hang, not a crash), this treats the update as
  *      failed: `git reset --hard` to the recorded previous commit, `npm
- *      install` to match, write the marker to "rolled_back", and exit
+ *      ci` to match, write the marker to "rolled_back", and exit
  *      non-zero so systemd's own Restart=always (already in the unit file)
  *      brings up a fresh boot-guard — which this time finds no "verifying"
  *      marker, so it just launches normally, no special monitoring.
@@ -55,7 +55,7 @@ function rollback(marker: UpdateMarker): void {
   console.error(`[boot-guard] Rolling back to ${marker.previousCommit.slice(0, 7)}...`);
   try {
     execFileSync("git", ["reset", "--hard", marker.previousCommit], { cwd: process.cwd(), stdio: "pipe" });
-    execFileSync("npm", ["install"], { cwd: process.cwd(), stdio: "pipe" });
+    execFileSync("npm", ["ci"], { cwd: process.cwd(), stdio: "pipe" });
   } catch (error) {
     console.error("[boot-guard] Rollback itself failed — manual intervention needed on this Pi:", error);
   }

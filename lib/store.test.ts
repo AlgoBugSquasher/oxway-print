@@ -22,7 +22,7 @@ import { settingsMatch } from "./store";
 /** Records every chained call so assertions can check exactly what query was built, then resolves like a real Supabase query when awaited. */
 function createMockQueryBuilder(result: { data: unknown; error: unknown }) {
   const calls: { method: string; args: unknown[] }[] = [];
-  const CHAIN_METHODS = ["from", "select", "update", "delete", "insert", "eq", "neq", "in", "lt", "lte", "gt", "gte", "or", "order", "limit", "single", "maybeSingle"];
+  const CHAIN_METHODS = ["from", "select", "update", "delete", "insert", "eq", "neq", "in", "is", "lt", "lte", "gt", "gte", "or", "order", "limit", "single", "maybeSingle"];
   const builder: Record<string, unknown> = { __calls: calls };
   for (const method of CHAIN_METHODS) {
     builder[method] = (...args: unknown[]) => {
@@ -102,6 +102,7 @@ describe("atomic status-guarded store functions", () => {
   beforeEach(() => {
     vi.resetModules();
     mockAdmin.current = null;
+    mockAdmin.fromQueue = [];
   });
 
   it("claimJobAsPaid guards on status = 'pending_payment'", async () => {
@@ -172,6 +173,121 @@ describe("atomic status-guarded store functions", () => {
       const { failPrintingJob } = await import("./store");
       await expect(failPrintingJob("job-1", "stuck")).resolves.toBeNull();
     });
+
+    it("logs a print_failures entry (the durable failure-rate ledger get_kiosk_sales_summary reads) only when this call actually caused the transition", async () => {
+      const updateBuilder = createMockQueryBuilder({ data: { id: "job-1", status: "print_failed", kiosk_id: "oxway_01" }, error: null });
+      const insertBuilder = createMockQueryBuilder({ data: null, error: null });
+      mockAdmin.fromQueue = [updateBuilder, insertBuilder];
+      const { failPrintingJob } = await import("./store");
+
+      await failPrintingJob("job-1", "stuck");
+
+      const insertCalls = insertBuilder.__calls.filter((call) => call.method === "insert");
+      expect(insertCalls).toHaveLength(1);
+      expect(insertCalls[0]?.args[0]).toMatchObject({ kiosk_id: "oxway_01", job_id: "job-1" });
+    });
+
+    it("does NOT log a print_failures entry when the guard matched zero rows (someone/something else already resolved the job)", async () => {
+      const updateBuilder = createMockQueryBuilder({ data: null, error: null });
+      const insertBuilder = createMockQueryBuilder({ data: null, error: null });
+      mockAdmin.fromQueue = [updateBuilder, insertBuilder];
+      const { failPrintingJob } = await import("./store");
+
+      await failPrintingJob("job-1", "stuck");
+
+      expect(insertBuilder.__calls.filter((call) => call.method === "insert")).toHaveLength(0);
+    });
+  });
+
+  // "interrupted detection after restart" — markJobInterrupted's own
+  // atomic guard, same discipline failPrintingJob above already
+  // establishes: it must never touch a job that's no longer
+  // printing/print_blocked by the time print-agent's boot reconciliation
+  // actually runs (see lib/print/restart-reconciliation.ts for the pure
+  // CUPS-known/not-known decision this writes the result of).
+  describe("markJobInterrupted", () => {
+    it("guards on status IN ('printing', 'print_blocked'), same as failPrintingJob", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "interrupted" }, error: null });
+      const { markJobInterrupted } = await import("./store");
+      await markJobInterrupted("job-1", "Print agent restarted; CUPS had no record of job oxway-1.");
+      const inCalls = mockAdmin.current.__calls.filter((call) => call.method === "in");
+      expect(inCalls).toContainEqual({ method: "in", args: ["status", ["printing", "print_blocked"]] });
+    });
+
+    it("writes interrupted_reason/interrupted_at and clears blocked_reason in the same write", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "interrupted" }, error: null });
+      const { markJobInterrupted } = await import("./store");
+      await markJobInterrupted("job-1", "lost at boot");
+      const updateCalls = mockAdmin.current.__calls.filter((call) => call.method === "update");
+      expect(updateCalls[0]?.args[0]).toMatchObject({ status: "interrupted", interrupted_reason: "lost at boot", blocked_reason: null });
+      expect(updateCalls[0]?.args[0]).toHaveProperty("interrupted_at");
+    });
+
+    it("never marks an already-resolved job interrupted — the guard matches zero rows and this returns null", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: null, error: null });
+      const { markJobInterrupted } = await import("./store");
+      await expect(markJobInterrupted("job-1", "lost at boot")).resolves.toBeNull();
+    });
+  });
+
+  describe("markJobCollected", () => {
+    it("guards on status = 'printed' and collected_at IS NULL", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "printed" }, error: null });
+      const { markJobCollected } = await import("./store");
+      await markJobCollected("job-1", "customer");
+      const calls = mockAdmin.current.__calls;
+      expect(calls).toContainEqual({ method: "eq", args: ["status", "printed"] });
+      expect(calls).toContainEqual({ method: "is", args: ["collected_at", null] });
+    });
+
+    it("collected tap: records collected_at and collected_via on the first call", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: { id: "job-1", status: "printed" }, error: null });
+      const { markJobCollected } = await import("./store");
+      await markJobCollected("job-1", "customer");
+      const updateCalls = mockAdmin.current.__calls.filter((call) => call.method === "update");
+      expect(updateCalls[0]?.args[0]).toMatchObject({ collected_via: "customer" });
+      expect(updateCalls[0]?.args[0]).toHaveProperty("collected_at");
+    });
+
+    it("is idempotent: a second tap after collected_at is already set matches zero rows and returns null, never throwing", async () => {
+      mockAdmin.current = createMockQueryBuilder({ data: null, error: null });
+      const { markJobCollected } = await import("./store");
+      await expect(markJobCollected("job-1", "customer")).resolves.toBeNull();
+    });
+  });
+});
+
+describe("isTrayLikelyOccupied", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.current = null;
+    mockAdmin.fromQueue = [];
+  });
+
+  it("empty tray: no uncollected printed jobs at all -> not occupied", async () => {
+    const kioskBuilder = createMockQueryBuilder({ data: { tray_cleared_at: null }, error: null });
+    const jobsBuilder = createMockQueryBuilder({ data: [], error: null });
+    mockAdmin.fromQueue = [kioskBuilder, jobsBuilder];
+    const { isTrayLikelyOccupied } = await import("./store");
+    await expect(isTrayLikelyOccupied("oxway_01", new Date(), { recentJobMinutes: 5, laterHoldHours: 2 })).resolves.toBe(false);
+  });
+
+  it("back-to-back jobs: a recent uncollected 'here' job within the recent-job window -> occupied", async () => {
+    const kioskBuilder = createMockQueryBuilder({ data: { tray_cleared_at: null }, error: null });
+    const jobsBuilder = createMockQueryBuilder({ data: [{ id: "job-1" }], error: null });
+    mockAdmin.fromQueue = [kioskBuilder, jobsBuilder];
+    const { isTrayLikelyOccupied } = await import("./store");
+    await expect(isTrayLikelyOccupied("oxway_01", new Date(), { recentJobMinutes: 5, laterHoldHours: 2 })).resolves.toBe(true);
+  });
+
+  it("tray cleared: excludes jobs that finished before the last tray_cleared_at", async () => {
+    const kioskBuilder = createMockQueryBuilder({ data: { tray_cleared_at: "2026-10-19T10:00:00Z" }, error: null });
+    const jobsBuilder = createMockQueryBuilder({ data: [], error: null });
+    mockAdmin.fromQueue = [kioskBuilder, jobsBuilder];
+    const { isTrayLikelyOccupied } = await import("./store");
+    await isTrayLikelyOccupied("oxway_01", new Date(), { recentJobMinutes: 5, laterHoldHours: 2 });
+    const gtCalls = jobsBuilder.__calls.filter((call) => call.method === "gt");
+    expect(gtCalls).toContainEqual({ method: "gt", args: ["ready_at", "2026-10-19T10:00:00Z"] });
   });
 });
 
@@ -277,6 +393,7 @@ describe("createStaffPrintJob", () => {
     idempotencyKey: "key-1",
     createdByUserId: "user-1",
     dailyCap: 500,
+    forceCoverSheet: false,
   };
 
   it("calls create_staff_print_job with every field mapped to its p_-prefixed RPC argument", async () => {
@@ -300,6 +417,7 @@ describe("createStaffPrintJob", () => {
         p_idempotency_key: "key-1",
         p_created_by: "user-1",
         p_daily_cap: 500,
+        p_force_cover_sheet: false,
       },
     }]);
     expect(result.id).toBe("job-staff-1");
@@ -387,7 +505,7 @@ describe("listJobsEligibleForCleanup", () => {
     await listJobsEligibleForCleanup();
 
     const orCalls = terminalBuilder.__calls.filter((call) => call.method === "or");
-    expect(orCalls).toEqual([{ method: "or", args: ["refund_status.is.null,refund_status.eq.refunded"] }]);
+    expect(orCalls).toEqual([{ method: "or", args: ["refund_status.is.null,refund_status.eq.refunded,refund_status.eq.not_needed"] }]);
     // The abandoned (pending_payment) query is unrelated to refunds — never needs this filter.
     expect(abandonedBuilder.__calls.some((call) => call.method === "or")).toBe(false);
   });

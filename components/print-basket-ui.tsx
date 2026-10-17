@@ -8,8 +8,9 @@
 // file-card/settings JSX, and so a layout/behavior fix only has to happen
 // in one place.
 
-import { ChevronDown, ChevronUp, CheckCircle2, Circle, FileText, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronUp, CheckCircle2, Circle, FileText, RefreshCw, X } from "lucide-react";
 import type { ReactNode } from "react";
+import { isDocx } from "@/lib/client-file-converter";
 import type { FileBasketItem } from "@/lib/hooks/useFileBasket";
 
 export type PageMode = "all" | "odd" | "even" | "custom";
@@ -124,6 +125,19 @@ export function FileBasketItemCard({
     {item.status === "error" && <div className="mt-3 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-500">{item.error}</div>}
 
     {item.status === "converting" && <div className={`mt-3 flex items-center gap-2 text-xs ${muted}`}><RefreshCw className="animate-spin text-blue-500" size={14} /> Converting to a printable PDF...</div>}
+
+    {isDocx(item.file) && item.status !== "error" && (
+      <div className="mt-3 rounded-xl border border-blue-500/20 bg-blue-500/10 px-3 py-2 text-xs font-medium text-blue-700">
+        Word files can change layout when printed. For best results upload a PDF — in Word, use File &rarr; Save As &rarr; PDF.
+      </div>
+    )}
+
+    {item.status === "ready" && item.conversionWarnings.length > 0 && (
+      <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-700">
+        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+        <p>This document had some elements (tables, images, or formatting) that may not have converted cleanly. Please check the preview below before paying.</p>
+      </div>
+    )}
 
     {item.status === "ready" && <div className="mt-4">
       <div className="mb-2 flex items-center justify-between gap-2">

@@ -1,5 +1,7 @@
 import { jsonNoStore } from "@/lib/api-response";
+import { getKioskTrayClearedAt } from "@/lib/kiosk-stats";
 import { supabaseAdmin } from "@/lib/supabase-admin";
+import { countUncollectedPrintedJobs } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,6 +16,7 @@ interface KioskDisplayJobRow {
   ticket_number: number | null;
   status: string;
   updated_at: string;
+  refund_status: string | null;
 }
 
 /**
@@ -29,40 +32,45 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
     const { kioskId } = await params;
     const supabase = supabaseAdmin();
 
-    // print_blocked included alongside printing — the job is still the
-    // one physically at the printer, just waiting on it (out of paper,
-    // etc.); the screen shows a different message for it below, but it's
-    // still "current," not simply absent.
+    // print_blocked/interrupted included alongside printing — the job is
+    // still the one physically at the printer (or was, for interrupted),
+    // just not actively "printing" this instant; the screen shows a
+    // different message for each below, but each is still "current," not
+    // simply absent. An interrupted job naturally stops showing here the
+    // moment a NEWER job starts printing (this query is ordered by
+    // updated_at desc) — it never gets stuck on screen once something
+    // else is actually happening.
     const { data: printingRows, error: printingError } = await supabase
       .from("print_jobs")
-      .select("ticket_number, status, updated_at")
+      .select("ticket_number, status, updated_at, refund_status")
       .eq("kiosk_id", kioskId)
-      .in("status", ["printing", "print_blocked"])
+      .in("status", ["printing", "print_blocked", "interrupted"])
       .order("updated_at", { ascending: false })
       .limit(1);
     if (printingError) throw new Error(`Could not load current job: ${printingError.message}`);
 
-    let current: { ticketNumber: number; status: "printing" | "print_blocked" | "printed" } | null = null;
+    let current: { ticketNumber: number; status: "printing" | "print_blocked" | "interrupted" | "printed" | "print_failed"; refundStatus?: string | null } | null = null;
     const printingRow = (printingRows as KioskDisplayJobRow[])[0];
     if (printingRow?.ticket_number != null) {
-      current = { ticketNumber: printingRow.ticket_number, status: printingRow.status as "printing" | "print_blocked" };
+      current = { ticketNumber: printingRow.ticket_number, status: printingRow.status as "printing" | "print_blocked" | "interrupted" };
     } else {
-      // Nothing actively printing — check whether the most recent finish is
-      // still within the settle window, so the screen doesn't flip straight
-      // to "upcoming only" the instant CUPS reports the job done.
       const settleCutoff = new Date(Date.now() - SETTLE_WINDOW_SECONDS * 1000).toISOString();
-      const { data: printedRows, error: printedError } = await supabase
+      const { data: settledRows, error: settledError } = await supabase
         .from("print_jobs")
-        .select("ticket_number, status, updated_at")
+        .select("ticket_number, status, updated_at, refund_status")
         .eq("kiosk_id", kioskId)
-        .eq("status", "printed")
+        .in("status", ["printed", "print_failed"])
         .gte("updated_at", settleCutoff)
         .order("updated_at", { ascending: false })
         .limit(1);
-      if (printedError) throw new Error(`Could not load recently-printed job: ${printedError.message}`);
-      const printedRow = (printedRows as KioskDisplayJobRow[])[0];
-      if (printedRow?.ticket_number != null) {
-        current = { ticketNumber: printedRow.ticket_number, status: "printed" };
+      if (settledError) throw new Error(`Could not load recently-settled job: ${settledError.message}`);
+      const settledRow = (settledRows as KioskDisplayJobRow[])[0];
+      if (settledRow?.ticket_number != null) {
+        current = {
+          ticketNumber: settledRow.ticket_number,
+          status: settledRow.status as "printed" | "print_failed",
+          refundStatus: settledRow.status === "print_failed" ? settledRow.refund_status : undefined,
+        };
       }
     }
 
@@ -79,7 +87,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
       .filter((row) => row.ticket_number != null)
       .map((row) => ({ ticketNumber: row.ticket_number as number }));
 
-    return jsonNoStore({ current, upcoming });
+    const trayClearedAt = await getKioskTrayClearedAt(kioskId);
+    const trayCount = await countUncollectedPrintedJobs(kioskId, trayClearedAt);
+
+    return jsonNoStore({ current, upcoming, trayCount });
   } catch (error) {
     console.error("kiosk-display error:", error);
     return jsonNoStore(

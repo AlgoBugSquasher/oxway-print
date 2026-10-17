@@ -3,6 +3,7 @@ const STYLES: Record<string, string> = {
   paid: "bg-blue-100 text-blue-700",
   printing: "bg-blue-100 text-blue-700",
   print_blocked: "bg-orange-100 text-orange-700",
+  interrupted: "bg-rose-100 text-rose-700",
   printed: "bg-emerald-100 text-emerald-700",
   print_failed: "bg-red-100 text-red-700",
   payment_failed: "bg-red-100 text-red-700",

@@ -29,6 +29,7 @@ interface StaffPrintRequestBody {
   settings?: unknown;
   kioskId?: unknown;
   idempotencyKey?: unknown;
+  forceCoverSheet?: unknown;
 }
 
 /**
@@ -81,6 +82,7 @@ export async function POST(request: Request) {
     // retry of its own request; createStaffPrintJob/the RPC handle a null
     // key fine (see lib/store.ts's own CreateStaffPrintJobInput comment).
     const idempotencyKey = typeof body.idempotencyKey === "string" && body.idempotencyKey ? body.idempotencyKey : null;
+    const forceCoverSheet = body.forceCoverSheet === true;
 
     if (!pdfStoragePath) return jsonError("Missing uploaded file reference.");
     tempUploadPath = pdfStoragePath;
@@ -160,6 +162,7 @@ export async function POST(request: Request) {
         idempotencyKey,
         createdByUserId: user.id,
         dailyCap: MAX_STAFF_DAILY_PAGES,
+        forceCoverSheet,
       });
     } catch (createError) {
       // The daily-cap rejection (createStaffPrintJob's RPC raises a

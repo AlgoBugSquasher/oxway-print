@@ -16,7 +16,16 @@ export function reportClientError(stage: string, error: unknown, meta?: Record<s
   const stack = error instanceof Error ? error.stack : undefined;
 
   console.error(`[${stage}]`, error, meta);
+  sendClientLog(stage, message, stack, meta);
+}
 
+/** Same pipe as reportClientError, for a diagnostic event that isn't itself an error (e.g. "checkout opened, here's the environment") — see lib/in-app-browser.ts's own caller for why this exists (Goal 4: UPI missing on some phones). Never personal or payment data. */
+export function reportClientDiagnostic(stage: string, meta?: Record<string, unknown>): void {
+  console.log(`[${stage}]`, meta);
+  sendClientLog(stage, undefined, undefined, meta);
+}
+
+function sendClientLog(stage: string, message: string | undefined, stack: string | undefined, meta: Record<string, unknown> | undefined): void {
   try {
     const payload = JSON.stringify({
       stage,

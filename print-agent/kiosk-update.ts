@@ -106,31 +106,57 @@ async function runRestart(command: KioskCommandRecord): Promise<void> {
 }
 
 /**
- * Fast-forward-only pull of UPDATE_BRANCH (this Pi's own env config, never
- * the command row — see lib/config.ts's UPDATE_BRANCH comment) + npm
- * install. Either step failing rolls back to the commit recorded before
- * anything was touched and keeps running the current, already-loaded old
- * code (no restart needed — the files are back to matching what's already
- * in memory). Only once BOTH steps succeed does this write the verification
+ * fetch + hard-reset to UPDATE_BRANCH (this Pi's own env config, never the
+ * command row — see lib/config.ts's UPDATE_BRANCH comment), then `npm ci`.
+ *
+ * Deliberately `git reset --hard origin/<branch>`, not `git pull` /
+ * `git merge --ff-only`: a plain `npm install` on a previous update can
+ * rewrite package-lock.json on disk (a new "resolved"/"integrity" line, a
+ * reordered entry — nothing a human edited, but still a real local diff),
+ * and that's enough for Git to refuse a pull with "your local changes to
+ * package-lock.json would be overwritten" — the bug this replaces. A hard
+ * reset to the remote branch's tip has no such merge step, so a dirty
+ * package-lock.json (or any other tracked file) is simply discarded in
+ * favor of upstream, every time, deterministically. `git reset --hard`
+ * only ever touches tracked files — it never deletes untracked ones, so
+ * .env.local and anything else gitignored survives untouched. `git clean`
+ * is never called anywhere in this file for exactly that reason.
+ *
+ * `npm ci` instead of `npm install`: ci installs exactly what
+ * package-lock.json says and never writes to it, so the file this Pi just
+ * reset to match upstream stays byte-for-byte what's in Git — the next
+ * update's own reset can never find it dirty again. It also deletes
+ * node_modules first and fails outright on any lockfile/package.json
+ * mismatch, which is exactly "if it fails, treat the update as failed."
+ *
+ * Either step failing rolls back to the commit recorded before anything
+ * was touched and keeps running the current, already-loaded old code (no
+ * restart needed — the files are back to matching what's already in
+ * memory). Only once BOTH steps succeed does this write the verification
  * marker and restart — see print-agent/boot-guard.ts for what happens next.
  */
 async function runUpdate(command: KioskCommandRecord): Promise<void> {
   const previousCommit = getCurrentCommit();
 
   const fetchResult = run("git", ["fetch", "origin", UPDATE_BRANCH]);
-  const pullResult = fetchResult.ok
-    ? run("git", ["merge", "--ff-only", `origin/${UPDATE_BRANCH}`])
-    : fetchResult;
-  if (!pullResult.ok) {
-    await reportOutcome(command.id, "failed", `git pull failed: ${pullResult.error}`);
+  if (!fetchResult.ok) {
+    await reportOutcome(command.id, "failed", `git fetch failed: ${fetchResult.error}`);
     return;
   }
 
-  const installResult = run("npm", ["install"]);
+  const resetResult = run("git", ["reset", "--hard", `origin/${UPDATE_BRANCH}`]);
+  if (!resetResult.ok) {
+    // Nothing was actually moved — still on previousCommit — so there's
+    // nothing to roll back here, unlike the npm ci failure below.
+    await reportOutcome(command.id, "failed", `git reset --hard origin/${UPDATE_BRANCH} failed: ${resetResult.error}`);
+    return;
+  }
+
+  const installResult = run("npm", ["ci"]);
   if (!installResult.ok) {
     run("git", ["reset", "--hard", previousCommit]);
-    run("npm", ["install"]); // Best-effort restore of node_modules to match the reverted commit; its own failure is logged but not fatal here.
-    await reportOutcome(command.id, "failed", `npm install failed after pulling the update — rolled back to ${shortCommit(previousCommit)}: ${installResult.error}`);
+    run("npm", ["ci"]); // Best-effort restore of node_modules to match the reverted commit; its own failure is logged but not fatal here.
+    await reportOutcome(command.id, "failed", `npm ci failed after updating — rolled back to ${shortCommit(previousCommit)}: ${installResult.error}`);
     return;
   }
 
@@ -138,6 +164,6 @@ async function runUpdate(command: KioskCommandRecord): Promise<void> {
   // it actually runs — leave the command "running" (not "done" yet) and let
   // the post-restart boot sequence confirm or roll back and finalize it.
   writeUpdateMarker({ commandId: command.id, previousCommit, status: "verifying" });
-  console.log(`[print-agent] Pulled and installed the latest ${UPDATE_BRANCH} (${shortCommit(getCurrentCommit())}) — restarting to verify it comes up cleanly...`);
+  console.log(`[print-agent] Updated to the latest ${UPDATE_BRANCH} (${shortCommit(getCurrentCommit())}) — restarting to verify it comes up cleanly...`);
   process.exit(0);
 }

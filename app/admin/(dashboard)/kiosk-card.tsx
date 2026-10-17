@@ -1,10 +1,10 @@
 "use client";
 
 import { type FormEvent, useCallback, useEffect, useState, useSyncExternalStore } from "react";
-import { AlertTriangle, Download, MessageCircle, Pencil, RefreshCw, RotateCw, Save, WifiOff } from "lucide-react";
-import { recordRefill, requestKioskCommand, updateKioskCounters, updateKioskWhatsappAvailability } from "@/lib/admin/actions";
+import { AlertTriangle, Bell, Download, MessageCircle, Pencil, RefreshCw, RotateCw, Save, WifiOff } from "lucide-react";
+import { clearKioskTray, recordRefill, requestKioskCommand, sendTestAlert, updateKioskAlertSettings, updateKioskCounters, updateKioskSeparatorSettings, updateKioskWhatsappAvailability } from "@/lib/admin/actions";
 import { computePaperEstimate, computeTonerEstimate, type SupplyEstimate } from "@/lib/admin/supply-estimate";
-import type { AdminKioskCommandRow, AdminKioskRow, RefillEventRow, SupplyStatusRow } from "@/lib/admin/types";
+import type { AdminKioskCommandRow, AdminKioskRow, KioskAlertSettingsRow, RefillEventRow, SupplyStatusRow } from "@/lib/admin/types";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 
 // Mirrors lib/config.ts's KIOSK_SILENT_THRESHOLD_MINUTES — kept as a plain
@@ -68,6 +68,7 @@ export default function KioskCard({
   const [isEditing, setIsEditing] = useState(false);
   const [trayMaxPages, setTrayMaxPages] = useState(String(kiosk.tray_max_pages));
   const [cartridgeMaxPages, setCartridgeMaxPages] = useState(String(kiosk.cartridge_max_pages));
+  const [lowSupplyThresholdPercent, setLowSupplyThresholdPercent] = useState(String(kiosk.low_supply_threshold_percent));
   const [allowColor, setAllowColor] = useState(kiosk.allow_color);
   const [allowBw, setAllowBw] = useState(kiosk.allow_bw);
   const [isSaving, setIsSaving] = useState(false);
@@ -77,6 +78,50 @@ export default function KioskCard({
   const [allowWhatsapp, setAllowWhatsapp] = useState(kiosk.allow_whatsapp);
   const [isSavingWhatsapp, setIsSavingWhatsapp] = useState(false);
   const [whatsappError, setWhatsappError] = useState("");
+
+  const [isEditingSeparator, setIsEditingSeparator] = useState(false);
+  const [separatorMode, setSeparatorMode] = useState(kiosk.separator_mode);
+  const [recentJobMinutes, setRecentJobMinutes] = useState(String(kiosk.recent_job_minutes));
+  const [laterHoldHours, setLaterHoldHours] = useState(String(kiosk.later_hold_hours));
+  const [largeJobPages, setLargeJobPages] = useState(String(kiosk.large_job_pages));
+  const [isSavingSeparator, setIsSavingSeparator] = useState(false);
+  const [separatorError, setSeparatorError] = useState("");
+  const [isClearingTray, setIsClearingTray] = useState(false);
+  const [trayError, setTrayError] = useState("");
+
+  const handleSaveSeparator = async (event: FormEvent) => {
+    event.preventDefault();
+    setSeparatorError("");
+    setIsSavingSeparator(true);
+    try {
+      await updateKioskSeparatorSettings({
+        kioskId: kiosk.id,
+        separatorMode,
+        recentJobMinutes: Number(recentJobMinutes),
+        laterHoldHours: Number(laterHoldHours),
+        largeJobPages: Number(largeJobPages),
+      });
+      setIsEditingSeparator(false);
+      onChanged();
+    } catch (err) {
+      setSeparatorError(err instanceof Error ? err.message : "Could not update separator settings.");
+    } finally {
+      setIsSavingSeparator(false);
+    }
+  };
+
+  const handleClearTray = async () => {
+    setTrayError("");
+    setIsClearingTray(true);
+    try {
+      await clearKioskTray(kiosk.id);
+      onChanged();
+    } catch (err) {
+      setTrayError(err instanceof Error ? err.message : "Could not clear the tray.");
+    } finally {
+      setIsClearingTray(false);
+    }
+  };
 
   // Problem 2 — supply estimates now come from get_kiosk_supply_status (a
   // baseline set by a refill event, consumption summed since it), never
@@ -124,11 +169,63 @@ export default function KioskCard({
   }, [kiosk.id, kiosk.updated_at]);
 
   const paperEstimate: SupplyEstimate = supplyStatus
-    ? computePaperEstimate(supplyStatus)
+    ? computePaperEstimate(supplyStatus, kiosk.low_supply_threshold_percent)
     : { status: "not_set_up", remaining: null, percent: null, lastRefillAt: null, lastRefillByUserId: null };
   const tonerEstimate: SupplyEstimate = supplyStatus
-    ? computeTonerEstimate(supplyStatus)
+    ? computeTonerEstimate(supplyStatus, kiosk.low_supply_threshold_percent)
     : { status: "not_set_up", remaining: null, percent: null, lastRefillAt: null, lastRefillByUserId: null };
+
+  const [alertSettings, setAlertSettings] = useState<KioskAlertSettingsRow | null>(null);
+  const [isEditingAlerts, setIsEditingAlerts] = useState(false);
+  const [telegramChatId, setTelegramChatId] = useState("");
+  const [isSavingAlerts, setIsSavingAlerts] = useState(false);
+  const [alertSettingsError, setAlertSettingsError] = useState("");
+  const [testAlertStatus, setTestAlertStatus] = useState("");
+  const [isSendingTestAlert, setIsSendingTestAlert] = useState(false);
+
+  useEffect(() => {
+    if (!isOwner) return;
+    let active = true;
+    const supabase = createSupabaseBrowserClient();
+    supabase.from("kiosk_alert_settings").select("*").eq("kiosk_id", kiosk.id).maybeSingle().then(({ data }) => {
+      if (!active) return;
+      const row = data as KioskAlertSettingsRow | null;
+      setAlertSettings(row);
+      setTelegramChatId(row?.telegram_chat_id ?? "");
+    });
+    return () => {
+      active = false;
+    };
+  }, [isOwner, kiosk.id]);
+
+  const handleSaveAlertSettings = async (event: FormEvent) => {
+    event.preventDefault();
+    setAlertSettingsError("");
+    setIsSavingAlerts(true);
+    try {
+      await updateKioskAlertSettings(kiosk.id, telegramChatId.trim());
+      setAlertSettings({ kiosk_id: kiosk.id, telegram_chat_id: telegramChatId.trim() || null });
+      setIsEditingAlerts(false);
+    } catch (err) {
+      setAlertSettingsError(err instanceof Error ? err.message : "Could not save alert settings.");
+    } finally {
+      setIsSavingAlerts(false);
+    }
+  };
+
+  const handleSendTestAlert = async () => {
+    setTestAlertStatus("Sending…");
+    setIsSendingTestAlert(true);
+    try {
+      const { results } = await sendTestAlert(kiosk.id);
+      const summary = results.map((r) => `${r.channel}: ${r.ok ? "sent" : `failed (${r.error ?? "unknown error"})`}`).join(", ");
+      setTestAlertStatus(summary);
+    } catch (err) {
+      setTestAlertStatus(err instanceof Error ? err.message : "Could not send test alert.");
+    } finally {
+      setIsSendingTestAlert(false);
+    }
+  };
 
   // "Paper refilled"/"Toner replaced" and "Set current paper level"/"Set
   // cartridge page count" are the exact same action (record_refill) — only
@@ -235,7 +332,7 @@ export default function KioskCard({
   // run in declaration order, the second effect's stale cleanup would fire
   // *after* the first effect's fresh update on the very same render,
   // silently resetting busy back to false while still mid-edit.
-  const isBusy = isEditing || isSaving || isSavingWhatsapp || requestingCommand !== null || paperFormOpen || tonerFormOpen;
+  const isBusy = isEditing || isSaving || isSavingWhatsapp || requestingCommand !== null || paperFormOpen || tonerFormOpen || isEditingAlerts || isSavingAlerts;
   useEffect(() => {
     onBusyChange(isBusy);
     return () => onBusyChange(false);
@@ -313,6 +410,7 @@ export default function KioskCard({
         cartridgeMaxPages: Number(cartridgeMaxPages),
         allowColor,
         allowBw,
+        lowSupplyThresholdPercent: Number(lowSupplyThresholdPercent),
       });
       setIsEditing(false);
       onChanged();
@@ -492,6 +590,7 @@ export default function KioskCard({
         <form onSubmit={handleSave} className="space-y-3">
           <CounterField label="Tray capacity (sheets)" value={trayMaxPages} onChange={setTrayMaxPages} />
           <CounterField label="Cartridge yield (pages)" value={cartridgeMaxPages} onChange={setCartridgeMaxPages} />
+          <CounterField label="Low-supply alert threshold (% remaining)" value={lowSupplyThresholdPercent} onChange={setLowSupplyThresholdPercent} />
           <div>
             <span className="mb-1 block text-[11px] font-bold text-slate-500">Available to customers</span>
             <div className="flex gap-4">
@@ -512,6 +611,90 @@ export default function KioskCard({
             <button type="button" onClick={() => setIsEditing(false)} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100">Cancel</button>
           </div>
         </form>
+      )}
+
+      <div className="mt-4 border-t border-slate-100 pt-3">
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-[11px] font-bold text-slate-500">Separators &amp; tray</p>
+          <button onClick={() => setIsEditingSeparator((value) => !value)} className="text-[11px] font-bold text-blue-600 hover:text-blue-500">
+            {isEditingSeparator ? "Close" : "Edit"}
+          </button>
+        </div>
+
+        {!isEditingSeparator ? (
+          <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-500">
+            <span>Separator mode: <span className="font-bold text-slate-700">{kiosk.separator_mode}</span></span>
+            <button onClick={handleClearTray} disabled={isClearingTray} className="rounded-lg border border-slate-200 px-2.5 py-1 font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50">
+              {isClearingTray ? "Clearing…" : "Tray cleared"}
+            </button>
+            {kiosk.tray_cleared_at && <span>Last cleared {new Date(kiosk.tray_cleared_at).toLocaleString("en-IN")}</span>}
+          </div>
+        ) : (
+          <form onSubmit={handleSaveSeparator} className="space-y-2">
+            <div>
+              <span className="mb-1 block text-[11px] font-bold text-slate-500">Separator mode</span>
+              <div className="flex gap-2">
+                {(["auto", "always", "never"] as const).map((mode) => (
+                  <button key={mode} type="button" onClick={() => setSeparatorMode(mode)} className={`rounded-lg border px-2.5 py-1 text-xs font-bold capitalize ${separatorMode === mode ? "border-blue-500 bg-blue-500/10 text-blue-600" : "border-slate-200 text-slate-600"}`}>
+                    {mode}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <CounterField label="Recent-job window (minutes)" value={recentJobMinutes} onChange={setRecentJobMinutes} />
+            <CounterField label="Later-pickup hold (hours)" value={laterHoldHours} onChange={setLaterHoldHours} />
+            <CounterField label="Large-job threshold (sheets)" value={largeJobPages} onChange={setLargeJobPages} />
+            {separatorError && <p className="text-xs font-medium text-red-500">{separatorError}</p>}
+            <div className="flex gap-2">
+              <button type="submit" disabled={isSavingSeparator} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-blue-500 disabled:opacity-50">
+                {isSavingSeparator ? <RefreshCw size={12} className="animate-spin" /> : <Save size={12} />} Save
+              </button>
+              <button type="button" onClick={() => setIsEditingSeparator(false)} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100">Cancel</button>
+            </div>
+          </form>
+        )}
+        {trayError && <p className="mt-1 text-xs font-medium text-red-500">{trayError}</p>}
+      </div>
+
+      {isOwner && (
+        <div className="mt-4 border-t border-slate-100 pt-3">
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-[11px] font-bold text-slate-500">Alerts</p>
+            <button onClick={() => setIsEditingAlerts((value) => !value)} className="text-[11px] font-bold text-blue-600 hover:text-blue-500">
+              {isEditingAlerts ? "Close" : "Edit"}
+            </button>
+          </div>
+
+          {!isEditingAlerts ? (
+            <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-500">
+              <span>Telegram: <span className="font-bold text-slate-700">{alertSettings?.telegram_chat_id ? "configured" : "not set"}</span></span>
+              <button onClick={() => void handleSendTestAlert()} disabled={isSendingTestAlert} className="flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1 font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50">
+                <Bell size={11} /> {isSendingTestAlert ? "Sending…" : "Send test alert"}
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handleSaveAlertSettings} className="space-y-2">
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-bold text-slate-500">Telegram chat id</span>
+                <input
+                  type="text"
+                  placeholder="e.g. -1001234567890"
+                  value={telegramChatId}
+                  onChange={(event) => setTelegramChatId(event.target.value)}
+                  className="w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs outline-none focus:border-blue-500"
+                />
+              </label>
+              {alertSettingsError && <p className="text-xs font-medium text-red-500">{alertSettingsError}</p>}
+              <div className="flex gap-2">
+                <button type="submit" disabled={isSavingAlerts} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-blue-500 disabled:opacity-50">
+                  {isSavingAlerts ? <RefreshCw size={12} className="animate-spin" /> : <Save size={12} />} Save
+                </button>
+                <button type="button" onClick={() => setIsEditingAlerts(false)} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100">Cancel</button>
+              </div>
+            </form>
+          )}
+          {testAlertStatus && <p className="mt-1.5 text-[11px] text-slate-500">{testAlertStatus}</p>}
+        </div>
       )}
     </div>
   );

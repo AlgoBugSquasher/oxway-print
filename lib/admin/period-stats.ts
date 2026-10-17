@@ -18,6 +18,10 @@ export interface PeriodTotals {
   freePrintCount: number;
   freePrintPages: number;
   freePrintWaivedAmount: number | null;
+  reprintCount: number;
+  reprintPages: number;
+  separatorsPrinted: number;
+  coversPrinted: number;
 }
 
 /**
@@ -39,6 +43,10 @@ export function summarizePeriodBreakdown(rows: PeriodBreakdownRow[]): PeriodTota
     freePrintCount: rows.reduce((sum, row) => sum + row.free_print_count, 0),
     freePrintPages: rows.reduce((sum, row) => sum + row.free_print_pages, 0),
     freePrintWaivedAmount: moneyKnown ? rows.reduce((sum, row) => sum + (row.free_print_waived_amount ?? 0), 0) : null,
+    reprintCount: rows.reduce((sum, row) => sum + row.reprint_count, 0),
+    reprintPages: rows.reduce((sum, row) => sum + row.reprint_pages, 0),
+    separatorsPrinted: rows.reduce((sum, row) => sum + row.separators_printed, 0),
+    coversPrinted: rows.reduce((sum, row) => sum + row.covers_printed, 0),
   };
 }
 

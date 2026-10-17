@@ -47,6 +47,8 @@ export interface FileBasketItem {
   selectedPages: number[];
   /** The converted, print-ready PDF bytes — null until status is "ready". */
   pdfBytes: Uint8Array | null;
+  /** Non-empty only for a converted .docx with a reported conversion problem (mammoth's own warnings, or a wildly-off page-count estimate) — see lib/client-file-converter.ts's docxToPdf. Always empty for a PDF/image. */
+  conversionWarnings: string[];
 }
 
 /** Same per-file ceiling the kiosk has always had — matches MAX_UPLOAD_FILE_SIZE_BYTES in lib/config.ts (server-side, re-checked there against the actual uploaded bytes). */
@@ -86,11 +88,12 @@ function makeConvertingItem(file: File): FileBasketItem {
     previewUrl: isBrowserPreviewableImage(file) ? URL.createObjectURL(file) : "",
     selectedPages: [],
     pdfBytes: null,
+    conversionWarnings: [],
   };
 }
 
 function makeErrorItem(file: File, error: string): FileBasketItem {
-  return { id: makeId(), file, status: "error", error, totalPages: 0, thumbnails: [], previewUrl: "", selectedPages: [], pdfBytes: null };
+  return { id: makeId(), file, status: "error", error, totalPages: 0, thumbnails: [], previewUrl: "", selectedPages: [], pdfBytes: null, conversionWarnings: [] };
 }
 
 /** Friendlier messages for the two pdf.js failure modes worth telling apart from a generic "couldn't read this file" — both confirmed exported from pdfjs-dist's own public API, not assumed. */
@@ -104,6 +107,7 @@ interface ConversionResult {
   totalPages: number;
   thumbnails: BasketPageThumbnail[];
   pdfBytes: Uint8Array;
+  conversionWarnings: string[];
 }
 type ConversionOutcome = { ok: true; result: ConversionResult } | { ok: false; error: string };
 
@@ -129,7 +133,7 @@ async function convertOneFile(file: File, layout: Layout): Promise<ConversionOut
 
   try {
     stage = "convert";
-    const pdfBytes = await convertFileInBrowser(file, layout);
+    const { bytes: pdfBytes, warnings: conversionWarnings } = await convertFileInBrowser(file, layout);
     stage = "pdfjs-load";
     const pdf = await pdfjsLib.getDocument({ data: pdfBytes.slice() }).promise;
     const thumbnails: BasketPageThumbnail[] = [];
@@ -149,7 +153,7 @@ async function convertOneFile(file: File, layout: Layout): Promise<ConversionOut
       await page.render({ canvas, canvasContext: context, viewport }).promise;
       thumbnails.push({ pageNumber, dataUrl: canvas.toDataURL("image/jpeg", 0.8) });
     }
-    return { ok: true, result: { totalPages: pdf.numPages, thumbnails, pdfBytes } };
+    return { ok: true, result: { totalPages: pdf.numPages, thumbnails, pdfBytes, conversionWarnings } };
   } catch (loadError) {
     reportClientError(`basket-upload-failed:${stage}`, loadError, fileMeta);
     // pdf.js itself (getDocument/getPage/render) is the one stage whose
@@ -243,6 +247,7 @@ export function useFileBasket({ layout, enabled }: UseFileBasketOptions): UseFil
           totalPages: outcome.result.totalPages,
           thumbnails: outcome.result.thumbnails,
           pdfBytes: outcome.result.pdfBytes,
+          conversionWarnings: outcome.result.conversionWarnings,
           selectedPages: Array.from({ length: outcome.result.totalPages }, (_, index) => index + 1),
         };
       }));

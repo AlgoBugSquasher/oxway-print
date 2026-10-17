@@ -143,11 +143,11 @@ describe("recordCompletedPrint", () => {
   // from revenue, tracked in their own running counters instead, still
   // counted toward physical paper/toner consumption like any other print.
   describe("isFree", () => {
-    it("bumps free_print_* instead of total_revenue, using `amount` as the waived value", async () => {
+    it("bumps free_print_* instead of total_revenue, using `waivedAmount` as the waived value", async () => {
       seedKiosk("oxway_01", { total_revenue: 50, free_print_count: 2, free_print_pages: 8, free_print_waived_amount: 16 });
       const { recordCompletedPrint } = await import("./kiosk-stats");
 
-      await recordCompletedPrint("oxway_01", { pagesPrinted: 3, amount: 6, colorMode: false, isFree: true });
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 3, amount: 0, waivedAmount: 6, colorMode: false, isFree: true });
 
       const patch = mock.updateCalls[0].patch;
       expect(patch.total_revenue).toBeUndefined(); // never touched for a free print
@@ -168,24 +168,47 @@ describe("recordCompletedPrint", () => {
       expect(patch.total_lifetime_prints).toBe(24);
     });
 
-    it("skips the print_orders revenue-history insert entirely for a free print", async () => {
+    it("still inserts into print_orders for a free print, but flagged is_free with a null amount and the waived_amount set — the durable ledger get_kiosk_period_breakdown reads has to know about it even though it's not revenue", async () => {
       seedKiosk("oxway_01");
       const { recordCompletedPrint } = await import("./kiosk-stats");
 
-      await recordCompletedPrint("oxway_01", { pagesPrinted: 1, amount: 2, colorMode: false, isFree: true });
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 1, amount: 0, waivedAmount: 2, colorMode: false, isFree: true });
 
-      expect(mock.printOrdersInsertCalls).toHaveLength(0);
+      expect(mock.printOrdersInsertCalls).toHaveLength(1);
+      const row = mock.printOrdersInsertCalls[0];
+      expect(row.is_free).toBe(true);
+      expect(row.amount).toBe(0);
+      expect(row.waived_amount).toBe(2);
     });
 
-    it("still inserts into print_orders for a normal (non-free) print — the existing behavior is unchanged", async () => {
+    it("inserts into print_orders for a normal (non-free) print with is_free/is_reprint false and no waived_amount", async () => {
       seedKiosk("oxway_01");
       const { recordCompletedPrint } = await import("./kiosk-stats");
 
       await recordCompletedPrint("oxway_01", { pagesPrinted: 1, amount: 2, colorMode: false });
 
       expect(mock.printOrdersInsertCalls).toHaveLength(1);
+      const row = mock.printOrdersInsertCalls[0];
+      expect(row.is_free).toBe(false);
+      expect(row.is_reprint).toBe(false);
+      expect(row.waived_amount).toBeNull();
       const patch = mock.updateCalls[0].patch;
       expect(patch.total_revenue).toBe(2);
+      expect(patch.free_print_count).toBeUndefined();
+    });
+
+    it("inserts into print_orders for a reprint flagged is_reprint, with amount 0 and no revenue/free-print bookkeeping", async () => {
+      seedKiosk("oxway_01", { total_revenue: 50, free_print_count: 1 });
+      const { recordCompletedPrint } = await import("./kiosk-stats");
+
+      await recordCompletedPrint("oxway_01", { pagesPrinted: 2, amount: 0, colorMode: false, isReprint: true });
+
+      expect(mock.printOrdersInsertCalls).toHaveLength(1);
+      const row = mock.printOrdersInsertCalls[0];
+      expect(row.is_reprint).toBe(true);
+      expect(row.amount).toBe(0);
+      const patch = mock.updateCalls[0].patch;
+      expect(patch.total_revenue).toBeUndefined();
       expect(patch.free_print_count).toBeUndefined();
     });
   });

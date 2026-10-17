@@ -64,18 +64,22 @@ export async function submitPrintJob(filePath: string, settings: PrintSettingsSn
 }
 
 /**
- * Cancels a submitted job in CUPS — called whenever a job transitions to
- * print_failed (see failJob in print-agent/index.ts), so a stuck or errored
- * job can never later get physically printed once whatever blocked it
- * clears (e.g. a disabled queue getting re-enabled), well after the
- * customer's already been auto-refunded for it. That exact gap — a refund
- * issued while the job sat live in CUPS's queue, then printed anyway once
- * the queue came back — is a confirmed real bug this closes.
+ * Cancels a submitted job in CUPS — called only from the final,
+ * unrecoverable path (see finalizeFailure in print-agent/index.ts), never
+ * for a merely print_blocked job (see CupsJobQueueState below: a
+ * RECOVERABLE problem is deliberately left alone, live in CUPS, so the
+ * SAME buffered job can finish on its own once it's ready — cancelling it
+ * is exactly the bug that used to let a job end up both failed and
+ * printed). This still matters for a genuinely unrecoverable job (a jam,
+ * an explicit abort, or the ordinary stuck-job timeout): without
+ * cancelling it, it could still sit live in CUPS and get physically
+ * printed later (e.g. a disabled queue getting re-enabled), well after
+ * it's already been marked print_failed and sent to the refund-pending
+ * queue for an owner to review.
  *
  * Best-effort: if the job already finished or was already removed by the
  * time this runs, `cancel` exits non-zero — fine, there's nothing left to
- * cancel, not a reason to leave the job print_failed/refunded without ever
- * marking that in the DB.
+ * cancel, not a reason to leave the job's own print_failed status unset.
  */
 export async function cancelPrintJob(cupsJobId: string): Promise<void> {
   try {
@@ -307,6 +311,49 @@ export async function getCupsJobQueueState(cupsJobId: string): Promise<CupsJobQu
   }
 
   return (await isPrinterIdle(destination)) ? { kind: "completed" } : { kind: "active" };
+}
+
+/**
+ * A DELIBERATELY DIFFERENT question from getCupsJobQueueState above: not
+ * "what is this job doing right now" but "does CUPS have ANY memory of
+ * this job id at all, anywhere" — used only once, at print-agent boot
+ * (print-agent/index.ts's reconcileInFlightJobsOnBoot), to tell a job the
+ * agent can safely reattach to from one CUPS has genuinely forgotten.
+ *
+ * getCupsJobQueueState's own fallback ("not found in the active list, not
+ * found in the completed-history list either -> report 'active' anyway")
+ * is the right call DURING a watch loop, where that gap is almost always
+ * just CUPS moving the job between its own two internal lists for a tick
+ * — but it is the WRONG call at boot, where there's no prior successful
+ * poll to compare against, so that same "not found anywhere" result is
+ * genuinely ambiguous between "brief gap" and "CUPS has no idea." This
+ * function returns the bare fact instead of guessing, so the caller can
+ * make its OWN restart-specific decision (reattach vs. mark interrupted).
+ *
+ * RELIABILITY NOTE (restart-specific — see getCupsJobQueueState's own note
+ * above for the separate, per-job classification-text reliability
+ * question): CUPS persists its own active-job spool to disk and reloads it
+ * on cupsd's own startup, so a job that was genuinely still
+ * printing/pending when the Pi rebooted USUALLY survives even a full
+ * system restart, not just a bare node-process restart — this has not been
+ * independently verified against a real cupsd restart on this exact
+ * Samsung ML-1866W setup, though, so treat that as a reasonable
+ * expectation, not a guarantee. The one real, acknowledged gap: CUPS's own
+ * completed-job history has a size/age limit it controls (MaxJobs /
+ * PreserveJobHistory), not this app — if the print agent is down long
+ * enough that a job which ACTUALLY finished successfully rotates out of
+ * that history before this check ever runs, this function will
+ * (incorrectly) report false, and that job gets marked 'interrupted' even
+ * though it printed fine. This is an accepted limitation, not a silent
+ * bug: 'interrupted' never fails the job, never triggers a refund, and
+ * never auto-reprints (see JobStatus's own comment in lib/store.ts) — the
+ * worst outcome is an owner has to glance at a job that actually printed
+ * fine, never a double print or an unwarranted refund.
+ */
+export async function isCupsJobKnown(cupsJobId: string): Promise<boolean> {
+  const destination = cupsJobId.slice(0, cupsJobId.lastIndexOf("-"));
+  if (extractJobBlock(await lpstatLongLines(["-o", destination]), cupsJobId)) return true;
+  return extractJobBlock(await lpstatLongLines(["-W", "completed", "-o", destination]), cupsJobId) !== null;
 }
 
 /** The exact substring that matched, lowercased, for a readable reason string (e.g. "media-empty") — falls back to the generic label if somehow nothing matches after classification already said it would (defensive only; should never actually happen). */

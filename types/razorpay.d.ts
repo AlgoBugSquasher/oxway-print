@@ -18,8 +18,19 @@ declare global {
     modal?: { ondismiss?: () => void };
   }
 
+  interface RazorpayPaymentFailedEvent {
+    error: {
+      code: string;
+      description: string;
+      source?: string;
+      step?: string;
+      reason?: string;
+    };
+  }
+
   interface RazorpayInstance {
     open: () => void;
+    on: (event: "payment.failed", handler: (response: RazorpayPaymentFailedEvent) => void) => void;
   }
 
   interface Window {

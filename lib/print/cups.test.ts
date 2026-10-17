@@ -46,7 +46,7 @@ const mockExecFile = vi.hoisted(() => {
 
 vi.mock("node:child_process", () => ({ execFile: mockExecFile.fn }));
 
-import { buildLpArgs, classifyPrinterProblemText, getCupsJobQueueState, isPrinterAcceptingNewJobs } from "./cups";
+import { buildLpArgs, classifyPrinterProblemText, getCupsJobQueueState, isCupsJobKnown, isPrinterAcceptingNewJobs } from "./cups";
 
 beforeEach(() => {
   mockExecFile.queue.length = 0;
@@ -249,6 +249,38 @@ describe("getCupsJobQueueState", () => {
       const secondPoll = await getCupsJobQueueState(cupsJobId);
       expect(secondPoll).toEqual({ kind: "completed" });
     });
+  });
+});
+
+// Requirement #7: "interrupted detection after restart" — isCupsJobKnown is
+// the deliberately narrow "does CUPS have ANY memory of this job at all"
+// check print-agent/index.ts's reconcileInFlightJobsOnBoot uses, distinct
+// from getCupsJobQueueState's own richer, boot-INappropriate "not found
+// anywhere -> active" fallback (see that function's own reliability note).
+describe("isCupsJobKnown", () => {
+  const cupsJobId = "Samsung_ML_1865_Series-42";
+
+  it("true when the job is still in the active queue", async () => {
+    mockExecFile.queue.push({ stdout: `${cupsJobId} owner 1024 queued for printing\n` });
+    await expect(isCupsJobKnown(cupsJobId)).resolves.toBe(true);
+  });
+
+  it("true when the job is only in CUPS's completed-job history (it finished, or errored, before the restart)", async () => {
+    mockExecFile.queue.push({ stdout: "" }); // not active
+    mockExecFile.queue.push({ stdout: `${cupsJobId} owner 1024 completed\n` });
+    await expect(isCupsJobKnown(cupsJobId)).resolves.toBe(true);
+  });
+
+  it("false when the job is in neither list — CUPS has genuinely forgotten it", async () => {
+    mockExecFile.queue.push({ stdout: "" });
+    mockExecFile.queue.push({ stdout: "" });
+    await expect(isCupsJobKnown(cupsJobId)).resolves.toBe(false);
+  });
+
+  it("never confuses a job id that's a PREFIX of another job's id, same word-boundary guard as getCupsJobQueueState", async () => {
+    mockExecFile.queue.push({ stdout: "Samsung_ML_1865_Series-10 owner 1024 queued for printing\n" });
+    mockExecFile.queue.push({ stdout: "" });
+    await expect(isCupsJobKnown("Samsung_ML_1865_Series-1")).resolves.toBe(false);
   });
 });
 

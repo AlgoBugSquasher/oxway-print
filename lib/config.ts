@@ -120,6 +120,9 @@ export const STAFF_PRINT_RATE_LIMIT_WINDOW_SECONDS = 60;
 export const LOGIN_RATE_LIMIT_MAX = 10;
 export const LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60;
 
+export const COLLECT_JOB_RATE_LIMIT_MAX = 10;
+export const COLLECT_JOB_RATE_LIMIT_WINDOW_SECONDS = 60;
+
 /**
  * Heartbeat monitoring (ROADMAP.md #8). Writes to kiosk_status.last_seen_at,
  * a dedicated column separate from updated_at (which also moves on every
@@ -183,3 +186,16 @@ export const AGENT_API_SECRET = process.env.AGENT_API_SECRET || "";
  * point a kiosk at an arbitrary ref. See print-agent/kiosk-update.ts.
  */
 export const UPDATE_BRANCH = process.env.UPDATE_BRANCH || "main";
+
+/**
+ * Non-WhatsApp alert channels (low-supply, kiosk-offline) — see lib/alerts/.
+ * Both optional: a channel with no token/key configured just skips itself
+ * (logged once via console.warn, same fail-open convention as
+ * OWNER_ALERT_PHONE above), never throws.
+ */
+export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+export const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+export const ALERT_FROM_EMAIL = process.env.ALERT_FROM_EMAIL || "alerts@oxway.app";
+
+/** Hours between repeat reminders for a still-unresolved alert — see lib/alerts/index.ts's evaluateAlert. */
+export const ALERT_REMINDER_HOURS = 6;
