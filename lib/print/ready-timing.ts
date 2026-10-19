@@ -22,10 +22,10 @@ export const READY_TIMING_CONFIG = {
    * How long a RECOVERABLE printer problem (out of paper, door open, low
    * toner, offline — see lib/print/cups.ts's classification) is tolerated
    * before a job is finally marked print_failed. Deliberately generous and
-   * separate from the normal "stuck" deadline (print-agent/index.ts's
-   * QUEUE_POLL_TIMEOUT_MS, a couple of minutes) — that one assumes
-   * something is genuinely wedged; this one assumes a person needs to
-   * notice the kiosk and physically go fix it, which can reasonably take a
+   * separate from the normal "stuck" deadline (computeStuckJobDeadlineMs
+   * below) — that one assumes something is genuinely wedged; this one
+   * assumes a person needs to notice the kiosk and physically go fix it,
+   * which can reasonably take a
    * while on an unattended machine. 30 minutes: long enough for "nobody's
    * standing next to it right now," short enough that a job that's
    * genuinely never coming back still resolves (and its refund queues up)
@@ -33,6 +33,32 @@ export const READY_TIMING_CONFIG = {
    */
   blockedRetryLimitSeconds: 30 * 60,
 } as const;
+
+/**
+ * The "genuinely stuck" deadline — the outer ceiling on a job's whole time
+ * from spool to print, regardless of page count. One flat 2-hour window,
+ * not scaled per page: at this kiosk's own page limit (300 sheets,
+ * lib/config.ts's MAX_UPLOAD_PAGE_COUNT), the minimum-print-time floor
+ * above (computeMinimumReadyAtMs) only ever needs on the order of 20
+ * minutes — 2 hours clears that with enormous room to spare for any job
+ * this kiosk can actually accept, so there's no need for a per-page
+ * formula to avoid the original bug (a job that printed completely but
+ * got marked print_failed because a fixed, too-SHORT timeout didn't scale
+ * with page count). Once this deadline passes, the job is stuck for real.
+ */
+export const STUCK_JOB_TIMEOUT_HOURS = 2;
+
+/**
+ * Anchored to `spooledAtMs` (when this job was actually submitted to CUPS),
+ * never to "now" — so a print-agent restart that reattaches to an
+ * in-progress job (print-agent/index.ts's reconcileInFlightJobsOnBoot)
+ * computes the exact same deadline a fresh, never-restarted watch of the
+ * same job would have, rather than quietly granting it a fresh full
+ * timeout window from the moment of the restart.
+ */
+export function computeStuckJobDeadlineMs(spooledAtMs: number): number {
+  return spooledAtMs + STUCK_JOB_TIMEOUT_HOURS * 60 * 60 * 1000;
+}
 
 /**
  * True if the printer had been sitting idle long enough before this job

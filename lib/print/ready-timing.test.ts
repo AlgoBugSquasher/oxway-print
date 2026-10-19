@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { READY_TIMING_CONFIG, computeMinimumReadyAtMs, decidePrintWatchOutcome, needsWarmup } from "./ready-timing";
+import { READY_TIMING_CONFIG, STUCK_JOB_TIMEOUT_HOURS, computeMinimumReadyAtMs, computeStuckJobDeadlineMs, decidePrintWatchOutcome, needsWarmup } from "./ready-timing";
 
 describe("needsWarmup", () => {
   it("needs warmup when the agent has never finished a job before (null — just restarted)", () => {
@@ -38,6 +38,45 @@ describe("computeMinimumReadyAtMs", () => {
   it("scales with more sheets (more copies/pages means a later floor)", () => {
     const spooledAtMs = 1_000_000;
     expect(computeMinimumReadyAtMs(spooledAtMs, 10, false)).toBeGreaterThan(computeMinimumReadyAtMs(spooledAtMs, 1, false));
+  });
+});
+
+// Bug this guards against: a 60-page job printed completely but got marked
+// print_failed anyway, because the old stuck-job deadline was one fixed
+// constant (2 minutes) regardless of page count — a long job's own
+// minimum-print-time floor (computeMinimumReadyAtMs) could legitimately
+// need longer than that, so it timed out before CUPS ever got a chance to
+// report anything wrong. The fix is a single flat 2-hour ceiling, generous
+// enough to always clear the floor at any page count this kiosk accepts,
+// rather than a per-page formula.
+describe("computeStuckJobDeadlineMs", () => {
+  it("equals spooledAtMs + STUCK_JOB_TIMEOUT_HOURS, exactly", () => {
+    const spooledAtMs = 1_000_000;
+    expect(computeStuckJobDeadlineMs(spooledAtMs)).toBe(spooledAtMs + STUCK_JOB_TIMEOUT_HOURS * 60 * 60 * 1000);
+  });
+
+  it("for a long (60-page) job, the flat deadline comfortably clears the job's own minimum-print-time floor — the exact bug this fixes", () => {
+    const spooledAtMs = 1_000_000;
+    const floor = computeMinimumReadyAtMs(spooledAtMs, 60, true);
+    expect(computeStuckJobDeadlineMs(spooledAtMs)).toBeGreaterThan(floor);
+  });
+
+  it("clears the floor with margin for page counts from 1 to 300 (the kiosk's own max), not just one lucky value", () => {
+    const spooledAtMs = 1_000_000;
+    const deadline = computeStuckJobDeadlineMs(spooledAtMs);
+    for (const physicalSheets of [1, 2, 10, 60, 150, 300]) {
+      const floor = computeMinimumReadyAtMs(spooledAtMs, physicalSheets, true);
+      expect(deadline).toBeGreaterThan(floor);
+    }
+  });
+
+  it("is anchored to spooledAtMs, not to when it happens to be called — so a print-agent restart reattaching to an in-progress job computes the exact same deadline a fresh watch of the same job would", () => {
+    const spooledAtMs = 1_000_000;
+    const freshDeadline = computeStuckJobDeadlineMs(spooledAtMs);
+    // Simulates calling this again much later (e.g. after a restart) with
+    // the SAME original spooledAtMs — must be identical, not extended.
+    const reattachedDeadline = computeStuckJobDeadlineMs(spooledAtMs);
+    expect(reattachedDeadline).toBe(freshDeadline);
   });
 });
 

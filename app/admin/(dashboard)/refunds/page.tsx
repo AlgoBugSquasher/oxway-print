@@ -1,27 +1,39 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { AlertTriangle, Check, IndianRupee, RefreshCw, ShieldAlert, X } from "lucide-react";
-import { requestRefunds } from "@/lib/admin/actions";
+import { AlertTriangle, Check, IndianRupee, Printer, RefreshCw, ShieldAlert, X } from "lucide-react";
+import { markJobsPrintedNoRefundNeeded, requestRefunds } from "@/lib/admin/actions";
 import { useAdminRole } from "@/lib/admin/role-context";
 import { useAutoRefresh } from "@/lib/hooks/useAutoRefresh";
-import type { AdminJobRow, RefundRouteResultItem } from "@/lib/admin/types";
+import type { AdminJobRow, MarkPrintedResultItem, RefundRouteResultItem } from "@/lib/admin/types";
 import { createSupabaseBrowserClient } from "@/lib/supabase";
 import { formatTicketCode } from "@/lib/ticket-code";
+import ConfirmActionModal, { type ConfirmActionReasonOption } from "../confirm-action-modal";
 import LiveIndicator from "../live-indicator";
+
+/** Options for the "Printed fine — no refund needed" confirmation's required reason field. */
+const MARK_PRINTED_REASONS: ConfirmActionReasonOption[] = [
+  { value: "confirmed_at_tray", label: "Confirmed printed — found it at the tray" },
+  { value: "cups_shows_completed", label: "CUPS/printer history shows it completed" },
+  { value: "customer_confirmed", label: "Customer confirmed they received it" },
+  { value: "other", label: "Other (see audit log for context)" },
+];
 
 /**
  * Owner-only approval queue for refunds — print-agent/index.ts no longer
  * refunds a failed job automatically; this is now the ONLY place any job's
  * refund actually gets approved and sent to the payment gateway (see
- * lib/refund.ts's attemptRefund). Lists every job whose refund_status is
- * 'pending' (never reviewed yet) or 'failed' (a previous attempt failed —
- * shown here specifically so an owner can retry it), oldest request first.
- * A row currently 'processing' (someone else's request mid-flight, or this
- * same page's own submission still running) simply isn't selectable —
- * clicking it would be refused by the server's own atomic claim anyway
- * (see claim_refund_for_processing's own comment), this just avoids
- * offering a button that would only ever fail.
+ * lib/refund.ts's attemptRefund). Lists every print_failed job that hasn't
+ * been resolved yet: refund_status 'pending' (never reviewed yet) or
+ * 'failed' (a previous refund attempt failed, shown so an owner can retry
+ * it), AND a print_failed job with NO refund_status at all — a free staff
+ * print or a reprint that failed, which never gets a refund_status (see
+ * set_print_job_refund_pending's own trigger) but still deserves a look
+ * (there's nothing to refund, only the "Printed fine" corrective action
+ * applies). A row currently 'processing' (someone else's request mid-
+ * flight, or this same page's own submission still running) simply isn't
+ * selectable — clicking it would be refused by the server's own atomic
+ * claim anyway.
  */
 export default function AdminRefundsPage() {
   const role = useAdminRole();
@@ -35,21 +47,26 @@ export default function AdminRefundsPage() {
   // story going forward). Lets a bulk submission show "6 succeeded, 2
   // failed" with the two failures named, rather than nothing at all once
   // the list re-fetches and the 6 successes simply vanish from it.
-  const [lastResults, setLastResults] = useState<Map<string, RefundRouteResultItem>>(new Map());
+  const [lastResults, setLastResults] = useState<Map<string, RefundRouteResultItem | MarkPrintedResultItem>>(new Map());
+  // Which confirmation pop-up is open, if any, and for which job(s) — null
+  // means no pop-up is showing. "kind" distinguishes the two destructive
+  // actions this page offers, since they share one ConfirmActionModal.
+  const [pendingAction, setPendingAction] = useState<{ kind: "refund" | "mark_printed"; jobIds: string[] } | null>(null);
 
   const fetchData = useCallback(async () => {
     const supabase = createSupabaseBrowserClient();
     const { data, error: queryError } = await supabase
       .from("print_jobs_admin_view")
       .select("*")
-      .in("refund_status", ["pending", "failed"])
+      .eq("status", "print_failed")
+      .or("refund_status.is.null,refund_status.eq.pending,refund_status.eq.failed")
       .order("refund_requested_at", { ascending: true });
     if (queryError) throw new Error(queryError.message);
     const nextRows = (data as AdminJobRow[]) ?? [];
     setRows(nextRows);
     // Drop a selection for any job that's no longer in the actionable list
-    // (it resolved to 'refunded', or has since been reprinted) — never
-    // leave a stale checkbox checked for a row that's disappeared.
+    // (it resolved to 'refunded'/'not_needed', or has since been reprinted)
+    // — never leave a stale checkbox checked for a row that's disappeared.
     const stillPresent = new Set(nextRows.map((row) => row.id));
     setSelectedIds((current) => new Set([...current].filter((id) => stillPresent.has(id))));
   }, []);
@@ -63,7 +80,11 @@ export default function AdminRefundsPage() {
   const isLoading = isRefreshing && lastUpdatedAt === null;
 
   const selectedRows = useMemo(() => rows.filter((row) => selectedIds.has(row.id)), [rows, selectedIds]);
-  const selectedTotal = useMemo(() => selectedRows.reduce((sum, row) => sum + Number(row.total_price ?? 0), 0), [selectedRows]);
+  // Only a job that genuinely HAS a refund_status of pending/failed can be
+  // refunded — a free staff print / reprint failure (refund_status null)
+  // has nothing to refund, only "Printed fine" applies to it.
+  const refundableSelectedRows = useMemo(() => selectedRows.filter((row) => row.refund_status === "pending" || row.refund_status === "failed"), [selectedRows]);
+  const refundableSelectedTotal = useMemo(() => refundableSelectedRows.reduce((sum, row) => sum + Number(row.total_price ?? 0), 0), [refundableSelectedRows]);
 
   const toggleRow = (jobId: string) => {
     setSelectedIds((current) => {
@@ -78,10 +99,6 @@ export default function AdminRefundsPage() {
     setSelectedIds((current) => (current.size === rows.length ? new Set() : new Set(rows.map((row) => row.id))));
   };
 
-  // Shared by both the single-row "Refund" button (jobIds.length === 1) and
-  // "Refund selected" — the server treats them identically (see
-  // app/api/admin/refund/route.ts), this just drives the UI state around
-  // the one call.
   const submitRefunds = async (jobIds: string[]) => {
     setSubmitError("");
     setIsSubmitting(true);
@@ -98,6 +115,7 @@ export default function AdminRefundsPage() {
       // with nothing further to re-pick.
       const failedIds = new Set(results.filter((r) => !r.ok).map((r) => r.jobId));
       setSelectedIds(failedIds);
+      setPendingAction(null);
       await refreshNow();
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Could not process the refund.");
@@ -106,29 +124,42 @@ export default function AdminRefundsPage() {
     }
   };
 
-  const handleRefundOne = (row: AdminJobRow) => {
-    if (!window.confirm(`Refund ₹${Number(row.total_price ?? 0).toFixed(2)} for "${row.file_name}" through ${row.provider}, at normal speed (5-7 business days)? This can't be undone from here.`)) {
-      return;
+  const submitMarkPrinted = async (jobIds: string[], reason?: string) => {
+    if (!reason) return; // Confirm button is disabled until a reason is chosen — defensive only.
+    setSubmitError("");
+    setIsSubmitting(true);
+    try {
+      const results = await markJobsPrintedNoRefundNeeded(jobIds, reason);
+      setLastResults((current) => {
+        const next = new Map(current);
+        for (const result of results) next.set(result.jobId, result);
+        return next;
+      });
+      const failedIds = new Set(results.filter((r) => !r.ok).map((r) => r.jobId));
+      setSelectedIds(failedIds);
+      setPendingAction(null);
+      await refreshNow();
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Could not mark this job printed.");
+    } finally {
+      setIsSubmitting(false);
     }
-    void submitRefunds([row.id]);
   };
 
-  const handleRefundSelected = () => {
-    if (selectedRows.length === 0) return;
-    if (!window.confirm(`Refund ${selectedRows.length} selected job${selectedRows.length === 1 ? "" : "s"}, totalling ₹${selectedTotal.toFixed(2)}, at normal speed (5-7 business days)? This can't be undone from here.`)) {
-      return;
-    }
-    void submitRefunds(selectedRows.map((row) => row.id));
-  };
+  const openRefundConfirm = (jobIds: string[]) => jobIds.length > 0 && setPendingAction({ kind: "refund", jobIds });
+  const openMarkPrintedConfirm = (jobIds: string[]) => jobIds.length > 0 && setPendingAction({ kind: "mark_printed", jobIds });
 
   if (role !== "owner") {
     return (
       <div className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-5 text-amber-800">
         <ShieldAlert size={18} />
-        <p className="text-sm font-semibold">Refunds are owner-only. Even if this page loaded, every refund_* field is masked to null for staff, and the server refuses any refund request that isn&apos;t from a signed-in owner.</p>
+        <p className="text-sm font-semibold">Refunds are owner-only. Even if this page loaded, every refund_* field is masked to null for staff, and the server refuses any refund or printed-correction request that isn&apos;t from a signed-in owner.</p>
       </div>
     );
   }
+
+  const pendingRows = pendingAction ? rows.filter((row) => pendingAction.jobIds.includes(row.id)) : [];
+  const pendingTotal = pendingRows.reduce((sum, row) => sum + Number(row.total_price ?? 0), 0);
 
   return (
     <div className="space-y-6">
@@ -149,14 +180,23 @@ export default function AdminRefundsPage() {
             <input type="checkbox" checked={selectedIds.size === rows.length && rows.length > 0} onChange={toggleSelectAll} className="size-4 accent-blue-600" />
             Select all ({rows.length})
           </label>
-          <button
-            onClick={handleRefundSelected}
-            disabled={selectedRows.length === 0 || isSubmitting}
-            className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-black text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {isSubmitting ? <RefreshCw className="animate-spin" size={15} /> : <IndianRupee size={15} />}
-            Refund selected ({selectedRows.length}, total &#8377;{selectedTotal.toFixed(2)})
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => openMarkPrintedConfirm(selectedRows.map((row) => row.id))}
+              disabled={selectedRows.length === 0 || isSubmitting}
+              className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm font-black text-emerald-700 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Printer size={15} /> Printed fine — no refund needed ({selectedRows.length})
+            </button>
+            <button
+              onClick={() => openRefundConfirm(refundableSelectedRows.map((row) => row.id))}
+              disabled={refundableSelectedRows.length === 0 || isSubmitting}
+              className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-black text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isSubmitting ? <RefreshCw className="animate-spin" size={15} /> : <IndianRupee size={15} />}
+              Refund selected ({refundableSelectedRows.length}, total &#8377;{refundableSelectedTotal.toFixed(2)})
+            </button>
+          </div>
         </div>
       )}
 
@@ -164,6 +204,8 @@ export default function AdminRefundsPage() {
         {rows.map((row) => {
           const result = lastResults.get(row.id);
           const isProcessing = row.refund_status === "processing";
+          const isRefundable = row.refund_status === "pending" || row.refund_status === "failed";
+          const cupsReportedCompleted = row.failure_evidence?.cupsState === "completed";
           return (
             <div key={row.id} className={`rounded-2xl border p-4 ${result && !result.ok ? "border-red-200 bg-red-50" : result?.ok ? "border-emerald-200 bg-emerald-50" : "border-slate-200 bg-white"}`}>
               <div className="flex flex-wrap items-start justify-between gap-3">
@@ -178,35 +220,81 @@ export default function AdminRefundsPage() {
                   <div>
                     <p className="font-bold text-blue-600">{row.ticket_number != null ? formatTicketCode(row.ticket_number) : "—"} <span className="text-slate-400">&middot;</span> <span className="text-slate-700">{row.file_name}</span></p>
                     <p className="mt-1 text-xs text-slate-500">
-                      &#8377;{Number(row.total_price ?? 0).toFixed(2)} via {row.provider} &middot; failed {row.refund_requested_at ? new Date(row.refund_requested_at).toLocaleString("en-IN") : new Date(row.created_at).toLocaleString("en-IN")}
+                      {isRefundable ? <>&#8377;{Number(row.total_price ?? 0).toFixed(2)} via {row.provider} &middot; </> : null}
+                      failed {row.refund_requested_at ? new Date(row.refund_requested_at).toLocaleString("en-IN") : new Date(row.created_at).toLocaleString("en-IN")}
                     </p>
+                    {/* Requirement: "show the failure reason next to each job" */}
                     {row.error && <p className="mt-1 text-xs text-slate-500">Failure reason: {row.error}</p>}
+                    {cupsReportedCompleted && (
+                      <p className="mt-1 flex items-center gap-1 text-xs font-bold text-amber-700">
+                        <AlertTriangle size={12} /> CUPS reported this job as completed — it likely printed fine.
+                      </p>
+                    )}
                     {row.refund_status === "failed" && row.refund_error && (
                       <p className="mt-1 flex items-center gap-1 text-xs font-medium text-red-600"><AlertTriangle size={12} /> Last refund attempt failed: {row.refund_error}</p>
                     )}
+                    {!row.refund_status && <p className="mt-1 text-xs text-slate-400">Free staff print / reprint — nothing to refund, only &quot;Printed fine&quot; applies.</p>}
                     {isProcessing && <p className="mt-1 text-xs font-medium text-blue-600">A refund for this job is already being processed.</p>}
                   </div>
                 </div>
-                <button
-                  onClick={() => handleRefundOne(row)}
-                  disabled={isProcessing || isSubmitting}
-                  className="flex items-center gap-1.5 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 transition hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <IndianRupee size={12} /> Refund
-                </button>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <button
+                    onClick={() => openMarkPrintedConfirm([row.id])}
+                    disabled={isProcessing || isSubmitting}
+                    className="flex items-center gap-1.5 rounded-full border border-emerald-200 px-3 py-1.5 text-xs font-bold text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Printer size={12} /> Printed fine
+                  </button>
+                  {isRefundable && (
+                    <button
+                      onClick={() => openRefundConfirm([row.id])}
+                      disabled={isProcessing || isSubmitting}
+                      className="flex items-center gap-1.5 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600 transition hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <IndianRupee size={12} /> Refund
+                    </button>
+                  )}
+                </div>
               </div>
               {result && (
                 <p className={`mt-2 flex items-center gap-1.5 text-xs font-bold ${result.ok ? "text-emerald-700" : "text-red-600"}`}>
                   {result.ok ? <Check size={13} /> : <X size={13} />}
-                  {result.ok ? "Refunded." : result.error}
+                  {result.ok ? "Done." : result.error}
                 </p>
               )}
             </div>
           );
         })}
-        {!isLoading && rows.length === 0 && <p className="rounded-2xl border border-slate-200 bg-white p-6 text-center text-sm text-slate-500">No refunds waiting on approval.</p>}
+        {!isLoading && rows.length === 0 && <p className="rounded-2xl border border-slate-200 bg-white p-6 text-center text-sm text-slate-500">No failed jobs waiting on review.</p>}
         {isLoading && <p className="flex items-center gap-2 text-sm text-slate-500"><RefreshCw size={14} className="animate-spin" /> Loading...</p>}
       </div>
+
+      {pendingAction && pendingAction.kind === "refund" && (
+        <ConfirmActionModal
+          title="Confirm refund"
+          description={`Refund ${pendingRows.length} job${pendingRows.length === 1 ? "" : "s"} (₹${pendingTotal.toFixed(2)} total) at normal speed (5-7 business days)? This can't be undone from here.`}
+          confirmLabel={`Yes, refund ₹${pendingTotal.toFixed(2)}`}
+          confirmWord="REFUND"
+          bulkCount={pendingAction.jobIds.length}
+          isSubmitting={isSubmitting}
+          onConfirm={() => void submitRefunds(pendingAction.jobIds)}
+          onCancel={() => setPendingAction(null)}
+        />
+      )}
+
+      {pendingAction && pendingAction.kind === "mark_printed" && (
+        <ConfirmActionModal
+          title="Confirm — printed fine, no refund"
+          description={`Mark ${pendingRows.length} job${pendingRows.length === 1 ? "" : "s"} as printed and set its refund to "not needed"? Only do this once you've confirmed the document actually came out.`}
+          confirmLabel={`Yes, refuse refund of ₹${pendingTotal.toFixed(2)}`}
+          confirmWord="REFUSE"
+          bulkCount={pendingAction.jobIds.length}
+          reasonOptions={MARK_PRINTED_REASONS}
+          isSubmitting={isSubmitting}
+          onConfirm={(reason) => void submitMarkPrinted(pendingAction.jobIds, reason)}
+          onCancel={() => setPendingAction(null)}
+        />
+      )}
     </div>
   );
 }

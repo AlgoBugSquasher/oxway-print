@@ -1,6 +1,5 @@
 import { jsonNoStore } from "@/lib/api-response";
-import { ONLINE_THRESHOLD_SECONDS } from "@/lib/config";
-import { getKioskColorModes, getKioskLastSeenAt, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
+import { getKioskColorModes, getKioskLastSeenAt, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability, isKioskCurrentlyOnline } from "@/lib/kiosk-stats";
 import { getPricingConfig } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -40,15 +39,15 @@ export const dynamic = "force-dynamic";
 export async function GET(_request: Request, { params }: { params: Promise<{ kioskId: string }> }) {
   try {
     const { kioskId } = await params;
-    const [lastSeenAt, colorModes, updateState, whatsappAvailability, pricing, printBlockedState] = await Promise.all([
+    const [lastSeenAt, isOnline, colorModes, updateState, whatsappAvailability, pricing, printBlockedState] = await Promise.all([
       getKioskLastSeenAt(kioskId),
+      isKioskCurrentlyOnline(kioskId),
       getKioskColorModes(kioskId),
       getKioskUpdateState(kioskId),
       getKioskWhatsappAvailability(kioskId),
       getPricingConfig(),
       getKioskPrintBlockedState(kioskId),
     ]);
-    const isOnline = lastSeenAt !== null && Date.now() - new Date(lastSeenAt).getTime() < ONLINE_THRESHOLD_SECONDS * 1000;
 
     return jsonNoStore({
       isOnline,

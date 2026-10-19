@@ -181,6 +181,21 @@ create table print_jobs (
   force_cover_sheet boolean not null default false,
   sheet_kind text check (sheet_kind in ('none', 'separator', 'cover')),
 
+  -- The CUPS/elapsed-time evidence finalizeFailure (print-agent/index.ts)
+  -- saw at the moment it decided this job failed — the raw material behind
+  -- `error`'s own short message, kept separately since `error` is a plain
+  -- string shown to staff/owner as-is, while this is for admin job-detail
+  -- debugging (added 2026-10-23, see that migration's own comment for why).
+  failure_evidence jsonb,
+
+  -- Set the instant lib/store.ts's deleteJobPdfOnly removes just the
+  -- stored PDF for a print_failed job whose refund is still unresolved
+  -- after REFUND_PENDING_FILE_RETENTION_DAYS (lib/config.ts, added
+  -- 2026-10-24) — null means the file (if any) is still there. The job
+  -- row, total_price, and refund_status are never touched by this; only
+  -- Reprint stops being possible.
+  pdf_deleted_at timestamptz,
+
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -256,10 +271,20 @@ create table print_orders (
   is_free boolean not null default false,
   is_reprint boolean not null default false,
   waived_amount numeric,
-  sheet_kind text check (sheet_kind in ('none', 'separator', 'cover'))
+  sheet_kind text check (sheet_kind in ('none', 'separator', 'cover')),
+  -- Added 2026-10-23 — lets a row be traced back to its job (debugging,
+  -- and a defense-in-depth duplicate guard: the corrective action in
+  -- mark_job_printed_no_refund_needed below calls the same
+  -- recordCompletedPrint() a normal print already does, and this is what
+  -- stops that from ever double-inserting the same job's revenue if it
+  -- somehow ran twice). Null for every row written before this column
+  -- existed — never backfilled, since there's no reliable way to match an
+  -- old row back to a job after the fact.
+  job_id uuid
 );
 
 create index print_orders_kiosk_created_idx on print_orders (kiosk_id, created_at);
+create unique index print_orders_job_id_idx on print_orders (job_id) where job_id is not null;
 
 alter table print_orders enable row level security;
 -- Policy created in §9 below, after current_app_role() exists — a CREATE
@@ -312,6 +337,44 @@ create table print_failures (
 create index print_failures_kiosk_created_idx on print_failures (kiosk_id, created_at);
 
 alter table print_failures enable row level security;
+-- Policy created in §9 below, same reasoning as print_orders' own policy
+-- comment above.
+
+-- ============================================================================
+-- 2d. print_job_archive — a slim, PERMANENT record of every job that ever
+-- reached a terminal state (added 2026-10-24,
+-- supabase/migrations/2026-10-24_stuck_job_archive_and_pdf_retention.sql).
+-- Survives the full-row delete the cleanup cron does after
+-- TERMINAL_JOB_RETENTION_HOURS — see lib/store.ts's deleteJob, which
+-- writes one of these in the SAME pass it removes the job's row and
+-- Storage object. Carries only what's needed for a "what happened to job
+-- X" lookup months later: never the file name, phone number, or any
+-- uploaded content, so nothing personal outlives the job's own row.
+-- Never read by any revenue/stats function (get_kiosk_period_breakdown and
+-- friends already read print_orders/refund_events, not print_jobs) — this
+-- is a historical archive only, so it can never double-count or disturb
+-- an existing revenue figure.
+-- ============================================================================
+
+create table print_job_archive (
+  id uuid primary key,
+  kiosk_id text not null,
+  created_at timestamptz not null,
+  finished_at timestamptz,
+  status text not null,
+  pages integer,
+  copies integer,
+  color_mode boolean,
+  amount numeric,
+  refund_status text,
+  refund_provider_id text,
+  provider_order_id text,
+  archived_at timestamptz not null default now()
+);
+
+create index print_job_archive_kiosk_created_idx on print_job_archive (kiosk_id, created_at);
+
+alter table print_job_archive enable row level security;
 -- Policy created in §9 below, same reasoning as print_orders' own policy
 -- comment above.
 
@@ -1321,6 +1384,9 @@ for select using (public.current_app_role() = 'owner');
 create policy "Owner reads print_failures" on print_failures
 for select using (public.current_app_role() = 'owner');
 
+create policy "Owner reads print_job_archive" on print_job_archive
+for select using (public.current_app_role() = 'owner');
+
 create policy "Owner reads pricing" on pricing_config
 for select using (public.current_app_role() = 'owner');
 
@@ -1362,7 +1428,9 @@ select
   case when public.current_app_role() = 'owner' then refund_error else null end as refund_error,
   blocked_reason,
   interrupted_reason, interrupted_at, original_job_id, reprint_note,
-  pickup_mode, force_cover_sheet, sheet_kind, collected_via
+  pickup_mode, force_cover_sheet, sheet_kind, collected_via,
+  failure_evidence,
+  pdf_deleted_at
 from public.print_jobs;
 
 -- free_print_* are NOT masked for staff the way total_revenue is — waived
@@ -1759,6 +1827,97 @@ end;
 $$;
 
 grant execute on function public.fail_refund(uuid, text, uuid, text, text, text) to service_role;
+
+-- Corrective action (added 2026-10-23) for a job that actually printed
+-- (confirmed by an owner looking at it) but got marked print_failed anyway
+-- — e.g. the fixed-timeout bug, see lib/print/ready-timing.ts's
+-- STUCK_JOB_TIMEOUT_CONFIG. Does ONLY the authoritative print_jobs state
+-- flip here; the caller (app/api/admin/mark-printed) calls the SAME
+-- recordCompletedPrint (lib/kiosk-stats.ts) the print agent's own success
+-- path already uses for the revenue/print_orders/tray-cartridge bookkeeping
+-- this job missed the first time, rather than a second copy of that logic.
+-- The WHERE guard is the real enforcement, not the UI: status must still be
+-- 'print_failed', and refund_status must be neither 'refunded' (requirement:
+-- "impossible to use on a job that was already refunded") nor 'processing'
+-- (a gateway call is live right now).
+create or replace function public.mark_job_printed_no_refund_needed(
+  p_job_id uuid,
+  p_reason text,
+  p_actor_user_id uuid default null,
+  p_actor_role text default null,
+  p_ip text default null,
+  p_user_agent text default null
+)
+returns setof print_jobs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_before print_jobs;
+  v_updated_rows integer;
+begin
+  -- Owner-only, same as every other refund-adjacent action — this touches
+  -- refund_status and revenue, which staff can't even see (refund_status
+  -- is masked to null for staff everywhere else in this schema).
+  if public.current_app_role() <> 'owner' then
+    raise exception 'Not authorized.';
+  end if;
+  if p_reason is null or length(trim(p_reason)) = 0 then
+    raise exception 'A reason is required.';
+  end if;
+
+  select * into v_before from print_jobs where id = p_job_id;
+  if v_before.id is null then
+    raise exception 'Job not found.';
+  end if;
+  if v_before.status <> 'print_failed' then
+    raise exception 'This job is not currently marked print_failed (it is "%").', v_before.status;
+  end if;
+  if v_before.refund_status = 'refunded' then
+    raise exception 'This job has already been refunded — cannot mark it printed instead.';
+  end if;
+  if v_before.refund_status = 'processing' then
+    raise exception 'A refund for this job is currently being processed — try again once it resolves.';
+  end if;
+
+  -- Only a genuinely PAID customer job gets refund_status 'not_needed' —
+  -- a free staff print or a reprint never had one to begin with (the
+  -- set_print_job_refund_pending trigger never fires for either), and
+  -- stays null here too, exactly as if it had simply printed normally.
+  update print_jobs set
+    status = 'printed',
+    refund_status = case when v_before.is_free or v_before.original_job_id is not null then null else 'not_needed' end,
+    ready_at = coalesce(ready_at, now()),
+    updated_at = now()
+  where id = p_job_id and status = 'print_failed'
+    and coalesce(refund_status, '') not in ('refunded', 'processing');
+  get diagnostics v_updated_rows = row_count;
+
+  if v_updated_rows = 0 then
+    raise exception 'Could not update this job — it may have changed state just now. Please refresh and try again.';
+  end if;
+
+  perform public.log_audit(
+    p_action := 'job_marked_printed_no_refund',
+    p_actor_user_id := p_actor_user_id,
+    p_actor_role := p_actor_role,
+    p_target_type := 'print_job',
+    p_target_id := p_job_id::text,
+    p_details := jsonb_build_object(
+      'reason', p_reason,
+      'previous_error', v_before.error,
+      'previous_refund_status', v_before.refund_status
+    ),
+    p_ip := p_ip,
+    p_user_agent := p_user_agent
+  );
+
+  return query select * from print_jobs where id = p_job_id;
+end;
+$$;
+
+grant execute on function public.mark_job_printed_no_refund_needed(uuid, text, uuid, text, text, text) to service_role;
 
 -- One summary audit entry per bulk "Refund selected" click, separate from
 -- the per-job job_refunded/refund_failed entries complete_refund/

@@ -81,6 +81,21 @@ export const PRINT_AGENT_POLL_INTERVAL_MS = Number(process.env.PRINT_AGENT_POLL_
 export const TERMINAL_JOB_RETENTION_HOURS = 6;
 export const ABANDONED_JOB_RETENTION_HOURS = 24;
 
+/**
+ * A print_failed job with an unresolved refund (refund_status pending,
+ * processing, or failed) is held past TERMINAL_JOB_RETENTION_HOURS above
+ * indefinitely, by design — an owner might reasonably take days to review
+ * the Refunds queue. This separate, much longer limit bounds how long the
+ * STORED PDF (not the job row, not the refund record) can keep taking up
+ * Storage space while that review is pending: once this many days pass,
+ * the cleanup cron deletes just the file (lib/store.ts's
+ * listUnresolvedRefundJobsWithStaleFiles/deleteJobPdfOnly) and stamps
+ * print_jobs.pdf_deleted_at — the job, its total_price, and its
+ * refund_status all stay exactly as they were, so the Refunds page keeps
+ * working; only "Reprint pages" stops being possible for it.
+ */
+export const REFUND_PENDING_FILE_RETENTION_DAYS = 7;
+
 /** Basic abuse protection on /api/create-order (ROADMAP.md #13). Tunable — not prescribed by the roadmap. */
 export const CREATE_ORDER_RATE_LIMIT_MAX = 5;
 export const CREATE_ORDER_RATE_LIMIT_WINDOW_SECONDS = 60;
@@ -135,12 +150,16 @@ export const KIOSK_HEARTBEAT_INTERVAL_MS = 20_000;
 /** A kiosk silent longer than this is flagged stale for the owner-alert cron — generous enough to absorb a transient blip without a false alarm. */
 export const KIOSK_SILENT_THRESHOLD_MINUTES = 10;
 /**
- * How stale kiosk_status.last_seen_at can be before the customer-facing
- * website treats the kiosk as offline. 3x the heartbeat interval above —
- * enough to absorb one or two missed beats without flapping the banner on a
- * momentary network blip.
+ * How stale kiosk_status.last_seen_at can be before the kiosk is treated as
+ * offline — the ONE definition of "offline" for this whole app (the kiosk
+ * display's connectivity light, the customer page's "isn't reachable"
+ * banner and Pay-button gate, and the server-side payment-creation block in
+ * app/api/create-order all read this same value via
+ * lib/kiosk-stats.ts's isKioskCurrentlyOnline). ~4.5x the heartbeat
+ * interval above — comfortably more than one missed beat (every 20s) so a
+ * single dropped heartbeat never flips this on its own.
  */
-export const ONLINE_THRESHOLD_SECONDS = 60;
+export const ONLINE_THRESHOLD_SECONDS = 90;
 
 /** Where low-supply / kiosk-silent alerts (ROADMAP.md #8) go — the owner, not a customer. No real SMS/WhatsApp provider is wired yet (see lib/notify/console.ts), so this only matters once one is. */
 export const OWNER_ALERT_PHONE = process.env.OWNER_ALERT_PHONE || "";

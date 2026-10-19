@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { TEMP_UPLOAD_STALE_HOURS } from "@/lib/config";
-import { deleteJob, deleteStorageObject, listJobsEligibleForCleanup, listStaleTempUploads } from "@/lib/store";
+import { deleteJob, deleteJobPdfOnly, deleteStorageObject, listJobsEligibleForCleanup, listStaleTempUploads, listUnresolvedRefundJobsWithStaleFiles } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,6 +21,14 @@ export const dynamic = "force-dynamic";
  * nothing to find there — it only ever looks at rows, and an orphan was
  * never a row — so this half is deliberately age-based against the
  * Storage object's own created_at instead.
+ *
+ * And a third sweep: a print_failed job with an unresolved refund is held
+ * past TERMINAL_JOB_RETENTION_HOURS indefinitely by the first sweep above
+ * (the job, its refund record, and its total_price must survive until an
+ * owner actually reviews it) — but the stored PDF alone doesn't need to
+ * wait that long. Past REFUND_PENDING_FILE_RETENTION_DAYS, just the file
+ * is removed (lib/store.ts's deleteJobPdfOnly); the row and refund stay
+ * exactly as they were.
  */
 export async function GET(request: Request) {
   const cronSecret = process.env.CRON_SECRET;
@@ -42,7 +50,15 @@ export async function GET(request: Request) {
     const staleUploads = await listStaleTempUploads(TEMP_UPLOAD_STALE_HOURS * 60 * 60 * 1000);
     await Promise.allSettled(staleUploads.map((path) => deleteStorageObject(path)));
 
-    return NextResponse.json({ checked: eligibleJobs.length, deleted, failed, orphanedUploadsDeleted: staleUploads.length });
+    const staleRefundFiles = await listUnresolvedRefundJobsWithStaleFiles();
+    const pdfOnlyResults = await Promise.allSettled(staleRefundFiles.map((job) => deleteJobPdfOnly(job)));
+    const pdfOnlyDeleted = pdfOnlyResults.filter((result) => result.status === "fulfilled" && result.value).length;
+
+    return NextResponse.json({
+      checked: eligibleJobs.length, deleted, failed,
+      orphanedUploadsDeleted: staleUploads.length,
+      unresolvedRefundFilesChecked: staleRefundFiles.length, unresolvedRefundFilesDeleted: pdfOnlyDeleted,
+    });
   } catch (error) {
     console.error("cleanup-jobs error:", error);
     return NextResponse.json(

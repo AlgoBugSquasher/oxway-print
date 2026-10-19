@@ -27,6 +27,7 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   kiosk_command_finished: "Kiosk command finished",
   alert_sent: "Alert sent",
   alert_settings_updated: "Alert settings changed",
+  job_marked_printed_no_refund: "Refund refused — marked printed",
 };
 
 /** Every action name in display order, for the viewer's filter dropdown. */
@@ -94,6 +95,11 @@ export function summarizeAuditEntry(entry: AuditLogRow): string {
       const results = Array.isArray(details.results) ? (details.results as { channel?: string; ok?: boolean }[]) : [];
       const channels = results.map((r) => `${r.channel}${r.ok ? "" : " (failed)"}`).join(", ");
       return kind ? `${label}: ${kind}${channels ? ` via ${channels}` : ""}` : label;
+    }
+    case "job_marked_printed_no_refund": {
+      const reason = typeof details.reason === "string" ? details.reason : null;
+      const job = entry.target_id ? ` (job ${shortenId(entry.target_id)})` : "";
+      return reason ? `${label}${job}: ${reason}` : `${label}${job}`;
     }
     default:
       return label;

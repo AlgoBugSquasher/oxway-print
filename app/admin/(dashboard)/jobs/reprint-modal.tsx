@@ -32,8 +32,16 @@ import { formatTicketCode } from "@/lib/ticket-code";
  */
 export default function ReprintModal({ job, onClose, onDone }: { job: AdminJobRow; onClose: () => void; onDone: () => void }) {
   const basket = useFileBasket({ layout: job.settings.layout, enabled: true });
-  const [loadError, setLoadError] = useState("");
-  const [isLoadingFile, setIsLoadingFile] = useState(true);
+  // Requirement: "make the Reprint option explain [the file being gone]" —
+  // known client-side already (print_jobs_admin_view exposes
+  // pdf_deleted_at), computed once up front (this modal is remounted fresh
+  // per job it's opened for) so there's no doomed-to-fail fetch to even
+  // attempt, and no generic storage error to explain around.
+  const pdfDeletedExplanation = job.pdf_deleted_at
+    ? `The stored file was deleted on ${new Date(job.pdf_deleted_at).toLocaleDateString("en-IN")} — an unresolved refund sat for over 7 days, and the file is removed after that (the job and refund record are unaffected). This job can no longer be reprinted.`
+    : "";
+  const [loadError, setLoadError] = useState(pdfDeletedExplanation);
+  const [isLoadingFile, setIsLoadingFile] = useState(!job.pdf_deleted_at);
 
   const [pageMode, setPageMode] = useState<PageMode>("all");
   const [customRange, setCustomRange] = useState("");
@@ -51,6 +59,7 @@ export default function ReprintModal({ job, onClose, onDone }: { job: AdminJobRo
   // this effect genuinely only run once per job, with no lint suppression.
   const { addFiles } = basket;
   useEffect(() => {
+    if (job.pdf_deleted_at) return; // Already explained via the initial state above — nothing to fetch.
     let cancelled = false;
     (async () => {
       try {
@@ -69,7 +78,7 @@ export default function ReprintModal({ job, onClose, onDone }: { job: AdminJobRo
     return () => {
       cancelled = true;
     };
-  }, [job.id, addFiles]);
+  }, [job.id, job.pdf_deleted_at, addFiles]);
 
   const item = basket.items[0];
   const activePages = useMemo(() => (item ? itemActivePages(item, pageMode, customRange) : []), [item, pageMode, customRange]);

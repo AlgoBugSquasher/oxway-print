@@ -201,6 +201,19 @@ export default function AdminJobsPage() {
                   {/* Requirement: "Show the blocked reason ... on the job." */}
                   {job.status === "print_blocked" && job.blocked_reason && <p className="mt-1 text-[11px] text-orange-600">{job.blocked_reason}</p>}
                   {job.status === "interrupted" && job.interrupted_reason && <p className="mt-1 text-[11px] text-rose-600">{job.interrupted_reason}</p>}
+                  {/* Requirement: "store the actual failure reason and the evidence ... show it in the admin job detail." */}
+                  {job.status === "print_failed" && job.error && <p className="mt-1 text-[11px] text-red-600">{job.error}</p>}
+                  {job.status === "print_failed" && job.failure_evidence && (
+                    <p className="mt-1 text-[11px] text-slate-400">
+                      CUPS: {job.failure_evidence.cupsState}{job.failure_evidence.cupsReason ? ` (${job.failure_evidence.cupsReason})` : ""}
+                      {" · "}{Math.round(job.failure_evidence.elapsedMs / 1000)}s elapsed · {job.failure_evidence.physicalSheets} sheets
+                      {job.failure_evidence.cupsState === "completed" && <span className="ml-1 font-bold text-amber-600">— likely printed anyway</span>}
+                    </p>
+                  )}
+                  {/* Requirement: "Show in admin when the file is gone." Only the stored PDF was removed (an unresolved refund held past REFUND_PENDING_FILE_RETENTION_DAYS) — the job and its refund record are untouched. */}
+                  {job.pdf_deleted_at && (
+                    <p className="mt-1 text-[11px] font-bold text-slate-400">File deleted {new Date(job.pdf_deleted_at).toLocaleDateString("en-IN")} — can&apos;t be reprinted.</p>
+                  )}
                 </td>
                 <td className="px-4 py-3 text-slate-500">{job.phone_number}</td>
                 <td className="px-4 py-3 text-slate-500">{job.kiosk_id}</td>
@@ -239,6 +252,8 @@ export default function AdminJobsPage() {
                         label="Reprint"
                         pending={pendingJobId === job.id}
                         onClick={() => runAction(job.id, () => forceReprintJob(job.id))}
+                        disabled={Boolean(job.pdf_deleted_at)}
+                        title={job.pdf_deleted_at ? "The stored file was deleted after 7+ days with an unresolved refund — it can't be reprinted." : undefined}
                       />
                     )}
                     {/* Requirement #3: "Each job in the admin Jobs list gets
@@ -286,11 +301,12 @@ export default function AdminJobsPage() {
   );
 }
 
-function ActionButton({ icon: Icon, label, pending, onClick }: { icon: typeof Ban; label: string; pending: boolean; onClick: () => void }) {
+function ActionButton({ icon: Icon, label, pending, onClick, disabled, title }: { icon: typeof Ban; label: string; pending: boolean; onClick: () => void; disabled?: boolean; title?: string }) {
   return (
     <button
       onClick={onClick}
-      disabled={pending}
+      disabled={pending || disabled}
+      title={title}
       className="flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold text-slate-600 transition hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
     >
       {pending ? <RefreshCw size={11} className="animate-spin" /> : <Icon size={11} />} {label}

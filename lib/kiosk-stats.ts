@@ -3,7 +3,20 @@
 // already rendered in app/admin/(dashboard)/kiosk-card.tsx, which read
 // tray_pages/cartridge_pages independently of this notify pipe.
 // import { notifyLowSupply } from "./notify";
+import { ONLINE_THRESHOLD_SECONDS } from "./config";
 import { supabaseAdmin } from "./supabase-admin";
+
+/**
+ * THE one place "is this kiosk online" is decided — every other call site
+ * (app/api/kiosk-status/[kioskId], the kiosk display's connectivity hook,
+ * and app/api/create-order's own payment-creation gate) calls this instead
+ * of re-deriving the same last_seen_at-vs-threshold comparison itself, so
+ * there is exactly one definition of "offline" in the whole app.
+ */
+export async function isKioskCurrentlyOnline(kioskId: string): Promise<boolean> {
+  const lastSeenAt = await getKioskLastSeenAt(kioskId);
+  return lastSeenAt !== null && Date.now() - new Date(lastSeenAt).getTime() < ONLINE_THRESHOLD_SECONDS * 1000;
+}
 
 export interface CompletedPrintStats {
   pagesPrinted: number;
@@ -39,6 +52,8 @@ export interface CompletedPrintStats {
   isReprint?: boolean;
   /** Mirrors the job's own sheet_kind ('none'/'separator'/'cover') — kept on the durable print_orders ledger too since print_jobs rows get cleaned up after a few hours (see get_kiosk_period_breakdown's own comment in supabase/schema.sql). */
   sheetKind?: "none" | "separator" | "cover";
+  /** The job this completed print is for — lets the resulting print_orders row be traced back to it, and (via that table's own unique partial index on job_id) is a defense-in-depth guard against ever double-counting the same job's revenue if this is somehow called twice for it (see the admin "mark printed, no refund needed" corrective action, app/api/admin/mark-printed). Optional only because older call sites predate this field; omit it only if there's genuinely no job backing this print. */
+  jobId?: string;
 }
 
 export interface KioskCounters {
@@ -142,6 +157,7 @@ export async function recordCompletedPrint(kioskId: string, stats: CompletedPrin
       is_reprint: stats.isReprint ?? false,
       waived_amount: stats.isFree ? (stats.waivedAmount ?? 0) : null,
       sheet_kind: stats.sheetKind ?? "none",
+      job_id: stats.jobId ?? null,
     });
 
     const { data: kiosk, error } = await supabase

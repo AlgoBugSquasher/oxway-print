@@ -1,4 +1,6 @@
-import type { JobStatus, PrintSettingsSnapshot } from "../store";
+import type { FailureEvidence, JobStatus, PrintSettingsSnapshot } from "../store";
+
+export type { FailureEvidence };
 
 export type AdminRole = "owner" | "staff" | "none";
 
@@ -66,6 +68,10 @@ export interface AdminJobRow {
   original_job_id: string | null;
   /** Written on the ORIGINAL job the moment a reprint is created from it — e.g. "Reprinted pages 2 to 4 on 17 Oct 2026, 10:42 am." */
   reprint_note: string | null;
+  /** The CUPS/elapsed-time evidence finalizeFailure (print-agent/index.ts) saw at the moment it decided this job failed — raw material behind `error`'s own short message. Null for a job that's never failed, or failed before this column existed. */
+  failure_evidence: FailureEvidence | null;
+  /** Set once lib/store.ts's deleteJobPdfOnly removed the stored PDF for a print_failed job whose refund stayed unresolved past REFUND_PENDING_FILE_RETENTION_DAYS — null means the file (if any) is still there. "Reprint pages" can't work once this is set. */
+  pdf_deleted_at: string | null;
 }
 
 /** One job's own outcome from a refund request (single or bulk) — see app/api/admin/refund/route.ts. */
@@ -74,6 +80,14 @@ export interface RefundRouteResultItem {
   ok: boolean;
   refundId?: string;
   /** Already a clear, specific, customer-safe message — ready to show directly. */
+  error?: string;
+}
+
+/** One job's own outcome from a "mark printed, no refund needed" request (single or bulk) — see app/api/admin/mark-printed/route.ts. */
+export interface MarkPrintedResultItem {
+  jobId: string;
+  ok: boolean;
+  /** Already a clear, specific message — ready to show directly. */
   error?: string;
 }
 

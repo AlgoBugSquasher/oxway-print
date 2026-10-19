@@ -18,6 +18,7 @@ interface MockKioskRow {
   free_print_count: number;
   free_print_pages: number;
   free_print_waived_amount: number;
+  last_seen_at: string | null;
 }
 
 const mock = vi.hoisted(() => ({
@@ -41,6 +42,14 @@ vi.mock("./supabase-admin", () => ({
               mock.selectedIds.push(id);
               const row = mock.kioskRowsById.get(id);
               return Promise.resolve(row ? { data: row, error: null } : { data: null, error: { message: "not found" } });
+            },
+            // getKioskLastSeenAt (and other narrow single-column reads) use
+            // maybeSingle() instead of single() — same lookup, but missing
+            // is a valid `null` result, not an error.
+            maybeSingle: () => {
+              mock.selectedIds.push(id);
+              const row = mock.kioskRowsById.get(id);
+              return Promise.resolve({ data: row ?? null, error: null });
             },
           }),
         }),
@@ -66,6 +75,7 @@ function seedKiosk(id: string, overrides: Partial<MockKioskRow> = {}) {
     free_print_count: 0,
     free_print_pages: 0,
     free_print_waived_amount: 0,
+    last_seen_at: null,
     ...overrides,
   });
 }
@@ -211,5 +221,50 @@ describe("recordCompletedPrint", () => {
       expect(patch.total_revenue).toBeUndefined();
       expect(patch.free_print_count).toBeUndefined();
     });
+  });
+});
+
+// Goal: "nobody can pay while the kiosk is offline" — isKioskCurrentlyOnline
+// is the ONE place that decision is made (app/api/kiosk-status, the kiosk
+// display, and app/api/create-order's own payment gate all call this
+// instead of re-deriving the threshold comparison themselves).
+describe("isKioskCurrentlyOnline", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mock.kioskRowsById.clear();
+  });
+
+  it("is online when the heartbeat is comfortably fresh", async () => {
+    seedKiosk("oxway_01", { last_seen_at: new Date().toISOString() });
+    const { isKioskCurrentlyOnline } = await import("./kiosk-stats");
+    expect(await isKioskCurrentlyOnline("oxway_01")).toBe(true);
+  });
+
+  it("is offline once the heartbeat is older than ONLINE_THRESHOLD_SECONDS", async () => {
+    const { ONLINE_THRESHOLD_SECONDS } = await import("./config");
+    seedKiosk("oxway_01", { last_seen_at: new Date(Date.now() - (ONLINE_THRESHOLD_SECONDS + 5) * 1000).toISOString() });
+    const { isKioskCurrentlyOnline } = await import("./kiosk-stats");
+    expect(await isKioskCurrentlyOnline("oxway_01")).toBe(false);
+  });
+
+  it("a single missed heartbeat (one KIOSK_HEARTBEAT_INTERVAL_MS late) never flips this to offline on its own", async () => {
+    const { ONLINE_THRESHOLD_SECONDS, KIOSK_HEARTBEAT_INTERVAL_MS } = await import("./config");
+    // One missed beat means the gap since the last one is up to 2x the
+    // normal interval — the threshold must stay comfortably above that.
+    seedKiosk("oxway_01", { last_seen_at: new Date(Date.now() - 2 * KIOSK_HEARTBEAT_INTERVAL_MS).toISOString() });
+    expect(2 * KIOSK_HEARTBEAT_INTERVAL_MS).toBeLessThan(ONLINE_THRESHOLD_SECONDS * 1000);
+    const { isKioskCurrentlyOnline } = await import("./kiosk-stats");
+    expect(await isKioskCurrentlyOnline("oxway_01")).toBe(true);
+  });
+
+  it("is offline when the kiosk has never sent a heartbeat at all", async () => {
+    seedKiosk("oxway_01", { last_seen_at: null });
+    const { isKioskCurrentlyOnline } = await import("./kiosk-stats");
+    expect(await isKioskCurrentlyOnline("oxway_01")).toBe(false);
+  });
+
+  it("is offline for a kiosk id with no kiosk_status row at all", async () => {
+    const { isKioskCurrentlyOnline } = await import("./kiosk-stats");
+    expect(await isKioskCurrentlyOnline("no_such_kiosk")).toBe(false);
   });
 });

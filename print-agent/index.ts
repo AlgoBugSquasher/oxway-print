@@ -35,12 +35,12 @@ import { enrichJobWithRazorpayPaymentDetails } from "../lib/payment-reconciliati
 import { prependBannerPage } from "../lib/print/banner";
 import { cancelPrintJob, getCupsJobQueueState, isCupsJobKnown, isPrinterAcceptingNewJobs, submitPrintJob } from "../lib/print/cups";
 import { expandCopies } from "../lib/print/pdf";
-import { computeMinimumReadyAtMs, decidePrintWatchOutcome, needsWarmup, READY_TIMING_CONFIG } from "../lib/print/ready-timing";
+import { computeMinimumReadyAtMs, computeStuckJobDeadlineMs, decidePrintWatchOutcome, needsWarmup, READY_TIMING_CONFIG, STUCK_JOB_TIMEOUT_HOURS } from "../lib/print/ready-timing";
 import { decideRestartOutcome } from "../lib/print/restart-reconciliation";
 import { prependSeparatorPage } from "../lib/print/separator";
 import { physicalSheetsForJob } from "../lib/print/sheets";
 import { decideSheetKind } from "../lib/print/sheet-kind";
-import { claimNextPaidJob, downloadJobPdf, failPrintingJob, getJob, isTrayLikelyOccupied, listInFlightJobsForKiosk, markJobInterrupted, updateJob, type PrintJobRecord } from "../lib/store";
+import { claimNextPaidJob, downloadJobPdf, failPrintingJob, getJob, isTrayLikelyOccupied, listInFlightJobsForKiosk, markJobInterrupted, updateJob, type FailureEvidence, type PrintJobRecord } from "../lib/store";
 import { getCurrentCommit, flushPendingResult, processKioskCommand } from "./kiosk-update";
 import { readPendingCommandResult } from "./pending-command-result";
 import { clearUpdateMarker, readUpdateMarker } from "./update-marker";
@@ -49,15 +49,10 @@ import { clearUpdateMarker, readUpdateMarker } from "./update-marker";
 // queue, the customer's Realtime-subscribed status page updates near-
 // instantly instead of on the next multi-second poll tick.
 const QUEUE_POLL_INTERVAL_MS = 1000;
-// A job stuck in the CUPS queue this long is treated as failed rather than
-// leaving the customer waiting forever — see finalizeFailure below. Time
-// spent genuinely print_blocked (see BLOCKED_RETRY_LIMIT_MS) never counts
-// against this — see decidePrintWatchOutcome's own blockedElapsedMs.
-const QUEUE_POLL_TIMEOUT_MS = 2 * 60 * 1000;
 // How long a RECOVERABLE printer problem is tolerated before finally
 // giving up — see lib/print/ready-timing.ts's own config for the full
-// reasoning behind the value and why it's deliberately separate from
-// QUEUE_POLL_TIMEOUT_MS above.
+// reasoning behind the value and why it's deliberately separate from the
+// stuck-job deadline (computeStuckJobDeadlineMs) below.
 const BLOCKED_RETRY_LIMIT_MS = READY_TIMING_CONFIG.blockedRetryLimitSeconds * 1000;
 
 /**
@@ -231,11 +226,11 @@ async function clearJobBlocked(job: PrintJobRecord): Promise<void> {
  * page instead (lib/refund.ts's attemptRefund). Refunds are never
  * instant/automatic anymore.
  */
-async function finalizeFailure(job: PrintJobRecord, reason: string, cupsJobId?: string): Promise<void> {
+async function finalizeFailure(job: PrintJobRecord, reason: string, cupsJobId?: string, evidence?: FailureEvidence): Promise<void> {
   console.error(`[print-agent] Job ${job.id} failed: ${reason}`);
   if (cupsJobId) await cancelPrintJob(cupsJobId);
 
-  const updated = await failPrintingJob(job.id, reason);
+  const updated = await failPrintingJob(job.id, reason, evidence);
   if (!updated) {
     console.warn(
       `[print-agent] Job ${job.id} was no longer printing/print_blocked by the time of this failure (likely already printed) — ` +
@@ -353,7 +348,11 @@ async function watchUntilPrinted(
 ): Promise<void> {
   const physicalSheets = physicalSheetsForJob(job);
   const minimumReadyAtMs = computeMinimumReadyAtMs(stageTiming.spooledAtMs, physicalSheets, stageTiming.warmupNeeded);
-  const deadlineMs = Date.now() + QUEUE_POLL_TIMEOUT_MS;
+  // Anchored to spooledAtMs (not "now") — see computeStuckJobDeadlineMs's
+  // own docstring for why: a print-agent restart that reattaches to this
+  // same job must compute the identical deadline a fresh watch would, not
+  // a fresh 2-hour window starting from the moment of the restart.
+  const deadlineMs = computeStuckJobDeadlineMs(stageTiming.spooledAtMs);
   // Set once, the first tick CUPS+the printer report the job done — even if
   // the floor hasn't elapsed yet, so the persisted timestamp reflects when
   // the printer actually finished, not when the floor let "printed" fire.
@@ -399,61 +398,97 @@ async function watchUntilPrinted(
     if (outcome.kind === "blocked" || outcome.kind === "wait") continue;
 
     if (outcome.kind === "error") {
-      await finalizeFailure(job, `CUPS reported job ${cupsJobId} as errored: ${outcome.reason}.`, cupsJobId);
+      await finalizeFailure(job, `CUPS reported job ${cupsJobId} as errored: ${outcome.reason}.`, cupsJobId, {
+        cupsState: cupsState.kind, cupsReason: "reason" in cupsState ? cupsState.reason : null,
+        elapsedMs: Date.now() - stageTiming.spooledAtMs, physicalSheets, deadlineMs, reconfirmedNotCompleted: false,
+      });
       return;
     }
 
-    if (outcome.kind === "blocked_timeout") {
-      await finalizeFailure(job, `Printer problem ("${outcome.reason}") persisted for over ${BLOCKED_RETRY_LIMIT_MS / 1000}s.`, cupsJobId);
-      return;
-    }
+    if (outcome.kind === "blocked_timeout" || outcome.kind === "timeout") {
+      // Requirement: "before marking a job failed, re-check CUPS and the
+      // database: if CUPS says it completed, mark it printed." A fresh
+      // getCupsJobQueueState call right here, immediately before giving
+      // up, catches the real-world gap where the job finishes in the
+      // instant between the tick that decided "stuck" and this check —
+      // decidePrintWatchOutcome itself only ever saw the OLDER cupsState
+      // from the top of this same loop iteration.
+      const recheck = await getCupsJobQueueState(cupsJobId);
+      if (recheck.kind === "completed") {
+        console.log(`[print-agent] Job ${job.id} was about to be marked failed (${outcome.kind}), but a final re-check found CUPS already reports it completed — marking printed instead.`);
+        await finalizeSuccess(job, physicalSheets, stageTiming, printerIdleAtMs);
+        return;
+      }
 
-    if (outcome.kind === "timeout") {
-      // Still "active" (or "completed" but the floor itself never cleared
-      // in time, which would mean the floor's own estimate is wildly off)
-      // after the full timeout — stuck rather than genuinely erroring, but
-      // the customer can't be left waiting forever either way.
-      await finalizeFailure(job, `Job ${cupsJobId} was still queued after ${QUEUE_POLL_TIMEOUT_MS / 1000}s — treating as stuck.`, cupsJobId);
+      const reason = outcome.kind === "blocked_timeout"
+        ? `Printer problem ("${outcome.reason}") persisted for over ${BLOCKED_RETRY_LIMIT_MS / 1000}s.`
+        : `Stuck, could not print within ${STUCK_JOB_TIMEOUT_HOURS} hours.`;
+      // finalizeFailure returns immediately below (and cancels the live
+      // CUPS job) — this function never loops back after that, so this
+      // job can never still be "printing" once it's landed in the refund
+      // list. If the printer recovers later, the admin "Reprint pages"
+      // option resubmits it as a brand new job instead.
+      await finalizeFailure(job, reason, cupsJobId, {
+        cupsState: recheck.kind, cupsReason: "reason" in recheck ? recheck.reason : null,
+        elapsedMs: Date.now() - stageTiming.spooledAtMs, physicalSheets, deadlineMs, reconfirmedNotCompleted: true,
+      });
       return;
     }
 
     // outcome.kind === "ready"
-    const readyAtMs = Date.now();
-    await updateJob(job.id, { status: "printed", readyAt: new Date(readyAtMs).toISOString() });
-    lastJobFinishedAtMs = readyAtMs;
-    console.log(
-      `[print-agent] Job ${job.id} printed. ` +
-        `claim->spool ${stageDurationSeconds(job.claimedAt, stageTiming.spooledAtMs)}s, ` +
-        `spool->printer-idle ${stageDurationSeconds(stageTiming.spooledAtMs, printerIdleAtMs)}s, ` +
-        `printer-idle->ready ${stageDurationSeconds(printerIdleAtMs, readyAtMs)}s.`,
-    );
-
-    await notifyAgentTerminalState(job.id);
-
-    await recordCompletedPrint(job.kioskId, {
-      pagesPrinted: physicalSheets,
-      // A free staff print's own totalPrice and a reprint's own totalPrice
-      // are both always 0 (see createStaffPrintJob) — real revenue is 0 for
-      // either, so `amount` only ever carries a real paying customer's
-      // price. waivedAmount carries what a free print WOULD have cost,
-      // used only for free_print_waived_amount/print_orders.waived_amount.
-      amount: job.isFree || job.originalJobId !== undefined ? 0 : job.totalPrice,
-      waivedAmount: job.isFree ? (job.waivedAmount ?? 0) : undefined,
-      colorMode: job.settings.isColor,
-      isFree: job.isFree,
-      isReprint: job.originalJobId !== undefined,
-      sheetKind: job.sheetKind,
-    });
-
-    await checkLowSupplyAfterPrint(job.kioskId);
-
-    if (job.originalJobId) {
-      // This job itself printing is what set_original_job_refund_not_needed
-      // (the status update just above) already resolved the ORIGINAL job's
-      // own pending refund, if it had one — nothing further to do here.
-      console.log(`[print-agent] Job ${job.id} was a reprint of ${job.originalJobId} — that job's refund (if pending) is now marked not_needed.`);
-    }
+    await finalizeSuccess(job, physicalSheets, stageTiming, printerIdleAtMs);
     return;
+  }
+}
+
+/**
+ * The success tail, shared by the normal "ready" outcome above and the
+ * last-chance re-check right before a timeout/blocked_timeout failure — a
+ * job CUPS genuinely confirms completed is marked printed exactly the same
+ * way either way, including the full revenue/print_orders/tray-cartridge
+ * bookkeeping (recordCompletedPrint) and customer notification.
+ */
+async function finalizeSuccess(
+  job: PrintJobRecord,
+  physicalSheets: number,
+  stageTiming: { spooledAtMs: number },
+  printerIdleAtMs: number | null,
+): Promise<void> {
+  const readyAtMs = Date.now();
+  await updateJob(job.id, { status: "printed", readyAt: new Date(readyAtMs).toISOString() });
+  lastJobFinishedAtMs = readyAtMs;
+  console.log(
+    `[print-agent] Job ${job.id} printed. ` +
+      `claim->spool ${stageDurationSeconds(job.claimedAt, stageTiming.spooledAtMs)}s, ` +
+      `spool->printer-idle ${stageDurationSeconds(stageTiming.spooledAtMs, printerIdleAtMs)}s, ` +
+      `printer-idle->ready ${stageDurationSeconds(printerIdleAtMs, readyAtMs)}s.`,
+  );
+
+  await notifyAgentTerminalState(job.id);
+
+  await recordCompletedPrint(job.kioskId, {
+    pagesPrinted: physicalSheets,
+    // A free staff print's own totalPrice and a reprint's own totalPrice
+    // are both always 0 (see createStaffPrintJob) — real revenue is 0 for
+    // either, so `amount` only ever carries a real paying customer's
+    // price. waivedAmount carries what a free print WOULD have cost,
+    // used only for free_print_waived_amount/print_orders.waived_amount.
+    amount: job.isFree || job.originalJobId !== undefined ? 0 : job.totalPrice,
+    waivedAmount: job.isFree ? (job.waivedAmount ?? 0) : undefined,
+    colorMode: job.settings.isColor,
+    isFree: job.isFree,
+    isReprint: job.originalJobId !== undefined,
+    sheetKind: job.sheetKind,
+    jobId: job.id,
+  });
+
+  await checkLowSupplyAfterPrint(job.kioskId);
+
+  if (job.originalJobId) {
+    // This job itself printing is what set_original_job_refund_not_needed
+    // (the status update just above) already resolved the ORIGINAL job's
+    // own pending refund, if it had one — nothing further to do here.
+    console.log(`[print-agent] Job ${job.id} was a reprint of ${job.originalJobId} — that job's refund (if pending) is now marked not_needed.`);
   }
 }
 

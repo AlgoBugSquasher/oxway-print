@@ -34,6 +34,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ job
     const job = await getJob(jobId);
     if (!job) return jsonError("Job not found.", 404);
 
+    // Known client-side already (the Reprint modal checks this before ever
+    // calling this route), but re-checked here too since this route's own
+    // trust boundary never assumes the client got there first.
+    if (job.pdfDeletedAt) {
+      return jsonError("The stored file was deleted after 7+ days with an unresolved refund — it can no longer be reprinted.", 410);
+    }
+
     let signedUrl: string;
     try {
       signedUrl = await createJobPdfDownloadUrl(job.pdfStoragePath, DOWNLOAD_URL_EXPIRY_SECONDS);

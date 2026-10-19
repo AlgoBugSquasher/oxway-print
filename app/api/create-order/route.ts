@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT } from "@/lib/config";
-import { getKioskColorModes, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability } from "@/lib/kiosk-stats";
+import { getKioskColorModes, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability, isKioskCurrentlyOnline } from "@/lib/kiosk-stats";
 import { createOrder, type CreateOrderOutput } from "@/lib/payment";
 import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
 import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
@@ -159,6 +159,18 @@ export async function POST(request: Request) {
     const printBlockedState = await getKioskPrintBlockedState(kioskId);
     if (printBlockedState.printBlocked) {
       return jsonError("This kiosk can't print right now (it needs attention) — please try again shortly.");
+    }
+
+    // Goal: "nobody can pay while the kiosk is offline." Checked here, not
+    // just on the customer page (which already disables Pay and polls the
+    // same /api/kiosk-status signal) — a tampered or stale request must be
+    // refused server-side regardless. Creates NOTHING (no job, no gateway
+    // order) rather than creating a job that would just sit paid and
+    // unclaimed — see isKioskCurrentlyOnline (lib/kiosk-stats.ts) for the
+    // one shared definition of "offline" this reuses.
+    if (!(await isKioskCurrentlyOnline(kioskId))) {
+      console.log(`[create-order] Refused — kiosk "${kioskId}" is offline.`);
+      return jsonError("This kiosk is offline right now, so payment is turned off. Please try again in a few minutes.");
     }
 
     const originalBytes = await downloadJobPdf(pdfStoragePath);

@@ -1,6 +1,6 @@
 import { fetchJson } from "../fetch-json";
 import { createSupabaseBrowserClient } from "../supabase";
-import type { RefundRouteResultItem } from "./types";
+import type { MarkPrintedResultItem, RefundRouteResultItem } from "./types";
 
 /**
  * Thin, typed wrappers around the SECURITY DEFINER RPCs from
@@ -24,6 +24,23 @@ export async function requestRefunds(jobIds: string[]): Promise<RefundRouteResul
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jobIds }),
+  });
+  return results;
+}
+
+/**
+ * The "Refuse refund — printed fine" corrective action (requirement: a
+ * paid job that actually printed, but got marked print_failed anyway, can
+ * be fixed without an owner having to touch the database directly). Goes
+ * through app/api/admin/mark-printed, not a direct RPC call, so the SAME
+ * recordCompletedPrint revenue bookkeeping the print agent's own success
+ * path uses can run server-side too — see lib/mark-printed.ts.
+ */
+export async function markJobsPrintedNoRefundNeeded(jobIds: string[], reason: string): Promise<MarkPrintedResultItem[]> {
+  const { results } = await fetchJson<{ results: MarkPrintedResultItem[] }>("/api/admin/mark-printed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jobIds, reason }),
   });
   return results;
 }

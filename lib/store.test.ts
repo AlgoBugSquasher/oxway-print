@@ -1,5 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { settingsMatch } from "./store";
+import { settingsMatch, type PrintJobRecord } from "./store";
+
+/** A minimal-but-complete PrintJobRecord fixture — deleteJob now needs the full record (to build its own print_job_archive row), not just id/status/pdfStoragePath. */
+function makeJobRecord(overrides: Partial<PrintJobRecord> = {}): PrintJobRecord {
+  return {
+    id: "job-1",
+    status: "printed",
+    fileName: "test.pdf",
+    selectedPages: [1],
+    settings: { copies: 1, layout: "portrait", isColor: false, paperSize: "A4", pagesPerSheet: 1 },
+    totalPrice: 10,
+    phoneNumber: "",
+    notifyOptIn: false,
+    includeBannerPage: true,
+    contentHash: "hash",
+    provider: "razorpay",
+    providerOrderId: "order_1",
+    pdfStoragePath: "job-1.pdf",
+    kioskId: "oxway_01",
+    createdAt: "2026-10-24T00:00:00.000Z",
+    updatedAt: "2026-10-24T00:00:00.000Z",
+    ...overrides,
+  };
+}
 
 // Highest-risk logic per ROADMAP.md #14: the atomic UPDATE ... WHERE status = X
 // guards (claimJobAsPaid, expireJobIfPending, deleteJob) are the entire
@@ -130,7 +153,7 @@ describe("atomic status-guarded store functions", () => {
   it("deleteJob guards on the exact status it was told the job was in, not just the id", async () => {
     mockAdmin.current = createMockQueryBuilder({ data: [{ id: "job-1" }], error: null });
     const { deleteJob } = await import("./store");
-    await deleteJob({ id: "job-1", status: "printed", pdfStoragePath: "job-1.pdf" });
+    await deleteJob(makeJobRecord());
     const eqCalls = mockAdmin.current.__calls.filter((call) => call.method === "eq");
     expect(eqCalls).toContainEqual({ method: "eq", args: ["status", "printed"] });
   });
@@ -139,7 +162,7 @@ describe("atomic status-guarded store functions", () => {
     // Empty array = the WHERE (id AND status) matched nothing — the atomic guard did its job.
     mockAdmin.current = createMockQueryBuilder({ data: [], error: null });
     const { deleteJob } = await import("./store");
-    await expect(deleteJob({ id: "job-1", status: "printed", pdfStoragePath: "job-1.pdf" })).resolves.toBe(false);
+    await expect(deleteJob(makeJobRecord())).resolves.toBe(false);
   });
 
   // "a job that printed after being marked failed" — the exact scenario
@@ -520,5 +543,89 @@ describe("listJobsEligibleForCleanup", () => {
     const jobs = await listJobsEligibleForCleanup();
 
     expect(jobs.map((job) => job.id).sort()).toEqual(["abandoned-1", "terminal-1"]);
+  });
+});
+
+describe("deleteJob — print_job_archive", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.current = null;
+    mockAdmin.fromQueue = [];
+    mockAdmin.storageRemoveCalls = [];
+  });
+
+  it("archives a slim record with the right fields the instant the delete actually succeeds", async () => {
+    const deleteBuilder = createMockQueryBuilder({ data: [{ id: "job-1" }], error: null });
+    const archiveBuilder = createMockQueryBuilder({ data: null, error: null });
+    mockAdmin.fromQueue = [deleteBuilder, archiveBuilder];
+    const { deleteJob } = await import("./store");
+
+    await deleteJob(makeJobRecord({
+      id: "job-1", status: "print_failed", kioskId: "oxway_02", totalPrice: 25,
+      settings: { copies: 2, layout: "portrait", isColor: true, paperSize: "A4", pagesPerSheet: 1 },
+      refundStatus: "not_needed", refundProviderId: "rfnd_1", readyAt: "2026-10-24T01:00:00.000Z",
+    }));
+
+    const insertCalls = archiveBuilder.__calls.filter((call) => call.method === "insert");
+    expect(insertCalls).toHaveLength(1);
+    expect(insertCalls[0].args[0]).toMatchObject({
+      id: "job-1", kiosk_id: "oxway_02", status: "print_failed", amount: 25,
+      copies: 2, color_mode: true, refund_status: "not_needed", refund_provider_id: "rfnd_1",
+      finished_at: "2026-10-24T01:00:00.000Z",
+    });
+  });
+
+  it("never archives (or touches Storage) a job the atomic delete guard actually backed off on", async () => {
+    const deleteBuilder = createMockQueryBuilder({ data: [], error: null }); // guard matched zero rows
+    const archiveBuilder = createMockQueryBuilder({ data: null, error: null });
+    mockAdmin.fromQueue = [deleteBuilder, archiveBuilder];
+    const { deleteJob } = await import("./store");
+
+    const result = await deleteJob(makeJobRecord());
+
+    expect(result).toBe(false);
+    expect(archiveBuilder.__calls.filter((call) => call.method === "insert")).toHaveLength(0);
+    expect(mockAdmin.storageRemoveCalls).toHaveLength(0);
+  });
+});
+
+describe("listUnresolvedRefundJobsWithStaleFiles / deleteJobPdfOnly", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockAdmin.current = null;
+    mockAdmin.fromQueue = [];
+    mockAdmin.storageRemoveCalls = [];
+  });
+
+  it("scopes to print_failed + an unresolved refund_status + no prior pdf_deleted_at, past the configured retention cutoff", async () => {
+    mockAdmin.current = createMockQueryBuilder({ data: [], error: null });
+    const { listUnresolvedRefundJobsWithStaleFiles } = await import("./store");
+
+    await listUnresolvedRefundJobsWithStaleFiles();
+
+    const calls = mockAdmin.current.__calls;
+    expect(calls).toContainEqual({ method: "eq", args: ["status", "print_failed"] });
+    expect(calls).toContainEqual({ method: "in", args: ["refund_status", ["pending", "processing", "failed"]] });
+    expect(calls).toContainEqual({ method: "is", args: ["pdf_deleted_at", null] });
+    expect(calls.some((call) => call.method === "or" && String(call.args[0]).includes("refund_requested_at"))).toBe(true);
+  });
+
+  it("deleteJobPdfOnly removes the Storage object and stamps pdf_deleted_at, guarded so a double-run can't double-report", async () => {
+    mockAdmin.current = createMockQueryBuilder({ data: [{ id: "job-1" }], error: null });
+    const { deleteJobPdfOnly } = await import("./store");
+
+    const result = await deleteJobPdfOnly({ id: "job-1", pdfStoragePath: "job-1.pdf" });
+
+    expect(result).toBe(true);
+    expect(mockAdmin.storageRemoveCalls).toEqual([["job-1.pdf"]]);
+    const isCalls = mockAdmin.current.__calls.filter((call) => call.method === "is");
+    expect(isCalls).toContainEqual({ method: "is", args: ["pdf_deleted_at", null] });
+  });
+
+  it("deleteJobPdfOnly returns false when the guard finds the file was already marked deleted", async () => {
+    mockAdmin.current = createMockQueryBuilder({ data: [], error: null });
+    const { deleteJobPdfOnly } = await import("./store");
+
+    await expect(deleteJobPdfOnly({ id: "job-1", pdfStoragePath: "job-1.pdf" })).resolves.toBe(false);
   });
 });

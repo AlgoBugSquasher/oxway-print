@@ -1,5 +1,17 @@
 import { supabaseAdmin } from "./supabase-admin";
-import { ABANDONED_JOB_RETENTION_HOURS, SUPABASE_PRINT_BUCKET, TERMINAL_JOB_RETENTION_HOURS } from "./config";
+import { ABANDONED_JOB_RETENTION_HOURS, REFUND_PENDING_FILE_RETENTION_DAYS, SUPABASE_PRINT_BUCKET, TERMINAL_JOB_RETENTION_HOURS } from "./config";
+import { physicalSheetsForJob } from "./print/sheets";
+
+/** Written by print-agent/index.ts's finalizeFailure at the moment a job is marked print_failed — see lib/print/ready-timing.ts's decidePrintWatchOutcome for where each of these comes from. Stored as-is in print_jobs.failure_evidence (jsonb) for the admin job detail / Refunds list to show. */
+export interface FailureEvidence {
+  cupsState: string;
+  cupsReason: string | null;
+  elapsedMs: number;
+  physicalSheets: number;
+  deadlineMs: number;
+  /** True when a fresh re-check of CUPS, done right before giving up, still did not report the job as completed. */
+  reconfirmedNotCompleted: boolean;
+}
 
 export type JobStatus =
   | "pending_payment"
@@ -216,6 +228,8 @@ export interface PrintJobRecord {
   spooledAt?: string;
   printerIdleAt?: string;
   readyAt?: string;
+  /** Set once lib/store.ts's deleteJobPdfOnly removes just the stored PDF for a print_failed job whose refund has been unresolved past REFUND_PENDING_FILE_RETENTION_DAYS — null/undefined means the file is still there. The job row, total_price, and refund_status are never touched by that. */
+  pdfDeletedAt?: string;
 }
 
 // 'interrupted' included — it's never going to resolve on its own (no
@@ -281,6 +295,7 @@ interface PrintJobRow {
   spooled_at: string | null;
   printer_idle_at: string | null;
   ready_at: string | null;
+  pdf_deleted_at: string | null;
 }
 
 function fromRow(row: PrintJobRow): PrintJobRecord {
@@ -336,6 +351,7 @@ function fromRow(row: PrintJobRow): PrintJobRecord {
     spooledAt: row.spooled_at ?? undefined,
     printerIdleAt: row.printer_idle_at ?? undefined,
     readyAt: row.ready_at ?? undefined,
+    pdfDeletedAt: row.pdf_deleted_at ?? undefined,
   };
 }
 
@@ -494,10 +510,10 @@ export async function expireJobIfPending(jobId: string): Promise<PrintJobRecord 
  * set_print_job_refund_pending's own trigger, via the status change
  * itself).
  */
-export async function failPrintingJob(jobId: string, reason: string): Promise<PrintJobRecord | null> {
+export async function failPrintingJob(jobId: string, reason: string, evidence?: FailureEvidence): Promise<PrintJobRecord | null> {
   const { data, error } = await supabaseAdmin()
     .from("print_jobs")
-    .update({ status: "print_failed", error: reason, blocked_reason: null, updated_at: new Date().toISOString() })
+    .update({ status: "print_failed", error: reason, blocked_reason: null, failure_evidence: evidence ?? null, updated_at: new Date().toISOString() })
     .eq("id", jobId)
     .in("status", ["printing", "print_blocked"])
     .select("*")
@@ -874,10 +890,17 @@ export async function listJobsEligibleForCleanup(): Promise<PrintJobRecord[]> {
  * zero rows match, something else already moved the job on and this backs
  * off without touching Storage.
  *
+ * Writes a slim, permanent print_job_archive row in the SAME pass, right
+ * after the delete actually succeeds — never before, so a race that backs
+ * off never archives a job that wasn't really removed. Best-effort (like
+ * the Storage removal just below it): the row is already gone either way,
+ * so a failure here is logged, not thrown — it would only mean one job's
+ * history is missing from the archive, never a dangling or duplicated row.
+ *
  * Returns whether the job was actually deleted, so the caller can report
  * accurate counts.
  */
-export async function deleteJob(job: Pick<PrintJobRecord, "id" | "status" | "pdfStoragePath">): Promise<boolean> {
+export async function deleteJob(job: PrintJobRecord): Promise<boolean> {
   const { data, error } = await supabaseAdmin()
     .from("print_jobs")
     .delete()
@@ -889,6 +912,22 @@ export async function deleteJob(job: Pick<PrintJobRecord, "id" | "status" | "pdf
   const wasDeleted = (data?.length ?? 0) > 0;
   if (!wasDeleted) return false;
 
+  const { error: archiveError } = await supabaseAdmin().from("print_job_archive").insert({
+    id: job.id,
+    kiosk_id: job.kioskId,
+    created_at: job.createdAt,
+    finished_at: job.readyAt ?? job.updatedAt,
+    status: job.status,
+    pages: physicalSheetsForJob(job),
+    copies: job.settings.copies,
+    color_mode: job.settings.isColor,
+    amount: job.totalPrice,
+    refund_status: job.refundStatus ?? null,
+    refund_provider_id: job.refundProviderId ?? null,
+    provider_order_id: job.providerOrderId,
+  });
+  if (archiveError) console.error(`Could not archive job ${job.id} before deleting its row:`, archiveError.message);
+
   // Storage removal is best-effort — the row is already gone at this point,
   // so a failure here just leaves an orphaned Storage object rather than a
   // dangling row with nowhere to retry from.
@@ -896,6 +935,54 @@ export async function deleteJob(job: Pick<PrintJobRecord, "id" | "status" | "pdf
   if (storageError) console.error(`Could not delete storage object for job ${job.id}:`, storageError.message);
 
   return true;
+}
+
+/**
+ * Finds a print_failed job whose refund is still unresolved (pending,
+ * processing, or failed) and has been sitting that way for more than
+ * REFUND_PENDING_FILE_RETENTION_DAYS — these are already held PAST
+ * TERMINAL_JOB_RETENTION_HOURS indefinitely (listJobsEligibleForCleanup
+ * above excludes them entirely until the refund resolves), so without this
+ * separate sweep a long-unreviewed refund queue would keep its PDFs in
+ * Storage forever. Measured from refundRequestedAt (stamped exactly once,
+ * the instant refund_status first became 'pending' — never touched again
+ * by a later retry), falling back to updatedAt for the defensive case
+ * where that's somehow missing. pdfDeletedAt IS NULL excludes a job this
+ * has already run for.
+ */
+export async function listUnresolvedRefundJobsWithStaleFiles(): Promise<PrintJobRecord[]> {
+  const cutoff = new Date(Date.now() - REFUND_PENDING_FILE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .select("*")
+    .eq("status", "print_failed")
+    .in("refund_status", ["pending", "processing", "failed"])
+    .is("pdf_deleted_at", null)
+    .or(`refund_requested_at.lt.${cutoff},and(refund_requested_at.is.null,updated_at.lt.${cutoff})`);
+  if (error) throw new Error(`Could not list unresolved-refund jobs with stale files: ${error.message}`);
+  return (data as PrintJobRow[]).map(fromRow);
+}
+
+/**
+ * Removes just the stored PDF for a job listUnresolvedRefundJobsWithStaleFiles
+ * found — the job row, total_price, and refund_status are never touched,
+ * only pdf_storage_path's own object in Storage and pdf_deleted_at. Same
+ * atomic-guard discipline as deleteJob: the UPDATE only lands if
+ * pdf_deleted_at is still null, so a double-run of this sweep can never
+ * stamp (or report) the same job twice.
+ */
+export async function deleteJobPdfOnly(job: Pick<PrintJobRecord, "id" | "pdfStoragePath">): Promise<boolean> {
+  const { error: storageError } = await supabaseAdmin().storage.from(SUPABASE_PRINT_BUCKET).remove([job.pdfStoragePath]);
+  if (storageError) console.error(`Could not delete storage object for job ${job.id} (pdf-only sweep):`, storageError.message);
+
+  const { data, error } = await supabaseAdmin()
+    .from("print_jobs")
+    .update({ pdf_deleted_at: new Date().toISOString() })
+    .eq("id", job.id)
+    .is("pdf_deleted_at", null)
+    .select("id");
+  if (error) throw new Error(`Could not mark job ${job.id}'s PDF as deleted: ${error.message}`);
+  return (data?.length ?? 0) > 0;
 }
 
 /**

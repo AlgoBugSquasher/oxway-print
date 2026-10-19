@@ -670,7 +670,13 @@ export default function PdfPageSelector() {
     <header className={`sticky top-0 z-20 border-b backdrop-blur-xl ${isDark ? "border-white/10 bg-[#101419]/85" : "border-slate-200/80 bg-[#f4f6f8]/85"}`}><div className="mx-auto flex max-w-6xl flex-wrap items-center gap-y-2 px-5 py-4 lg:px-8"><div className="flex items-center gap-3"><div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20"><Printer size={19} /></div><div><BrandWordmark className="h-10" /><p className={`mt-1.5 text-xs ${muted}`}>Smart print kiosk</p></div></div><div className="ml-auto flex items-center gap-2">{isKioskOnline
       ? <span className="flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-500"><span className="size-1.5 rounded-full bg-emerald-500" />Online</span>
       : <span className="flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-500"><span className="size-1.5 rounded-full bg-amber-500" />Offline</span>}<Link href="/admin" className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${isDark ? "border-white/10 text-slate-300 hover:border-white/20 hover:bg-white/10" : "border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-100"}`}>Admin</Link><button aria-label="Toggle color theme" onClick={() => setIsDark((value) => !value)} className={`grid size-10 place-items-center rounded-xl border ${panel}`}>{isDark ? <Sun size={17} /> : <Moon size={17} />}</button></div></div></header>
-    {!isKioskOnline && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600"><WifiOff size={18} className="mt-0.5 shrink-0" /><p>This kiosk isn&apos;t reachable right now — it may be powered off or have no network connection. Printing will resume once it&apos;s back online.</p></div></div>}
+    {/* Goal: "nobody can pay while the kiosk is offline" — shown up front
+       (uploading/choosing options still works) so a customer knows before
+       they get all the way to Pay. The Pay button itself is separately
+       replaced by its own large message further down, same isKioskOnline
+       signal, polled via the same /api/kiosk-status call below — no page
+       refresh needed either way for this to clear once the kiosk returns. */}
+    {!isKioskOnline && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600"><WifiOff size={18} className="mt-0.5 shrink-0" /><p>This kiosk is offline right now, so payment is turned off. You can still upload your file and choose print options — the Pay button will turn on automatically once the kiosk is back online.</p></div></div>}
     {isKioskUpdating && <div className="mx-auto max-w-6xl px-5 pt-4 lg:px-8"><div className="flex items-start gap-3 rounded-2xl border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm font-medium text-blue-600"><RefreshCw size={18} className="mt-0.5 shrink-0" /><p>This kiosk is being updated right now. New orders will resume automatically in a minute or two.</p></div></div>}
     {/* Requirement: block new checkout with a clear temporary-unavailable
        message while the printer can't print, clearing on its own once the
@@ -866,8 +872,19 @@ export default function PdfPageSelector() {
          price throughout, rather than duplicating the same number twice
          on screen at two very different sizes. */}
       <div><p className={`text-xs font-bold uppercase tracking-[0.15em] ${muted}`}>Total payable</p><p className="text-2xl font-black">₹{totalPrice}</p></div>
-      {orderStatus === "idle" && <div className="flex items-center gap-2">
-        <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating || printBlocked} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>
+      {orderStatus === "idle" && !isKioskOnline && (
+        // Goal: "the Pay button is disabled and a large, clear message
+        // replaces it" — icon + words, not color alone. isKioskOnline comes
+        // from the same /api/kiosk-status poll already driving the top
+        // banner above, so this clears on its own the moment the kiosk's
+        // heartbeat is fresh again, no page refresh needed.
+        <div className="flex min-w-[180px] max-w-sm items-center gap-2.5 rounded-xl bg-amber-500/10 px-4 py-3.5 text-sm font-bold text-amber-700">
+          <WifiOff size={20} className="shrink-0" />
+          <span>This kiosk is offline right now, so payment is turned off. Please try again in a few minutes.</span>
+        </div>
+      )}
+      {orderStatus === "idle" && isKioskOnline && <div className="flex items-center gap-2">
+        <button onClick={handleStartPayment} disabled={isLoading || basket.isProcessing || totalActivePages === 0 || isKioskUpdating || printBlocked || !isKioskOnline} className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3.5 text-sm font-black text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50">{uploadProgress !== null ? <span>Uploading... {uploadProgress}%</span> : isLoading ? <RefreshCw className="animate-spin" size={17} /> : <span>Pay ₹{totalPrice}</span>}</button>
       </div>}
       {orderStatus === "pending_payment" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Waiting for payment...</div>}
       {orderStatus === "paid" && <div className="flex min-w-[180px] items-center justify-center gap-2 rounded-xl bg-blue-500/10 px-5 py-3.5 text-sm font-black text-blue-500"><RefreshCw className="animate-spin" size={17} /> Payment confirmed, starting print{etaMinutes ? ` · ~${etaMinutes} min` : "..."}</div>}
