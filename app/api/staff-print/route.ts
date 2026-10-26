@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
-import { MAX_PAGES_PER_STAFF_JOB, MAX_STAFF_DAILY_PAGES, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT, getActiveProvider } from "@/lib/config";
+import { MAX_FILES_PER_ORDER, MAX_PAGES_PER_STAFF_JOB, MAX_STAFF_DAILY_PAGES, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT, getActiveProvider } from "@/lib/config";
 import { getKioskUpdateState } from "@/lib/kiosk-stats";
 import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
 import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
@@ -30,6 +30,7 @@ interface StaffPrintRequestBody {
   kioskId?: unknown;
   idempotencyKey?: unknown;
   forceCoverSheet?: unknown;
+  fileCount?: unknown;
 }
 
 /**
@@ -83,11 +84,18 @@ export async function POST(request: Request) {
     // key fine (see lib/store.ts's own CreateStaffPrintJobInput comment).
     const idempotencyKey = typeof body.idempotencyKey === "string" && body.idempotencyKey ? body.idempotencyKey : null;
     const forceCoverSheet = body.forceCoverSheet === true;
+    // Same reasoning as app/api/create-order's identical check — the
+    // basket's files are already merged into one PDF by this point, so
+    // the original count only survives if the client sends it.
+    const fileCount = typeof body.fileCount === "number" ? body.fileCount : 1;
 
     if (!pdfStoragePath) return jsonError("Missing uploaded file reference.");
     tempUploadPath = pdfStoragePath;
     if (!fileName) return jsonError("Missing file name.");
     if (selectedPages.length === 0) return jsonError("Select at least one page.");
+    if (fileCount > MAX_FILES_PER_ORDER) {
+      return jsonError(`This order combines ${fileCount} files, over the ${MAX_FILES_PER_ORDER}-file limit.`);
+    }
 
     // Mirrors create-order's own kiosk-update guard — a staff print is still
     // a print job at a physical printer, same reasoning applies.

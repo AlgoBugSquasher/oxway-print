@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
-import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT } from "@/lib/config";
+import { DUPLICATE_ORDER_WINDOW_SECONDS, getActiveProvider, MAX_FILES_PER_ORDER, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT } from "@/lib/config";
 import { getKioskColorModes, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability, isKioskCurrentlyOnline } from "@/lib/kiosk-stats";
 import { createOrder, type CreateOrderOutput } from "@/lib/payment";
 import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
@@ -44,6 +44,7 @@ interface CreateOrderRequestBody {
   phone?: unknown;
   kioskId?: unknown;
   pickupMode?: unknown;
+  fileCount?: unknown;
 }
 
 /** Reconstructs the same response shape /api/create-order normally returns, from an existing job — used for the duplicate-order short-circuit (ROADMAP.md #13). */
@@ -102,12 +103,22 @@ export async function POST(request: Request) {
     // keeps working unchanged. Read before the WhatsApp fields below since
     // the per-kiosk allow_whatsapp check needs it.
     const kioskId = typeof body.kioskId === "string" && body.kioskId ? body.kioskId : "oxway_01";
+    // The basket's own files are already merged into one PDF by the time
+    // this request reaches us (components/PdfPageSelector.tsx), so the
+    // original file count only survives if the client sends it — the UI
+    // already enforces MAX_FILES_PER_ORDER (lib/hooks/useFileBasket.ts's
+    // own mirrored copy of this same limit), but that's never trusted
+    // alone, same reasoning as every other limit on this route.
+    const fileCount = typeof body.fileCount === "number" ? body.fileCount : 1;
 
     if (!pdfStoragePath) return jsonError("Missing uploaded file reference.");
     tempUploadPath = pdfStoragePath;
     if (!fileName) return jsonError("Missing file name.");
     if (selectedPages.length === 0) return jsonError("Select at least one page.");
     if (!totalPrice || totalPrice <= 0) return jsonError("Invalid order total.");
+    if (fileCount > MAX_FILES_PER_ORDER) {
+      return jsonError(`This order combines ${fileCount} files, over the ${MAX_FILES_PER_ORDER}-file limit.`);
+    }
 
     // WhatsApp opt-in (re-enabled ROADMAP.md §1) — a phone number is only
     // ever stored when the customer actually opted in; the client is never

@@ -54,6 +54,7 @@ vi.mock("@/lib/config", () => ({
   // same mocked numbers, not against the real config. Acceptable: this
   // suite's job is authorization + request handling, not re-verifying
   // pricing math that already has its own dedicated tests.
+  MAX_FILES_PER_ORDER: 50,
   MAX_PAGES_PER_STAFF_JOB: 100,
   MAX_STAFF_DAILY_PAGES: 500,
   MAX_UPLOAD_FILE_SIZE_BYTES: 50 * 1024 * 1024,
@@ -178,6 +179,17 @@ describe("POST /api/staff-print — request handling", () => {
     const response = await POST(makeRequest(validBody));
     expect(response.status).toBe(400);
     expect(mocks.createStaffPrintJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects a request over MAX_FILES_PER_ORDER server-side, never reaching createStaffPrintJob — the client's own basket limit is never trusted alone", async () => {
+    const response = await POST(makeRequest({ ...validBody, fileCount: 51 }));
+    expect(response.status).toBe(400);
+    expect(mocks.createStaffPrintJob).not.toHaveBeenCalled();
+  });
+
+  it("allows a request at exactly MAX_FILES_PER_ORDER", async () => {
+    const response = await POST(makeRequest({ ...validBody, fileCount: 50 }));
+    expect(response.status).toBe(200);
   });
 
   it("surfaces the daily-cap rejection as a 429 with a clear message, not a generic 500", async () => {

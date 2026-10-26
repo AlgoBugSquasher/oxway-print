@@ -41,7 +41,7 @@ import {
 import { fetchJson } from "@/lib/fetch-json";
 import {
   MAX_COMBINED_FILE_SIZE_BYTES,
-  MAX_FILES_PER_BASKET,
+  MAX_FILES_PER_ORDER,
   MAX_FILE_SIZE_BYTES,
   MAX_TOTAL_PAGES_PER_BASKET,
   useFileBasket,
@@ -461,6 +461,11 @@ export default function PdfPageSelector() {
           phone: notifyOptIn ? phone : undefined,
           kioskId: paramKioskId || undefined,
           pickupMode,
+          // The server-side authoritative MAX_FILES_PER_ORDER check (see
+          // app/api/create-order's own) needs this — by this point the
+          // basket's own files are already merged into one PDF, so the
+          // original file count isn't otherwise recoverable server-side.
+          fileCount: basket.items.length,
         }),
       });
 
@@ -731,7 +736,7 @@ export default function PdfPageSelector() {
         <span className="text-lg font-bold">Drop your files here</span>
         <span className={`mt-2 text-sm ${muted}`}>PDF, image, or Word document — select or drop several at once</span>
         <span className={`mt-6 rounded-full px-3 py-1 text-[11px] ${isDark ? "bg-white/10 text-slate-300" : "bg-slate-100 text-slate-500"}`}>PDF · PNG · JPG · HEIC · DOCX · max {Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))} MB each</span>
-        <span className={`mt-1.5 text-[11px] ${muted}`}>Up to {MAX_FILES_PER_BASKET} files · {Math.round(MAX_COMBINED_FILE_SIZE_BYTES / (1024 * 1024))} MB combined · {MAX_TOTAL_PAGES_PER_BASKET} pages combined</span>
+        <span className={`mt-1.5 text-[11px] ${muted}`}>Up to {MAX_FILES_PER_ORDER} files · {Math.round(MAX_COMBINED_FILE_SIZE_BYTES / (1024 * 1024))} MB combined · {MAX_TOTAL_PAGES_PER_BASKET} pages combined</span>
       </button>}
 
       {basket.items.length > 0 && <div className="space-y-4">
@@ -753,14 +758,17 @@ export default function PdfPageSelector() {
           onClearPages={() => basket.clearPages(item.id)}
         />)}
 
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={!canEditBasket || basket.items.length >= MAX_FILES_PER_BASKET}
-          className={`flex min-h-11 w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed px-4 text-sm font-bold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-40 ${isDark ? "border-white/15 text-slate-300 hover:enabled:bg-white/5" : "border-slate-300 text-slate-600 hover:enabled:bg-white"}`}
-        >
-          <Plus size={16} className="text-blue-500" /> Add more files
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={!canEditBasket || basket.items.length >= MAX_FILES_PER_ORDER}
+            className={`flex min-h-11 flex-1 items-center justify-center gap-2 rounded-2xl border-2 border-dashed px-4 text-sm font-bold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-40 ${isDark ? "border-white/15 text-slate-300 hover:enabled:bg-white/5" : "border-slate-300 text-slate-600 hover:enabled:bg-white"}`}
+          >
+            <Plus size={16} className="text-blue-500" /> Add more files
+          </button>
+          <span className={`shrink-0 text-xs font-bold ${muted}`}>{basket.items.length} / {MAX_FILES_PER_ORDER} files</span>
+        </div>
 
         {basket.basketError && <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600">{basket.basketError}</div>}
       </div>}

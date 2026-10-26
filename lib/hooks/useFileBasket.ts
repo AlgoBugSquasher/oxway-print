@@ -54,14 +54,17 @@ export interface FileBasketItem {
 /** Same per-file ceiling the kiosk has always had — matches MAX_UPLOAD_FILE_SIZE_BYTES in lib/config.ts (server-side, re-checked there against the actual uploaded bytes). */
 export const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 /**
- * New, multi-file-only limits. Deliberately modest for now: the actual
- * submit step (PdfPageSelector.tsx's handleStartPayment) still only ever
- * uploads/charges for the first file in the basket until a later merge step
- * connects the rest — see this hook's own module docstring note there isn't
- * one; search handleStartPayment instead. These limits bound what the UI
- * lets a customer *build up* in the meantime, not what gets billed today.
+ * Multi-file basket limits. MAX_FILES_PER_ORDER's own authoritative value
+ * lives in lib/config.ts (re-checked there server-side in
+ * app/api/create-order, against the fileCount the client actually sends)
+ * — mirrored here, under the same name, rather than imported directly:
+ * lib/config.ts also holds real secrets (API keys, tokens) read at module
+ * scope, so it must never be imported into client-bundled code like this
+ * hook. Same already-established split as MAX_UPLOAD_FILE_SIZE_BYTES/
+ * MAX_FILE_SIZE_BYTES and MAX_UPLOAD_PAGE_COUNT/MAX_TOTAL_PAGES_PER_BASKET
+ * just below — keep both copies' VALUES in sync if either ever changes.
  */
-export const MAX_FILES_PER_BASKET = 10;
+export const MAX_FILES_PER_ORDER = 50;
 export const MAX_COMBINED_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 export const MAX_TOTAL_PAGES_PER_BASKET = 300;
 
@@ -229,8 +232,12 @@ export function useFileBasket({ layout, enabled }: UseFileBasketOptions): UseFil
     itemsRef.current = items;
   }, [items]);
 
-  const runConversion = useCallback((id: string, file: File, targetLayout: Layout) => {
-    void convertOneFile(file, targetLayout).then((outcome) => {
+  // Returns the conversion's own promise (rather than firing it as a bare
+  // "void ...then()") so addFiles below can await each one in turn — see
+  // that function's own comment on why conversions are processed
+  // sequentially, not all at once.
+  const runConversion = useCallback((id: string, file: File, targetLayout: Layout): Promise<void> => {
+    return convertOneFile(file, targetLayout).then((outcome) => {
       setItems((current) => current.map((item) => {
         if (item.id !== id) return item;
         if (!outcome.ok) return { ...item, status: "error", error: outcome.error };
@@ -264,11 +271,11 @@ export function useFileBasket({ layout, enabled }: UseFileBasketOptions): UseFil
     const rejectionNotes: string[] = [];
 
     let combinedSize = itemsRef.current.reduce((sum, item) => sum + item.file.size, 0);
-    let slotsLeft = MAX_FILES_PER_BASKET - itemsRef.current.length;
+    let slotsLeft = MAX_FILES_PER_ORDER - itemsRef.current.length;
 
     for (const file of incoming) {
       if (slotsLeft <= 0) {
-        rejectionNotes.push(`"${file.name}" (basket limit of ${MAX_FILES_PER_BASKET} files reached)`);
+        rejectionNotes.push(`"${file.name}" (basket limit of ${MAX_FILES_PER_ORDER} files reached)`);
         continue;
       }
       if (!isSupportedClientFile(file)) {
@@ -297,7 +304,20 @@ export function useFileBasket({ layout, enabled }: UseFileBasketOptions): UseFil
 
     setBasketError(rejectionNotes.length > 0 ? `Couldn't add ${rejectionNotes.join(", ")}.` : "");
     if (accepted.length > 0) setItems((current) => [...current, ...accepted]);
-    toConvert.forEach((item) => runConversion(item.id, item.file, layout));
+
+    // One at a time, not all at once — each conversion can involve
+    // pdf.js page rendering or DOCX/image canvas work, which is real
+    // main-thread CPU/memory cost. Firing dozens of these concurrently
+    // (e.g. adding MAX_FILES_PER_ORDER files in one picker selection) is
+    // exactly what can make a phone's browser stutter or feel frozen; a
+    // simple sequential queue keeps the UI responsive regardless of how
+    // many files were just added, at the cost of them finishing a bit
+    // later rather than all together.
+    void (async () => {
+      for (const item of toConvert) {
+        await runConversion(item.id, item.file, layout);
+      }
+    })();
   }, [enabled, layout, runConversion]);
 
   const removeFile = useCallback((id: string) => {

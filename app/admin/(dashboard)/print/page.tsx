@@ -13,7 +13,7 @@ import {
 } from "@/components/print-basket-ui";
 import { useAdminRole } from "@/lib/admin/role-context";
 import { fetchJson } from "@/lib/fetch-json";
-import { MAX_COMBINED_FILE_SIZE_BYTES, MAX_FILES_PER_BASKET, MAX_FILE_SIZE_BYTES, MAX_TOTAL_PAGES_PER_BASKET, useFileBasket } from "@/lib/hooks/useFileBasket";
+import { MAX_COMBINED_FILE_SIZE_BYTES, MAX_FILES_PER_ORDER, MAX_FILE_SIZE_BYTES, MAX_TOTAL_PAGES_PER_BASKET, useFileBasket } from "@/lib/hooks/useFileBasket";
 import { mergeSelectedPdfPages } from "@/lib/pdf-merge";
 import { formatTicketCode } from "@/lib/ticket-code";
 import { uploadFileWithProgress } from "@/lib/upload-with-progress";
@@ -159,6 +159,10 @@ export default function AdminPrintPage() {
           kioskId,
           idempotencyKey: idempotencyKeyRef.current,
           forceCoverSheet,
+          // Same server-side MAX_FILES_PER_ORDER check create-order has —
+          // the files are already merged into one PDF by this point, so
+          // the original count isn't otherwise recoverable server-side.
+          fileCount: basket.items.length,
         }),
       });
 
@@ -266,7 +270,7 @@ export default function AdminPrintPage() {
                 <span className="text-base font-bold">Drop a file here</span>
                 <span className="mt-1.5 text-sm text-slate-500">PDF, image, or Word document — select or drop several at once</span>
                 <span className="mt-4 rounded-full bg-slate-100 px-3 py-1 text-[11px] text-slate-500">PDF · PNG · JPG · HEIC · DOCX · max {Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))} MB each</span>
-                <span className="mt-1.5 text-[11px] text-slate-400">Up to {MAX_FILES_PER_BASKET} files · {Math.round(MAX_COMBINED_FILE_SIZE_BYTES / (1024 * 1024))} MB combined · {MAX_TOTAL_PAGES_PER_BASKET} pages combined</span>
+                <span className="mt-1.5 text-[11px] text-slate-400">Up to {MAX_FILES_PER_ORDER} files · {Math.round(MAX_COMBINED_FILE_SIZE_BYTES / (1024 * 1024))} MB combined · {MAX_TOTAL_PAGES_PER_BASKET} pages combined</span>
               </button>
             )}
 
@@ -291,14 +295,17 @@ export default function AdminPrintPage() {
                     onClearPages={() => basket.clearPages(item.id)}
                   />
                 ))}
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={!canEditBasket || basket.items.length >= MAX_FILES_PER_BASKET}
-                  className="flex min-h-11 w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-300 px-4 text-sm font-bold text-slate-600 transition hover:enabled:bg-white disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <Plus size={16} className="text-blue-500" /> Add more files
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={!canEditBasket || basket.items.length >= MAX_FILES_PER_ORDER}
+                    className="flex min-h-11 flex-1 items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-300 px-4 text-sm font-bold text-slate-600 transition hover:enabled:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Plus size={16} className="text-blue-500" /> Add more files
+                  </button>
+                  <span className="shrink-0 text-xs font-bold text-slate-500">{basket.items.length} / {MAX_FILES_PER_ORDER} files</span>
+                </div>
                 {basket.basketError && <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-600">{basket.basketError}</div>}
               </div>
             )}

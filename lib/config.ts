@@ -48,6 +48,19 @@ export const MAX_UPLOAD_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 export const MAX_UPLOAD_PAGE_COUNT = 300;
 
 /**
+ * Max number of source files one order can combine — the single home for
+ * this limit; lib/hooks/useFileBasket.ts's own addFiles (customer + admin
+ * print pages) and app/api/create-order both import this directly rather
+ * than each keeping their own copy. Combined size (50MB) and combined page
+ * count (300) stay defined in useFileBasket.ts, unchanged — only the file
+ * COUNT limit moved here, since create-order needed its own authoritative
+ * copy to check server-side (see that route's own fileCount check) and a
+ * second place to keep the same number in sync is worse than one shared
+ * constant.
+ */
+export const MAX_FILES_PER_ORDER = 50;
+
+/**
  * How long a temporary direct-to-storage upload (lib/store.ts's
  * tempUploadStoragePath, under the "uploads/" prefix) can sit unclaimed
  * before the cleanup cron sweeps it as an orphan — e.g. the customer

@@ -1857,12 +1857,13 @@ declare
   v_before print_jobs;
   v_updated_rows integer;
 begin
-  -- Owner-only, same as every other refund-adjacent action — this touches
-  -- refund_status and revenue, which staff can't even see (refund_status
-  -- is masked to null for staff everywhere else in this schema).
-  if public.current_app_role() <> 'owner' then
-    raise exception 'Not authorized.';
-  end if;
+  -- Owner-only — but enforced by the grant below (service_role only, same
+  -- as claim_refund_for_processing/complete_refund/fail_refund) plus the
+  -- calling route's own session check (app/api/admin/mark-printed),
+  -- never by current_app_role() here: that reads auth.jwt(), which is
+  -- empty for a service-role call with no user JWT attached, so a check
+  -- here would reject every legitimate call regardless of who the real
+  -- actor is — exactly the "Not authorized" bug this fixes.
   if p_reason is null or length(trim(p_reason)) = 0 then
     raise exception 'A reason is required.';
   end if;

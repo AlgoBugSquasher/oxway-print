@@ -90,3 +90,28 @@ describe("POST /api/create-order — offline gate", () => {
     expect(mock.downloadJobPdfCalls).toBe(1);
   });
 });
+
+describe("POST /api/create-order — file count gate", () => {
+  it("rejects an order over MAX_FILES_PER_ORDER server-side, never reaching downloadJobPdf — the client's own basket limit is never trusted alone", async () => {
+    mock.isOnline = true;
+    mock.downloadJobPdfCalls = 0;
+    const { POST } = await import("./route");
+
+    const response = await POST(new Request("http://localhost/api/create-order", { method: "POST", body: JSON.stringify({ ...requestBody(), fileCount: 51 }) }));
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body.error).toMatch(/51 files.*50-file limit/);
+    expect(mock.downloadJobPdfCalls).toBe(0);
+  });
+
+  it("allows an order at exactly MAX_FILES_PER_ORDER", async () => {
+    mock.isOnline = true;
+    mock.downloadJobPdfCalls = 0;
+    const { POST } = await import("./route");
+
+    await POST(new Request("http://localhost/api/create-order", { method: "POST", body: JSON.stringify({ ...requestBody(), fileCount: 50 }) }));
+
+    expect(mock.downloadJobPdfCalls).toBe(1);
+  });
+});
