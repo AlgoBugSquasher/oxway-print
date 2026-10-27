@@ -163,45 +163,57 @@ function KioskDisplayView() {
       {/* Requirement: "The QR must stay visible in every state" — printing,
          waiting, and while print IDs are showing. Laid out side-by-side
          (QR | current status) rather than mutually exclusive, so neither
-         ever has to be hidden to show the other on this ~800x480 screen. */}
-      <div className="flex flex-1 items-center justify-center gap-12">
-        <QrBlock />
+         ever has to be hidden to show the other on this ~800x480 screen.
+         `grid place-items-center` on the flex-1 area centers the QR+text
+         group as one unit, both axes, in the space below the header row.
+         The text column is a FIXED width (not max-width) so the group's
+         total footprint — and so the QR's own position — never shifts
+         between idle/printing/printed/etc., even though each state's text
+         is a different length. */}
+      <div className="grid flex-1 place-items-center">
+        <div className="flex items-center gap-12">
+          <QrBlock />
 
-        <div className="flex max-w-[380px] flex-col items-start gap-3">
-          {current?.status === "printing" && (
-            <>
-              <p className="text-5xl font-black leading-tight text-blue-400">{formatTicketCode(current.ticketNumber)} printing</p>
-              {upcoming.length > 0 && (
-                <p className="text-xl font-bold text-slate-300">
-                  Next: {upcoming.slice(0, MAX_UPCOMING_SHOWN).map((job) => formatTicketCode(job.ticketNumber)).join(", ")}
-                </p>
-              )}
-              <p className="text-lg font-medium text-slate-400">{trayCount} {trayCount === 1 ? "stack" : "stacks"} likely in tray</p>
-            </>
-          )}
+          <div className="flex w-[320px] flex-col items-start gap-3">
+            {current?.status === "printing" && (
+              <>
+                <p className="text-5xl font-black leading-tight text-blue-400">{formatTicketCode(current.ticketNumber)} printing</p>
+                {upcoming.length > 0 && (
+                  <p className="text-xl font-bold text-slate-300">
+                    Next: {upcoming.slice(0, MAX_UPCOMING_SHOWN).map((job) => formatTicketCode(job.ticketNumber)).join(", ")}
+                  </p>
+                )}
+                <p className="text-lg font-medium text-slate-400">{trayCount} {trayCount === 1 ? "stack" : "stacks"} likely in tray</p>
+              </>
+            )}
 
-          {current?.status === "printed" && (
-            <p className="text-5xl font-black leading-tight text-emerald-400">{formatTicketCode(current.ticketNumber)} ready, please take your pages</p>
-          )}
+            {current?.status === "printed" && (
+              <p className="text-5xl font-black leading-tight text-emerald-400">{formatTicketCode(current.ticketNumber)} ready, please take your pages</p>
+            )}
 
-          {current?.status === "print_blocked" && (
-            <p className="text-5xl font-black leading-tight text-amber-400">{formatTicketCode(current.ticketNumber)} is paused — needs attention</p>
-          )}
+            {current?.status === "print_blocked" && (
+              <p className="text-5xl font-black leading-tight text-amber-400">{formatTicketCode(current.ticketNumber)} is paused — needs attention</p>
+            )}
 
-          {current?.status === "interrupted" && (
-            <p className="text-5xl font-black leading-tight text-rose-400">Printing delayed, please wait</p>
-          )}
+            {/* "Printing delayed, please wait" removed on request — the kiosk
+               shows nothing about a delay, same as before this existed.
+               Kept here (commented, not deleted) in case it's wanted back:
+            {current?.status === "interrupted" && (
+              <p className="text-5xl font-black leading-tight text-rose-400">Printing delayed, please wait</p>
+            )}
+            */}
 
-          {refundStatusCopy && (
-            <>
-              <p className="text-5xl font-black leading-tight text-slate-200">{refundStatusCopy.title}</p>
-              <p className="text-lg font-medium text-slate-400">{refundStatusCopy.body}</p>
-            </>
-          )}
+            {refundStatusCopy && (
+              <>
+                <p className="text-5xl font-black leading-tight text-slate-200">{refundStatusCopy.title}</p>
+                <p className="text-lg font-medium text-slate-400">{refundStatusCopy.body}</p>
+              </>
+            )}
 
-          {!current && (
-            <p className="text-3xl font-black leading-tight text-slate-200">Upload &amp; print your document here</p>
-          )}
+            {(!current || current.status === "interrupted") && (
+              <p className="text-3xl font-black leading-tight text-slate-200">Upload &amp; print your document here</p>
+            )}
+          </div>
         </div>
       </div>
     </div>
