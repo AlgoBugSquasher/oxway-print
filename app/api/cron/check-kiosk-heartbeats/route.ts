@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { evaluateAlert } from "@/lib/alerts";
 import { KIOSK_SILENT_THRESHOLD_MINUTES } from "@/lib/config";
+import { routeErrorResponse } from "@/lib/errors";
 import { listKioskHeartbeats } from "@/lib/kiosk-stats";
 // ROADMAP.md §2 (WhatsApp notifications) is disabled for v2.5 — see
 // lib/alerts/ for the Telegram/email/banner channels actually used below.
@@ -48,10 +49,6 @@ export async function GET(request: Request) {
 
     return NextResponse.json({ checked: kiosks.length, silent: silentCount });
   } catch (error) {
-    console.error("check-kiosk-heartbeats error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not check kiosk heartbeats." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "cron", route: "cron/check-kiosk-heartbeats" });
   }
 }

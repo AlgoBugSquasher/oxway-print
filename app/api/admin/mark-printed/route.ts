@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { MarkPrintedResultItem } from "@/lib/admin/types";
+import { routeErrorResponse } from "@/lib/errors";
 import { markJobPrintedNoRefundNeeded } from "@/lib/mark-printed";
 import { getClientIp } from "@/lib/rate-limit";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
@@ -48,10 +49,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ results });
   } catch (error) {
-    console.error("admin/mark-printed error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not mark this job printed." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "admin", route: "admin/mark-printed" });
   }
 }

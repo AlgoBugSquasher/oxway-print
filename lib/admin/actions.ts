@@ -1,4 +1,5 @@
 import { fetchJson } from "../fetch-json";
+import { reportErrorAndGetMessage } from "../report-error";
 import { createSupabaseBrowserClient } from "../supabase";
 import type { MarkPrintedResultItem, RefundRouteResultItem } from "./types";
 
@@ -7,6 +8,10 @@ import type { MarkPrintedResultItem, RefundRouteResultItem } from "./types";
  * SUPABASE_SETUP.md §7.7. Each RPC re-checks the caller's role itself — the
  * role gating implied by which of these an admin page exposes a button for
  * is a UX nicety, not the actual security boundary.
+ *
+ * Every RPC error below goes through reportErrorAndGetMessage (not a bare
+ * `throw new Error(error.message)`) so a raw Postgres message never
+ * reaches the admin page that called this — see lib/report-error.ts.
  */
 
 /**
@@ -48,7 +53,7 @@ export async function markJobsPrintedNoRefundNeeded(jobIds: string[], reason: st
 export async function forceReprintJob(jobId: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("force_reprint_job", { p_job_id: jobId });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "force_reprint_job" }));
 }
 
 /**
@@ -75,7 +80,7 @@ export async function requestReprint(input: {
 export async function cancelJob(jobId: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("cancel_job", { p_job_id: jobId });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "cancel_job" }));
 }
 
 export interface UpdateKioskCountersInput {
@@ -101,13 +106,13 @@ export async function updateKioskCounters(input: UpdateKioskCountersInput): Prom
     p_allow_bw: input.allowBw ?? null,
     p_low_supply_threshold_percent: input.lowSupplyThresholdPercent ?? null,
   });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "update_kiosk_counters" }));
 }
 
 export async function updateKioskAlertSettings(kioskId: string, telegramChatId: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("update_kiosk_alert_settings", { p_kiosk_id: kioskId, p_telegram_chat_id: telegramChatId || null });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "update_kiosk_alert_settings" }));
 }
 
 export async function sendTestAlert(kioskId: string): Promise<{ results: { channel: string; ok: boolean; error?: string }[] }> {
@@ -127,7 +132,7 @@ export async function sendTestAlert(kioskId: string): Promise<{ results: { chann
 export async function updateKioskWhatsappAvailability(kioskId: string, allowWhatsapp: boolean): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("update_kiosk_whatsapp_availability", { p_kiosk_id: kioskId, p_allow_whatsapp: allowWhatsapp });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "update_kiosk_whatsapp_availability" }));
 }
 
 /**
@@ -140,13 +145,13 @@ export async function updateKioskWhatsappAvailability(kioskId: string, allowWhat
 export async function requestKioskCommand(kioskId: string, command: "update" | "restart"): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("request_kiosk_command", { p_kiosk_id: kioskId, p_command: command });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "request_kiosk_command" }));
 }
 
 export async function updatePricing(priceBw: number, priceColor: number): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("update_pricing", { p_price_bw: priceBw, p_price_color: priceColor });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "update_pricing" }));
 }
 
 /**
@@ -159,7 +164,7 @@ export async function updatePricing(priceBw: number, priceColor: number): Promis
 export async function recordRefill(kioskId: string, kind: "paper" | "toner", quantity: number, note?: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("record_refill", { p_kiosk_id: kioskId, p_kind: kind, p_quantity: quantity, p_note: note ?? null });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "record_refill" }));
 }
 
 export interface UpdateKioskSeparatorSettingsInput {
@@ -179,11 +184,11 @@ export async function updateKioskSeparatorSettings(input: UpdateKioskSeparatorSe
     p_later_hold_hours: input.laterHoldHours,
     p_large_job_pages: input.largeJobPages,
   });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "update_kiosk_separator_settings" }));
 }
 
 export async function clearKioskTray(kioskId: string): Promise<void> {
   const supabase = createSupabaseBrowserClient();
   const { error } = await supabase.rpc("clear_kiosk_tray", { p_kiosk_id: kioskId });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(await reportErrorAndGetMessage("admin", error, { rpc: "clear_kiosk_tray" }));
 }

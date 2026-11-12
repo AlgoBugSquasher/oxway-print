@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { routeErrorResponse } from "@/lib/errors";
 import { createJobPdfDownloadUrl, getJob } from "@/lib/store";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
 
@@ -50,7 +51,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ job
 
     return NextResponse.json({ signedUrl, fileName: job.fileName, totalPages: job.selectedPages.length });
   } catch (error) {
-    console.error("admin/jobs/[jobId]/pdf-url error:", error);
-    return jsonError(error instanceof Error ? error.message : "Could not create a download link.", 500);
+    return await routeErrorResponse(error, { area: "admin", route: "admin/jobs/[jobId]/pdf-url" });
   }
 }

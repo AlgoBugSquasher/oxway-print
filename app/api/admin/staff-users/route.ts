@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { routeErrorResponse } from "@/lib/errors";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { logDuration, withTiming } from "@/lib/server-timing";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
@@ -50,10 +51,6 @@ export async function GET() {
 
     return NextResponse.json({ users: staffUsers });
   } catch (error) {
-    console.error("admin/staff-users error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not list staff users." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "admin", route: "admin/staff-users" });
   }
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { RefundRouteResultItem } from "@/lib/admin/types";
+import { routeErrorResponse } from "@/lib/errors";
 import { getClientIp } from "@/lib/rate-limit";
 import { attemptRefund, recordBulkRefundAction } from "@/lib/refund";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
@@ -83,10 +84,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ results });
   } catch (error) {
-    console.error("admin/refund error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not process the refund." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "admin", route: "admin/refund" });
   }
 }

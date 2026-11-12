@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { ERROR_AREAS, type ErrorArea } from "@/lib/error-areas";
+import { logError } from "@/lib/errors";
 import { getClientIp } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
@@ -8,13 +10,19 @@ export const dynamic = "force-dynamic";
 // that this can't be turned into a meaningful log-flooding vector.
 const MAX_BODY_BYTES = 8 * 1024;
 
+function isErrorArea(value: unknown): value is ErrorArea {
+  return typeof value === "string" && (ERROR_AREAS as readonly string[]).includes(value);
+}
+
 /**
- * Receives best-effort error reports from lib/client-log.ts (see that
- * file's comment for why this exists — debugging the iPhone 15/15 Plus
- * Safari PDF-upload failures without physical device access). Just logs to
- * the server console; there's deliberately no database write or alerting
- * here — this is a temporary diagnostic aid, not a permanent telemetry
- * pipeline, so it stays as simple as the thing it's investigating allows.
+ * Receives best-effort error reports from the browser — originally just
+ * lib/client-log.ts (debugging the iPhone 15/15 Plus Safari PDF-upload
+ * failures without physical device access), now also lib/report-error.ts
+ * (any client component that caught a raw Supabase/Postgres error directly,
+ * e.g. an admin page's own `supabase.from(...)` call). Logs to error_logs
+ * via lib/errors.ts and hands back a reference code — lib/client-log.ts's
+ * existing fire-and-forget callers ignore the response body entirely, so
+ * this stays backward compatible for them.
  */
 export async function POST(request: Request) {
   try {
@@ -23,18 +31,30 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Report too large." }, { status: 413 });
     }
 
-    const report = JSON.parse(raw) as { stage?: unknown; message?: unknown; stack?: unknown; meta?: unknown; userAgent?: unknown; url?: unknown };
-    console.error("[client-log]", {
-      stage: report.stage,
-      message: report.message,
-      stack: report.stack,
-      meta: report.meta,
-      userAgent: report.userAgent,
-      url: report.url,
-      ip: getClientIp(request),
+    const report = JSON.parse(raw) as { stage?: unknown; area?: unknown; message?: unknown; stack?: unknown; meta?: unknown; userAgent?: unknown; url?: unknown };
+    // lib/client-log.ts's older callers send `stage`, never `area` — those
+    // are all upload-flow diagnostics, so "upload" is the right default.
+    const area: ErrorArea = isErrorArea(report.area) ? report.area : "upload";
+
+    // Rebuilt as a real Error (with the browser's own stack re-attached) so
+    // logError's own `error.stack` extraction picks it up directly, rather
+    // than passing the same stack twice via `extra`.
+    const error = typeof report.message === "string" ? new Error(report.message) : report.message;
+    if (error instanceof Error && typeof report.stack === "string") error.stack = report.stack;
+
+    const { referenceCode } = await logError({
+      area,
+      error,
+      route: typeof report.stage === "string" ? report.stage : undefined,
+      userAgent: typeof report.userAgent === "string" ? report.userAgent : request.headers.get("user-agent"),
+      extra: {
+        meta: report.meta,
+        url: report.url,
+        ip: getClientIp(request),
+      },
     });
 
-    return new NextResponse(null, { status: 204 });
+    return NextResponse.json({ referenceCode });
   } catch (error) {
     // A malformed report is itself just diagnostic noise — log it and move
     // on rather than surfacing a 500 back to a client that's already failing.

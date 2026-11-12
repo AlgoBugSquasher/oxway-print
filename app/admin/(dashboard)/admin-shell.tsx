@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ClipboardList, Gift, IndianRupee, LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
+import { AlertOctagon, ClipboardList, Gift, IndianRupee, LayoutDashboard, ListOrdered, LogOut, Tags } from "lucide-react";
 import BrandWordmark from "@/components/BrandWordmark";
 import { AdminRoleProvider } from "@/lib/admin/role-context";
 import { fetchJson } from "@/lib/fetch-json";
@@ -43,6 +43,9 @@ export default function AdminShell({ children, email, role }: { children: ReactN
     // regardless, this just avoids showing a nav link to a page that would
     // only ever render empty/403 for them).
     ...(role === "owner" ? [{ href: "/admin/audit", label: "Audit log", icon: ClipboardList }] : []),
+    // Error log — same owner-only reasoning as Audit log above (see the
+    // "Owner reads error_logs" policy backing it).
+    ...(role === "owner" ? [{ href: "/admin/error-log", label: "Error log", icon: AlertOctagon }] : []),
   ];
 
   return (

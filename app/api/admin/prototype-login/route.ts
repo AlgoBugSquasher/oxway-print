@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { logAudit } from "@/lib/audit";
+import { routeErrorResponse } from "@/lib/errors";
 import { getClientIp } from "@/lib/rate-limit";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
 
@@ -75,10 +76,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ ok: true });
   } catch (error) {
-    console.error("prototype-login error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not sign in." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "admin", route: "admin/prototype-login" });
   }
 }

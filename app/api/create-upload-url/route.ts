@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { MAX_UPLOAD_FILE_SIZE_BYTES } from "@/lib/config";
+import { routeErrorResponse } from "@/lib/errors";
 import { getClientIp, isWithinCreateOrderRateLimit } from "@/lib/rate-limit";
 import { createTempUploadUrl, tempUploadStoragePath } from "@/lib/store";
 
@@ -61,10 +62,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ path, token, signedUrl });
   } catch (error) {
-    console.error("create-upload-url error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not prepare the upload." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "upload", route: "create-upload-url" });
   }
 }

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { routeErrorResponse } from "@/lib/errors";
 import { getClientIp, isWithinCollectJobRateLimit } from "@/lib/rate-limit";
 import { getJob, markJobCollected } from "@/lib/store";
 
@@ -29,7 +30,6 @@ export async function POST(request: Request) {
     const updated = await markJobCollected(jobId, "customer");
     return NextResponse.json({ collectedAt: (updated ?? job).collectedAt ?? new Date().toISOString() });
   } catch (error) {
-    console.error("collect-job error:", error);
-    return jsonError(error instanceof Error ? error.message : "Could not record collection.", 500);
+    return await routeErrorResponse(error, { area: "kiosk", route: "collect-job" });
   }
 }

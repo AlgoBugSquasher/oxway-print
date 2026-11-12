@@ -1,4 +1,5 @@
 import { jsonNoStore } from "@/lib/api-response";
+import { routeErrorResponse } from "@/lib/errors";
 import { estimateMinutesUntilReady } from "@/lib/eta";
 import { getKioskTrayClearedAt } from "@/lib/kiosk-stats";
 import { reconcilePendingPayment } from "@/lib/payment-reconciliation";
@@ -90,10 +91,6 @@ export async function GET(request: Request) {
       sheetsAhead,
     });
   } catch (error) {
-    console.error("verify-payment error:", error);
-    return jsonNoStore(
-      { error: error instanceof Error ? error.message : "Could not check payment status." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "payment", route: "verify-payment", noStore: true });
   }
 }

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { MAX_FILES_PER_ORDER, MAX_PAGES_PER_STAFF_JOB, MAX_STAFF_DAILY_PAGES, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_PAGE_COUNT, getActiveProvider } from "@/lib/config";
+import { routeErrorResponse } from "@/lib/errors";
 import { getKioskUpdateState } from "@/lib/kiosk-stats";
 import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
 import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
@@ -195,11 +196,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ jobId: job.id, ticketNumber: job.ticketNumber, waivedAmount: job.waivedAmount });
   } catch (error) {
-    console.error("staff-print error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not create the print job." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "print", route: "staff-print" });
   } finally {
     if (tempUploadPath) await deleteStorageObject(tempUploadPath);
   }

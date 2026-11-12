@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { checkLowSupplyAlerts } from "@/lib/alerts/low-supply";
+import { routeErrorResponse } from "@/lib/errors";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
 export const runtime = "nodejs";
@@ -29,10 +30,6 @@ export async function GET(request: Request) {
 
     return NextResponse.json({ checked: kiosks?.length ?? 0 });
   } catch (error) {
-    console.error("check-low-supply error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not check low supply." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "cron", route: "cron/check-low-supply" });
   }
 }

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
+import { routeErrorResponse } from "@/lib/errors";
 import { extractSelectedPages } from "@/lib/print/pdf";
 import { formatReprintNote } from "@/lib/print/reprint-note";
 import { createReprintJob, deleteStorageObject, downloadJobPdf, getJob, uploadJobPdf, type PrintSettingsSnapshot } from "@/lib/store";
@@ -127,7 +128,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ jobId: job.id, ticketNumber: job.ticketNumber });
   } catch (error) {
-    console.error("admin/reprint error:", error);
-    return jsonError(error instanceof Error ? error.message : "Could not create the reprint.", 500);
+    return await routeErrorResponse(error, { area: "admin", route: "admin/reprint" });
   }
 }

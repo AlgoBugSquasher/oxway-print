@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { sendTestAlert } from "@/lib/alerts";
+import { routeErrorResponse } from "@/lib/errors";
 import { createSupabaseServerClient } from "@/lib/supabase-server";
 
 export const runtime = "nodejs";
@@ -19,7 +20,6 @@ export async function POST(request: Request) {
     const results = await sendTestAlert(kioskId);
     return NextResponse.json({ results });
   } catch (error) {
-    console.error("admin/test-alert error:", error);
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Could not send test alert." }, { status: 500 });
+    return await routeErrorResponse(error, { area: "admin", route: "admin/test-alert" });
   }
 }

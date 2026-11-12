@@ -758,6 +758,65 @@ create trigger print_jobs_set_original_refund_not_needed
   for each row execute function public.set_original_job_refund_not_needed();
 
 -- ============================================================================
+-- 6g-2. recognize_original_revenue_on_reprint_success() trigger — added
+--     2026-11-02 (supabase/migrations/2026-11-02_reprint_and_refund_revenue_fix.sql).
+--     Revenue is only ever recorded when a job actually PRINTS
+--     (recordCompletedPrint, never at payment time) — so a job that was
+--     paid but never printed (interrupted/print_failed/print_blocked) and
+--     gets resolved via a free reprint instead of a refund would otherwise
+--     never enter revenue at all, even though the business keeps the
+--     money. Fires on the SAME event as the trigger just above (a reprint
+--     job reaching 'printed'), and only recognizes the original's payment
+--     once: never for a job already counted (including one reprinted
+--     after already printing normally), never for staff/reprint jobs
+--     (never real money), never while a refund is pending/processing/done
+--     (that path is handled by complete_refund instead — see its own
+--     comment for the matching "only if counted" rule on the other side).
+-- ============================================================================
+create or replace function public.recognize_original_revenue_on_reprint_success()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_original record;
+begin
+  if tg_op = 'UPDATE'
+     and new.status = 'printed'
+     and old.status is distinct from 'printed'
+     and new.original_job_id is not null then
+
+    select * into v_original from print_jobs where id = new.original_job_id for update;
+
+    if v_original.id is not null
+       and v_original.total_price > 0
+       and coalesce(v_original.payment_method, '') not in ('staff', 'reprint')
+       and coalesce(v_original.refund_status, '') not in ('pending', 'processing', 'refunded')
+       and not exists (select 1 from print_orders where job_id = v_original.id) then
+
+      -- pages_printed = 0 — the reprint's own print_orders row (is_reprint
+      -- = true) already accounts for the real paper used; this row exists
+      -- purely to recognize the money, dated today (reprint completion),
+      -- not the original payment day.
+      insert into print_orders (kiosk_id, pages_printed, amount, color_mode, status, is_free, is_reprint, job_id)
+      values (v_original.kiosk_id, 0, v_original.total_price, coalesce((v_original.settings->>'isColor')::boolean, false), 'completed', false, false, v_original.id)
+      on conflict (job_id) where job_id is not null do nothing;
+
+      update kiosk_status
+      set total_revenue = total_revenue + v_original.total_price, updated_at = now()
+      where id = v_original.kiosk_id;
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger print_jobs_recognize_original_revenue_on_reprint
+  after update on print_jobs
+  for each row execute function public.recognize_original_revenue_on_reprint_success();
+
+-- ============================================================================
 -- 6e. create_staff_print_job() / claim_next_paid_job()
 -- ============================================================================
 --
@@ -1765,6 +1824,15 @@ begin
   -- gets cleaned up a few hours after a refund resolves).
   if v_updated_rows > 0 then
     insert into refund_events (kiosk_id, job_id, amount) values (v_kiosk_id, p_job_id, v_total_price);
+
+    -- Added 2026-11-02 (reprint_and_refund_revenue_fix) — only subtract
+    -- from the lifetime card if this job's payment was ever actually
+    -- added to it. A print_failed job is never in print_orders (revenue
+    -- is only recorded on an actual successful PRINT), so refunding one
+    -- must not push total_revenue negative for money it never counted.
+    if exists (select 1 from print_orders where job_id = p_job_id and not is_free and not is_reprint) then
+      update kiosk_status set total_revenue = total_revenue - v_total_price, updated_at = now() where id = v_kiosk_id;
+    end if;
   end if;
 
   perform public.log_audit(
@@ -2087,7 +2155,15 @@ begin
     select
       (date_trunc(v_trunc_unit, re.resolved_at at time zone v_tz)) at time zone v_tz as bucket_start,
       coalesce(sum(re.amount), 0) as refund_amount,
-      count(*) as refund_count
+      count(*) as refund_count,
+      -- Added 2026-11-02 (reprint_and_refund_revenue_fix) — only the
+      -- portion of this bucket's refunds whose job was actually counted
+      -- as revenue; refund_amount/refund_count above keep their original
+      -- meaning (every refund resolved in the period) as a separate ops
+      -- stat, this is only used for the revenue subtraction below.
+      coalesce(sum(re.amount) filter (
+        where exists (select 1 from print_orders po where po.job_id = re.job_id and not po.is_free and not po.is_reprint)
+      ), 0) as counted_refund_amount
     from refund_events re
     where (p_kiosk_id is null or re.kiosk_id = p_kiosk_id)
       and re.resolved_at >= v_period_start and re.resolved_at <= v_now
@@ -2095,7 +2171,7 @@ begin
   )
   select
     b.bucket_start,
-    case when v_is_owner then coalesce(o.revenue, 0) - coalesce(rf.refund_amount, 0) else null end,
+    case when v_is_owner then coalesce(o.revenue, 0) - coalesce(rf.counted_refund_amount, 0) else null end,
     case when v_is_owner then coalesce(rf.refund_amount, 0) else null end,
     case when v_is_owner then coalesce(rf.refund_count, 0)::integer else null end,
     coalesce(o.pages_printed, 0)::integer,
@@ -2588,6 +2664,43 @@ as $$
 $$;
 
 grant execute on function public.get_active_alerts(text) to authenticated;
+
+-- ============================================================================
+-- 12. error_logs — see supabase/migrations/2026-10-29_error_logs.sql for
+--     the full rationale (same append-only, owner-only discipline as
+--     audit_log above, written only by lib/errors.ts's logError()).
+-- ============================================================================
+create table error_logs (
+  id bigint generated always as identity primary key,
+  created_at timestamptz not null default now(),
+  reference_code text not null,
+  area text not null check (area in ('upload', 'payment', 'print', 'admin', 'cron', 'kiosk')),
+  message text not null,
+  details jsonb,
+  user_agent text
+);
+
+create index error_logs_created_at_idx on error_logs (created_at desc, id desc);
+create index error_logs_reference_code_idx on error_logs (reference_code);
+create index error_logs_area_idx on error_logs (area);
+
+alter table error_logs enable row level security;
+
+-- One function, not an inlined role check — so a later "engineer" role
+-- that should also read this table is a one-line change here, never a
+-- rewrite of the policy below or of any server-side reader.
+create or replace function public.can_read_error_logs()
+returns boolean
+language sql
+stable
+as $$
+  select public.current_app_role() = 'owner';
+$$;
+
+create policy "Owner reads error_logs" on error_logs
+for select using (public.can_read_error_logs());
+
+grant select on public.error_logs to authenticated;
 
 -- ============================================================================
 -- Not part of this file: the Storage bucket.

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { reportErrorAndGetMessage } from "../report-error";
 
 const DEFAULT_INTERVAL_MS = 5_000;
 // Kicks in once the SAME failure streak has lasted this many consecutive
@@ -84,7 +85,12 @@ export function useAutoRefresh(refresh: () => Promise<void>, options: UseAutoRef
       if (surfaceErrors) setError(null);
     } catch (err) {
       failureStreakRef.current += 1;
-      if (surfaceErrors) setError(err instanceof Error ? err.message : "Could not refresh.");
+      // Every admin page's own fetchData throws straight from a raw
+      // Supabase/Postgres error (`throw new Error(queryError.message)`) —
+      // this is the one place that turns ALL of those into a friendly
+      // message with a reference code, instead of each page doing it
+      // separately. See lib/report-error.ts.
+      if (surfaceErrors) setError(await reportErrorAndGetMessage("admin", err));
     } finally {
       isRunningRef.current = false;
       setIsRefreshing(false);

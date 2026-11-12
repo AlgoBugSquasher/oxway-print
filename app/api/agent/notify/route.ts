@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { AGENT_API_SECRET } from "@/lib/config";
+import { routeErrorResponse } from "@/lib/errors";
 import { notifyPrintCompleted, notifyPrintFailedRefunded } from "@/lib/notify";
 import { claimJobForNotification, getJob } from "@/lib/store";
 
@@ -35,8 +36,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  let jobId: string | undefined;
   try {
-    const { jobId } = (await request.json()) as { jobId?: string };
+    ({ jobId } = (await request.json()) as { jobId?: string });
     if (!jobId) return NextResponse.json({ error: "Missing jobId" }, { status: 400 });
 
     const job = await getJob(jobId);
@@ -65,10 +67,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ sent: true });
   } catch (error) {
-    console.error("agent/notify error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not process notification." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "print", route: "agent/notify", jobId });
   }
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { TEMP_UPLOAD_STALE_HOURS } from "@/lib/config";
+import { routeErrorResponse } from "@/lib/errors";
 import { deleteJob, deleteJobPdfOnly, deleteStorageObject, listJobsEligibleForCleanup, listStaleTempUploads, listUnresolvedRefundJobsWithStaleFiles } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -60,10 +61,6 @@ export async function GET(request: Request) {
       unresolvedRefundFilesChecked: staleRefundFiles.length, unresolvedRefundFilesDeleted: pdfOnlyDeleted,
     });
   } catch (error) {
-    console.error("cleanup-jobs error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not clean up old jobs." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "cron", route: "cron/cleanup-jobs" });
   }
 }

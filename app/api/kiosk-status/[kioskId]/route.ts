@@ -1,4 +1,5 @@
 import { jsonNoStore } from "@/lib/api-response";
+import { routeErrorResponse } from "@/lib/errors";
 import { getKioskColorModes, getKioskLastSeenAt, getKioskPrintBlockedState, getKioskUpdateState, getKioskWhatsappAvailability, isKioskCurrentlyOnline } from "@/lib/kiosk-stats";
 import { getPricingConfig } from "@/lib/store";
 
@@ -37,8 +38,9 @@ export const dynamic = "force-dynamic";
  * sensitive (no revenue, no supply counters).
  */
 export async function GET(_request: Request, { params }: { params: Promise<{ kioskId: string }> }) {
+  let kioskId: string | undefined;
   try {
-    const { kioskId } = await params;
+    ({ kioskId } = await params);
     const [lastSeenAt, isOnline, colorModes, updateState, whatsappAvailability, pricing, printBlockedState] = await Promise.all([
       getKioskLastSeenAt(kioskId),
       isKioskCurrentlyOnline(kioskId),
@@ -62,10 +64,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
       printBlockedReason: printBlockedState.printBlockedReason,
     });
   } catch (error) {
-    console.error("kiosk-status error:", error);
-    return jsonNoStore(
-      { error: error instanceof Error ? error.message : "Could not check kiosk status." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "kiosk", route: "kiosk-status", kioskId, noStore: true });
   }
 }

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { AGENT_API_SECRET } from "@/lib/config";
 import { checkLowSupplyAlerts } from "@/lib/alerts/low-supply";
+import { AGENT_API_SECRET } from "@/lib/config";
+import { routeErrorResponse } from "@/lib/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,14 +12,14 @@ export async function POST(request: Request) {
   const authHeader = request.headers.get("authorization");
   if (authHeader !== `Bearer ${AGENT_API_SECRET}`) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  let kioskId: string | undefined;
   try {
-    const { kioskId } = (await request.json()) as { kioskId?: string };
+    ({ kioskId } = (await request.json()) as { kioskId?: string });
     if (!kioskId) return NextResponse.json({ error: "Missing kioskId" }, { status: 400 });
 
     await checkLowSupplyAlerts(kioskId);
     return NextResponse.json({ ok: true });
   } catch (error) {
-    console.error("agent/check-low-supply error:", error);
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Could not check low supply." }, { status: 500 });
+    return await routeErrorResponse(error, { area: "cron", route: "agent/check-low-supply", kioskId });
   }
 }

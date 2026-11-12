@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { routeErrorResponse } from "@/lib/errors";
 import { reconcilePendingPayment } from "@/lib/payment-reconciliation";
 import { listPendingPaymentJobs } from "@/lib/store";
 
@@ -32,10 +33,6 @@ export async function GET(request: Request) {
     const failed = results.filter((result) => result.status === "rejected").length;
     return NextResponse.json({ checked: pendingJobs.length, failed });
   } catch (error) {
-    console.error("recheck-payments error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not recheck pending payments." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "cron", route: "cron/recheck-payments" });
   }
 }

@@ -5,6 +5,7 @@ import { getKioskColorModes, getKioskPrintBlockedState, getKioskUpdateState, get
 import { createOrder, type CreateOrderOutput } from "@/lib/payment";
 import { computeBillableSheets, computeOrderPrice } from "@/lib/pricing";
 import { extractSelectedPages, looksLikePdf } from "@/lib/print/pdf";
+import { routeErrorResponse } from "@/lib/errors";
 import { getClientIp, isWithinCreateOrderRateLimit } from "@/lib/rate-limit";
 import {
   assignTicketNumber,
@@ -307,11 +308,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ jobId, ...order });
   } catch (error) {
-    console.error("create-order error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Could not create the payment order." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "payment", route: "create-order" });
   } finally {
     // Whatever happened above — success, a validation rejection, an
     // invalid-PDF rejection, or an unexpected throw — the temp upload this

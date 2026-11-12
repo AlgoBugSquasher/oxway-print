@@ -1,4 +1,5 @@
 import { jsonNoStore } from "@/lib/api-response";
+import { routeErrorResponse } from "@/lib/errors";
 import { getKioskTrayClearedAt } from "@/lib/kiosk-stats";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { countUncollectedPrintedJobs } from "@/lib/store";
@@ -28,8 +29,9 @@ interface KioskDisplayJobRow {
  * remotely sensitive (no phone, price, file name, settings).
  */
 export async function GET(_request: Request, { params }: { params: Promise<{ kioskId: string }> }) {
+  let kioskId: string | undefined;
   try {
-    const { kioskId } = await params;
+    ({ kioskId } = await params);
     const supabase = supabaseAdmin();
 
     // print_blocked/interrupted included alongside printing — the job is
@@ -92,10 +94,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ kio
 
     return jsonNoStore({ current, upcoming, trayCount });
   } catch (error) {
-    console.error("kiosk-display error:", error);
-    return jsonNoStore(
-      { error: error instanceof Error ? error.message : "Could not load kiosk display data." },
-      { status: 500 }
-    );
+    return await routeErrorResponse(error, { area: "kiosk", route: "kiosk-display", kioskId, noStore: true });
   }
 }
